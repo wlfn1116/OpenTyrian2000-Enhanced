@@ -4304,7 +4304,7 @@ static int scancode_digit(int sc)
 /* Endless-only: the SECTOR modifiers (dangers / boons that define a zone) the debug screen can
  * toggle onto the jumped-to zone. The four PERSONAL kill-fire buffs (Turbodrive / Overdrive and
  * their evil mirrors) live in endlessDebugBuffMods below, on the "Perks & Buffs" page. */
-static const struct { unsigned bit; const char *name; } endlessDebugSectorMods[] = {
+static const struct { Uint64 bit; const char *name; } endlessDebugSectorMods[] = {
 	{ ENDLESS_MOD_FORTIFIED,   "Fortified"      },
 	{ ENDLESS_MOD_FRENZY,      "Frenzy"         },
 	{ ENDLESS_MOD_SWIFT,       "Swift"          },
@@ -4318,6 +4318,7 @@ static const struct { unsigned bit; const char *name; } endlessDebugSectorMods[]
 	{ ENDLESS_MOD_KAMIKAZE,    "Kamikaze (mid)" },
 	{ ENDLESS_MOD_HOMING,      "Homing (light)" },
 	{ ENDLESS_MOD_GRAVITY,     "Gravity Well"   },
+	{ ENDLESS_MOD_GRAVITY_OMNI,"Gravity (omni)" },  // omni pulls along a random heading; toggle alone or with Gravity Well
 	{ ENDLESS_MOD_OVERCHARGE,  "Overcharged"    },
 	{ ENDLESS_MOD_DILATION,    "Time Dilation"  },
 	{ ENDLESS_MOD_FAVOR,       "Merchant Favor" },
@@ -4326,6 +4327,10 @@ static const struct { unsigned bit; const char *name; } endlessDebugSectorMods[]
 	{ ENDLESS_MOD_SLIPSTREAM,  "Slipstream"     },
 	{ ENDLESS_MOD_OVERLOAD,    "Overload"       },
 	{ ENDLESS_MOD_WARP,        "Warp Speed"     },
+	{ ENDLESS_MOD_TOPSY,       "Topsy-Turvy"    },  // fork: upside-down screen (boss-style controls)
+	{ ENDLESS_MOD_SLUGGISH,    "Sluggish Ship"  },  // fork: slowed movement (kbd/mouse/touch)
+	{ ENDLESS_MOD_SHIELDLESS,  "No Shield Regen" }, // fork: shields never recharge
+	{ ENDLESS_MOD_DEADGEN,     "Dead Generator" },  // fork: no shields + starved main gun (super-rare)
 	// Gamble-only next-sector effects, also toggleable here for zone-jump testing. NITRO/OVERHEAT
 	// normally ride with OVERCHARGE / TURBODRIVE (toggle those too for the full "deal"); here each
 	// is isolable. All four are read straight from endlessActiveMods in-level, so the jump applies them.
@@ -4443,7 +4448,7 @@ static bool endlessDebugScreen(void)
 	int      dbgZone = endlessRunDepth + 1;
 	bool     dbgZoneTyped = false;
 	int      dbgBase = -1;             // -1 = Random, else index into endlessBase*
-	unsigned dbgMods = endlessActiveMods | endlessPendingMods();  // sector + personal-buff bits (pre-toggled)
+	Uint64   dbgMods = endlessActiveMods | endlessPendingMods();  // sector + personal-buff bits (pre-toggled)
 	int      dbgPerks[32];             // owned stacks per perk, pre-loaded from the run (toggle/stack here)
 	for (int i = 0; i < NPERKS && i < 32; ++i)
 		dbgPerks[i] = endlessPerkGetOwned(i);

@@ -328,11 +328,19 @@ void vt_ship_step(float dt)  // dt = this frame's fraction of a 35Hz tick
 
 	// Momentum step + immediate DIRECT component + direct mouse delta. The direct term is not
 	// folded into vt_vx: releasing input stops it at once, only the momentum glides out.
-	vt_x[p] += (vt_vx[p] + ix * VT_DIRECT) * dt + mdx;
-	vt_y[p] += (vt_vy[p] + iy * VT_DIRECT) * dt + mdy;
+	// Endless SLUGGISH scales this committed displacement -- keyboard/stick momentum, the direct
+	// term, AND the mouse/touch delta (touch rides mdx/mdy) all slow together. Exactly 1.0 (a no-op,
+	// bit-for-bit) whenever the modifier is off, so normal play is unchanged.
+	const float mscale = endlessMoveScale();
+	vt_x[p] += ((vt_vx[p] + ix * VT_DIRECT) * dt + mdx) * mscale;
+	vt_y[p] += ((vt_vy[p] + iy * VT_DIRECT) * dt + mdy) * mscale;
 
-	// Endless GRAVITY WELL: a steady downward drag (dt-scaled, so render-rate independent).
-	vt_y[p] += endlessGravityDrift() * dt;
+	// Endless GRAVITY WELL: a steady drag (dt-scaled, so render-rate independent). A plain well pulls
+	// straight down; an omnidirectional well pulls along a fixed random heading, so it has an X
+	// component too. The playfield-bounds clamp below catches any axis, so a sideways/up pull just
+	// pins the ship at that edge (no phantom momentum, same as the down case).
+	vt_x[p] += endlessGravityDriftX() * dt;
+	vt_y[p] += endlessGravityDriftY() * dt;
 
 	// Same playfield bounds the sim enforces (mainint.c). Stop velocity at walls
 	// so we don't accumulate phantom momentum while held against an edge.
@@ -899,6 +907,14 @@ static float tempMapXOfs_frac = 0.0f;
 static float tempScrollYfrac    = 0.0f;
 static float tempScrollYfracNow = 0.0f;
 
+// This batch's endless smooth-overclock extra scroll px (the endlessScrollExtraPxN of the layer
+// these enemies ride), set beside tempBackMove so the enemy scrolls at its layer's true pace. The
+// channel is tagged EXPLICITLY here rather than matched by value (tempBackMove == backMove?) --
+// value-matching mis-picks when two layers momentarily share a backMove (e.g. EP1 TYRIAN's slowdown
+// makes backMove == backMove3, which sent layer-3 enemies onto layer 1's much smaller delay-gated
+// extra px, so they drifted off the terrain). notes.md §Endless scroll boost / §Slow-scroll smoothing.
+static int tempScrollExtraPx = 0;
+
 inline static void blit_enemy(SDL_Surface *surface, unsigned int i, signed int x_offset, signed int y_offset, signed int sprite_offset)
 {
 	if (enemy[i].sprite2s == NULL)
@@ -1141,10 +1157,9 @@ enemy_still_exists:
 			}
 
 			// Scroll-track at overclock pace using the SMOOTH per-tick px of whichever layer this
-			// enemy rides, so ground enemies glide with the terrain. notes.md §Endless scroll boost.
-			int scrollExtraPx = (tempBackMove == backMove)  ? endlessScrollExtraPx1 :
-			                    (tempBackMove == backMove3) ? endlessScrollExtraPx3 : 0;
-			enemy[i].ey += tempBackMove + scrollExtraPx;
+			// enemy rides (tagged per batch beside tempBackMove), so ground enemies glide with the
+			// terrain instead of drifting when two layers share a backMove. notes.md §Endless scroll boost.
+			enemy[i].ey += tempBackMove + tempScrollExtraPx;
 
 			if (enemy[i].ex <= -24 || enemy[i].ex >= vga_width - 24)
 				goto draw_enemy_end;
@@ -1860,10 +1875,16 @@ start_level_first:
 	shieldWait = 1;
 	shieldT    = shields[player[0].items.shield].tpwr * 20;
 
+	// Endless SHIELDLESS/DEADGEN sectors never recharge the shield, so hand it over fully charged:
+	// you get the whole buffer up front, then fly on armor once it's spent (no way to earn it back).
+	const bool startShieldFull = endlessShieldRegenOff();
+
 	for (uint i = 0; i < COUNTOF(player); ++i)
 	{
 		player[i].shield     = shields[player[i].items.shield].mpwr;
 		player[i].shield_max = player[i].shield * 2;
+		if (startShieldFull)
+			player[i].shield = player[i].shield_max;
 		shieldGaugeFlash[i] = armorGaugeFlash[i] = 0;
 	}
 
@@ -2093,6 +2114,16 @@ level_loop:
 				starShowVGASpecialCode = 0;
 			if (starShowVGASpecialCode == 0 && endlessLightConeActive())
 				starShowVGASpecialCode = 2;
+
+			// TOPSY-TURVY modifier: flip the playfield like a screen-flip boss. Boss-STYLE means we
+			// set the same smoothies[9-1] the bosses use, so the vertical controls invert WITH the
+			// view (up on the stick still moves the ship up ON SCREEN) -- disorienting but fair. It
+			// overrides any spotlight above; the two never share a zone (TOPSY is a standalone theme).
+			if (endlessActiveMods & ENDLESS_MOD_TOPSY)
+			{
+				smoothies[9 - 1] = true;
+				starShowVGASpecialCode = 1;
+			}
 		}
 	}
 
@@ -2185,7 +2216,8 @@ level_loop:
 					JE_drawShield();
 				}
 			}
-			else if (player[0].is_alive && player[0].shield < player[0].shield_max && power > shieldT)
+			else if (player[0].is_alive && player[0].shield < player[0].shield_max && power > shieldT
+			         && !endlessShieldRegenOff())  // endless SHIELDLESS / DEADGEN: shields never recharge
 			{
 				if (--shieldWait == 0)
 				{
@@ -2232,7 +2264,7 @@ level_loop:
 		}
 		else
 		{
-			power += powerAdd;
+			power += endlessGeneratorPowerAdd(powerAdd);  // endless DEADGEN throttles the generator to a trickle (normal rate otherwise)
 			if (power > 900)
 				power = 900;
 
@@ -2352,11 +2384,16 @@ level_loop:
 	}
 	bgSmoothActivePend = true;
 
-	// Publish this tick's (non-lagged) fraction for scroll-tracked entities drawn later this tick
-	// (enemies + HP bars): recorded after the scroll advance, they need frac_T, not the one-tick-
-	// lagged bg_layer_yfrac the pre-advance background rows use. notes.md §Sub-pixel parallax.
+	// Publish this tick's (non-lagged) rate + fraction for things recorded AFTER this tick's scroll
+	// advance: scroll-tracked entities (enemies + HP bars) drawn later this tick, and background
+	// layer 3 (draw_background_3 advances before it records, unlike layers 1/2). They need rate_T /
+	// frac_T, not the one-tick-lagged bg_layer_dy/bg_layer_yfrac the pre-advance layers 1/2 use.
+	// notes.md §Sub-pixel parallax / §Slow-scroll smoothing.
 	for (int L = 1; L <= 3; ++L)
+	{
 		bg_layer_yfrac_now[L] = bgSmoothFracPend[L];
+		bg_layer_dy_now[L]    = bgSmoothRatePend[L];
+	}
 
 	// Layer 1 (+ the event pointer, which must ride the identical delta so scripted stops stay
 	// aligned to the terrain). One combined advance; the wrap can cross more than one tile.
@@ -2422,6 +2459,7 @@ level_loop:
 	tempBackMove = backMove;
 	tempScrollYfrac    = bg_layer_yfrac[1];      // sprite (pre-advance): lagged frac, glued to layer 1
 	tempScrollYfracNow = bg_layer_yfrac_now[1];  // HP bar (post-advance): this-tick frac
+	tempScrollExtraPx  = endlessScrollExtraPx1;  // this batch rides layer 1
 	JE_drawEnemy(50);
 	JE_drawEnemy(100);
 
@@ -2502,6 +2540,7 @@ level_loop:
 		tempBackMove = 0;
 		tempScrollYfrac    = 0.0f;  // not vertically scroll-tracked (layer-2 anchor): no sub-pixel glue
 		tempScrollYfracNow = 0.0f;
+		tempScrollExtraPx  = 0;     // layer-2 anchor: not vertically scroll-tracked
 		JE_drawEnemy(25);
 
 		if (enemyOnScreen == lastEnemyOnScreen)
@@ -2522,6 +2561,7 @@ level_loop:
 		tempBackMove = backMove3;
 		tempScrollYfrac    = bg_layer_yfrac[3];      // sprite (pre-advance): lagged frac, glued to layer 3
 		tempScrollYfracNow = bg_layer_yfrac_now[3];  // HP bar (post-advance): this-tick frac
+		tempScrollExtraPx  = endlessScrollExtraPx3;  // this batch rides layer 3
 		JE_drawEnemy(75);
 	}
 
@@ -3024,6 +3064,7 @@ draw_player_shot_loop_end:
 		tempBackMove = backMove3;
 		tempScrollYfrac    = bg_layer_yfrac[3];      // sprite (pre-advance): lagged frac, glued to layer 3
 		tempScrollYfracNow = bg_layer_yfrac_now[3];  // HP bar (post-advance): this-tick frac
+		tempScrollExtraPx  = endlessScrollExtraPx3;  // this batch rides layer 3
 		JE_drawEnemy(75);
 	}
 
@@ -3037,6 +3078,7 @@ draw_player_shot_loop_end:
 		tempBackMove = 0;
 		tempScrollYfrac    = 0.0f;  // not vertically scroll-tracked (layer-2 anchor): no sub-pixel glue
 		tempScrollYfracNow = 0.0f;
+		tempScrollExtraPx  = 0;     // layer-2 anchor: not vertically scroll-tracked
 		JE_drawEnemy(25);
 
 		if (enemyOnScreen == lastEnemyOnScreen)

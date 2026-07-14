@@ -6167,7 +6167,12 @@ void JE_playerMovement(Player *this_player,
 			VGAScreen = game_screen;
 		}
 		if (!vt_ship_owns())  // the VT ship (normal play) applies gravity in vt_ship_step
-			this_player->y += endlessGravityPull();
+		{
+			// X is nonzero only for an omnidirectional well; both axes are clamped to the playfield
+			// at the end of JE_playerMovement, so a sideways/up pull just pins the ship at that edge.
+			this_player->x += endlessGravityPullX();
+			this_player->y += endlessGravityPullY();
+		}
 		// Quicken the guns: the Rapid Cyclers perk every tick, plus the kill-fire buff during a
 		// TURBODRIVE/Turbodrive streak. Both feed the same shotRepeat-decrement loop.
 		{
@@ -6340,6 +6345,11 @@ redo:
 	{
 		*mouseX_ = this_player->x;
 		*mouseY_ = this_player->y;
+		// Endless SLUGGISH (classic non-VT path): snapshot the tick-start position so the whole net
+		// move can be rescaled at the end. Y is snapshotted separately because the inverted-control
+		// flip below rewrites *mouseY_.
+		const int sluggishStartX = this_player->x;
+		const int sluggishStartY = this_player->y;
 		button[1-1] = false;
 		button[2-1] = false;
 		button[3-1] = false;
@@ -6547,6 +6557,28 @@ redo:
 					accelYC++;
 				else if (mouseYC < -2)
 					accelYC--;
+
+				// Endless SLUGGISH (classic path): the VT ship scales its own move (tyrian2.c); mirror
+				// it here for the Smooth-Motion-off path. Every source -- keyboard, d-pad, mouse, touch,
+				// stick -- has already committed to this_player->x/y above, so rescale this tick's NET
+				// displacement with a sub-pixel carry (like endlessGravityPullX/Y) so a fractional scale
+				// still averages out. player[0] only; a no-op at scale 1.0, so normal play is untouched.
+				if (playerNum_ == 1)
+				{
+					const float ms = endlessMoveScale();
+					if (ms < 1.0f)
+					{
+						static float carryX = 0.0f, carryY = 0.0f;
+						const float wantX = (float)(this_player->x - sluggishStartX) * ms + carryX;
+						const float wantY = (float)(this_player->y - sluggishStartY) * ms + carryY;
+						const int   dX = (int)(wantX >= 0.0f ? wantX + 0.5f : wantX - 0.5f);
+						const int   dY = (int)(wantY >= 0.0f ? wantY + 0.5f : wantY - 0.5f);
+						carryX = wantX - (float)dX;
+						carryY = wantY - (float)dY;
+						this_player->x = sluggishStartX + dX;
+						this_player->y = sluggishStartY + dY;
+					}
+				}
 
 			}   /*endLevel*/
 

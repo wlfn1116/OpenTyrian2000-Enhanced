@@ -59,6 +59,19 @@ enum {
 // must fit in. RAMPAGE: aggressive homing rammers with extra ram damage (gamble-only, ~1/5000).
 #define ENDLESS_MOD_RAMPAGE (1u << 31)
 
+// Bits 32+ live above the 32-bit line, so they're Uint64 and endlessActiveMods (and every mod-set
+// that can carry them: endlessCourseMod[], sortieMods, the save fields) is Uint64 too. Fork
+// "challenge" sector mutators: a flipped screen and a slowed ship, in the spirit of the boss gimmicks.
+#define ENDLESS_MOD_TOPSY    ((Uint64)1 << 32)  // playfield flips upside-down, boss-style: controls invert WITH the view (hostile)
+#define ENDLESS_MOD_SLUGGISH ((Uint64)1 << 33)  // your ship crawls -- keyboard, mouse AND touch all slowed (hostile)
+// Gravity Well variant, decided (50/50) whenever a gravity course is charted: the pull runs along a
+// FIXED RANDOM heading for the whole sector instead of straight down. Rides alongside GRAVITY (never
+// alone in a course) and is cosmetically masked out of theme-name lookup, so gravity combos keep
+// their names; the per-sector heading is rolled in endlessRegenerateLevel.
+#define ENDLESS_MOD_GRAVITY_OMNI ((Uint64)1 << 34)  // omnidirectional gravity well: pull along a random heading, not just down (hostile)
+#define ENDLESS_MOD_SHIELDLESS ((Uint64)1 << 35)  // shields do NOT recharge -- you keep what you have, then run on armor (hostile)
+#define ENDLESS_MOD_DEADGEN    ((Uint64)1 << 36)  // the generator is dead: no shield regen AND the main gun is starved of power (hostile, super-rare nightmare)
+
 // The six kill-fire mods -- boons Turbodrive/Overdrive/Overblast, evil mirrors Backfire/Burnout/
 // Misfire -- a sector carries at most one (notes.md §Course generation & danger labels).
 #define ENDLESS_MOD_FIREBOOST      (ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERDRIVE)
@@ -132,7 +145,7 @@ extern int endlessRunBossKills;
 void endlessCountKill(int linknum);
 
 // Mutator bits (ENDLESS_MOD_*) active on the current level; set by endlessChooseNextLevel.
-extern unsigned endlessActiveMods;
+extern Uint64 endlessActiveMods;   // ENDLESS_MOD_* bits for the current level (64-bit: TOPSY/SLUGGISH are bits 32-33)
 
 // Run-persistent bonus to max armor, bought at the outpost ("Reinforce Hull"). Added to
 // the ship's armor each level start (varz.c ship-info). Reset each run.
@@ -348,8 +361,14 @@ int endlessKillBuffFireMultiplier(void);// fire-rate multiplier the buff is gran
 int endlessKillBuffDamagePercent(void); // shot-damage bonus % the buff is granting (0 during Turbodrive)
 int  endlessKillBuffFireDecrements(void); // extra shotRepeat decrements this tick (Turbodrive base + Overdrive stacks)
 int  endlessPerkSpecialCooldownDecrements(void); // Rapid Recharge perk: extra cooldown decrements/tick, applied by the caller to the special-weapon gate AND sidekick ammo refill
-int   endlessGravityPull(void);         // GRAVITY: per-tick downward nudge (classic non-VT ship path)
-float endlessGravityDrift(void);        // GRAVITY: downward drag in px per 35Hz tick (VT ship path)
+int   endlessGravityPullX(void);        // GRAVITY: per-tick horizontal nudge (classic non-VT ship path; nonzero only for an omni well)
+int   endlessGravityPullY(void);        // GRAVITY: per-tick vertical nudge (classic non-VT ship path)
+float endlessGravityDrift(void);        // GRAVITY: pull magnitude in px per 35Hz tick (direction-agnostic)
+float endlessGravityDriftX(void);       // GRAVITY: horizontal drag component in px/tick (VT ship path; nonzero only for an omni well)
+float endlessGravityDriftY(void);       // GRAVITY: vertical drag component in px/tick (VT ship path)
+float endlessMoveScale(void);           // SLUGGISH: ship traverse-speed scale, 1.0 = normal; scales ALL input (keyboard/mouse/touch/stick) in both ship paths
+bool  endlessShieldRegenOff(void);      // SHIELDLESS or DEADGEN: true when the shield must not recharge (gate the shield-regen step in tyrian2.c)
+unsigned endlessGeneratorPowerAdd(unsigned normalAdd); // DEADGEN: generator charge per tick, throttled to a trickle (else the passed-in normal rate)
 int  endlessExtraScrollSteps(void);     // OVERCLOCK/SLIPSTREAM/OVERLOAD/WARP: extra scroll steps this tick
 bool endlessScrollBoostActive(void);    // true while any scroll-speed modifier is active (stable across the tick, unlike the fractional step count)
 int  endlessScrollExtraPx(int channel, int fireStep, int delayMax, int baseThisTick, float *rateOut, float *fracOut); // SMOOTH boost: extra scroll px this tick for layer `channel` (0/1/2); call once/channel/tick (notes.md §Endless scroll boost)
@@ -365,8 +384,8 @@ const char *endlessKillFireEvilName(void);   // one-word HUD label for the activ
 
 // Display name / help for an arbitrary modifier bitset: a curated theme name if one exists,
 // otherwise a generated one -- so the course generator can offer any combination.
-const char *endlessComboName(unsigned mods);
-const char *endlessComboHelp(unsigned mods);
+const char *endlessComboName(Uint64 mods);
+const char *endlessComboHelp(Uint64 mods);
 
 // Special enemies come in two tiers: ELITE (tougher, tinted, pays a bounty) and CHAMPION
 // (an elite that also fires faster and hits harder, a distinct tint, ~half as common). A

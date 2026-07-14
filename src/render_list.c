@@ -788,7 +788,10 @@ static void rl_replay_common(SDL_Surface *dst, float inv, float alpha, bool appl
 
 		// Position: EXACT scaled base plus displacements rounded at the render
 		// scale. (Never round a combined float: rl_iround(x - d) != x - rl_iround(d)
-		// at half-pixels, which once caused 1px jitter even at scale 1.)
+		// at half-pixels, which once caused 1px jitter even at scale 1.) The two
+		// vertical-scroll branches below are the deliberate exception -- there the base
+		// itself jumps by an integer pulse between ticks, so the combined value must be
+		// rounded as one to stay continuous across boundaries (see bg_row Y).
 		int x = c->x * scale, y = c->y * scale;
 		const bool is_ship_id = c->id >= RL_ID_SHIP_BASE && c->id < RL_ID_SIDEKICK_BASE;
 		if (use_override && ship_override_active && is_ship_id)
@@ -883,8 +886,24 @@ static void rl_replay_common(SDL_Surface *dst, float inv, float alpha, bool appl
 				// integer per-tick pulse of c->dy (bgScrollDeltaY), which freezes on delay-gated
 				// slow sections then jumps. Mirrors the horizontal parallax above; a byte-exact
 				// no-op (frac 0, integer rate) on full-speed layers. notes.md §Slow-scroll smoothing.
+				//
+				// Round base + offset TOGETHER here (the one place that must, unlike the exact-base
+				// rule at the top of this block). Across a tick boundary the recorded c->y jumps by
+				// the whole-pixel scroll pulse while yfrac compensates fractionally; the true float
+				// position is continuous, but rl_iround is round-half-AWAY-from-zero, which is not
+				// integer-translation-invariant at exactly x.5 -- so rounding only the offset splits
+				// one continuous value two ways and steps the row 1px BACKWARD at the boundary
+				// ("up/down" jitter on fractional rates like 1.5 px/tick). Rounding the combined
+				// value gives an identical result on both sides of every boundary, at any scale.
+				//
+				// Layer 3 records its rows AFTER advancing (draw_background_3), unlike layers 1/2, so
+				// it needs this tick's rate/frac (bg_layer_*_now), not the one-tick-lagged values the
+				// pre-advance layers use -- otherwise layer 3 alone sits one tick out of phase and
+				// jitters against the true motion (visible under a scroll modifier). See tyrian2.c.
 				const int L = c->id - RL_ID_BG_BASE;
-				y = c->y * scale + rl_iround((bg_layer_yfrac[L] - bg_layer_dy[L] * inv) * scale);
+				const float rate  = (L == 3) ? bg_layer_dy_now[L]    : bg_layer_dy[L];
+				const float yfrac = (L == 3) ? bg_layer_yfrac_now[L] : bg_layer_yfrac[L];
+				y = rl_iround((c->y + yfrac - rate * inv) * scale);
 			}
 			else if (use_override && (c->par_yfrac != 0.0f || c->par_yfrac_dy != 0.0f))
 			{
@@ -892,8 +911,9 @@ static void rl_replay_common(SDL_Surface *dst, float inv, float alpha, bool appl
 				// (c->dy) and the sub-pixel fraction into one rounded displacement, like bg_row
 				// above. Rounded separately, the fraction dies at scale 1 and the integer pulse
 				// shows through, so the entity jitters against the smooth background whenever
-				// supersampling is off. c->dy also carries any own velocity.
-				y = c->y * scale + rl_iround((c->par_yfrac - (c->dy + c->par_yfrac_dy) * inv) * scale);
+				// supersampling is off. c->dy also carries any own velocity. Round base + offset
+				// together (see bg_row) so it stays glued to its layer across tick boundaries.
+				y = rl_iround((c->y + c->par_yfrac - (c->dy + c->par_yfrac_dy) * inv) * scale);
 			}
 			else if (c->dy && inv != 0.0f)
 			{

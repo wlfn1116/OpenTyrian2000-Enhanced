@@ -52,7 +52,7 @@
 // --- Run state ------------------------------------------------------------------
 
 int      endlessRunDepth  = 0;   // levels cleared this run (0 on the first level)
-unsigned endlessActiveMods = 0;  // ENDLESS_MOD_* bits for the current level
+Uint64   endlessActiveMods = 0;  // ENDLESS_MOD_* bits for the current level (64-bit: TOPSY/SLUGGISH use bits 32-33)
 int      endlessArmorBonus = 0;  // run-persistent +max armor bought at the outpost
 int      endlessRunKills = 0;    // total enemies destroyed this run (shown on the end screen)
 int      endlessRunBossKills = 0;// boss-tier enemies destroyed this run
@@ -200,7 +200,7 @@ bool endlessLockedSortie  = false;  // the reopened outpost is locked to the lau
 // and are declared up here so endlessResetRun (above the rec typedef) can clear them.
 static bool     endlessSortieHave  = false; // a launch-time snapshot exists
 static Player   endlessSortiePlayer[2];     // player[] loadout at launch (cash / items / superbombs)
-static unsigned endlessSortieModsV = 0;     // endlessActiveMods at launch (the committed level's mutators)
+static Uint64 endlessSortieModsV = 0;       // endlessActiveMods at launch (the committed level's mutators)
 static JE_byte  endlessSortieSec   = 0;     // committed level section
 static int      endlessSortieEp    = 0;     // committed episode
 static JE_byte  endlessSortieFile  = 0;     // committed lvl file number
@@ -785,6 +785,8 @@ int endlessRecentLevelCount(void)          { return endlessRecentCount; }
 int endlessRecentLevelEpisode(int i)       { return (i >= 0 && i < endlessRecentCount) ? endlessRecentEp[i]  : 0; }
 int endlessRecentLevelSection(int i)       { return (i >= 0 && i < endlessRecentCount) ? endlessRecentSec[i] : 0; }
 
+static void endlessRollGravityDir(void);  // defined with the gravity code below; rolls this sector's pull heading
+
 void endlessRegenerateLevel(void)
 {
 	// Endless plays the shipped level exactly as authored -- its enemies, their
@@ -851,6 +853,12 @@ void endlessRegenerateLevel(void)
 	// fixed per (seed, depth) without shifting the existing music/course/shop draws.
 	endlessReseed((Uint64)endlessRunDepth * 2 + 0x40000000);
 	endlessLightCone = (endlessRand() % 10 == 0);
+
+	// Roll this sector's gravity-well heading: an omnidirectional well picks a fixed random heading
+	// for the whole sector, a plain well points straight down. Own reseed phase (keyed by depth) so it
+	// stays fixed per (seed, zone) without shifting the music / course / light-cone draws above.
+	endlessReseed((Uint64)endlessRunDepth * 2 + 0x50000000);
+	endlessRollGravityDir();
 }
 
 // --- Depth- and mutator-scaled enemy difficulty --------------------------------
@@ -1402,34 +1410,123 @@ const char *endlessKillFireEvilName(void)
 	return "JAMMED";  // Backfire
 }
 
-// GRAVITY: a steady downward drag growing with zone AND difficulty; the absolute cap stays
-// clear of the ship's top speed so full throttle can always climb (notes.md §Difficulty ramp).
+// GRAVITY: a steady drag growing with zone AND difficulty; the absolute cap stays clear of the
+// ship's top speed so full throttle can always climb (notes.md §Difficulty ramp). A plain well
+// pulls straight down; an OMNIDIRECTIONAL well (ENDLESS_MOD_GRAVITY_OMNI) pulls along a fixed
+// random heading chosen per sector -- same magnitude, so any single axis is still out-climbable.
 #define ENDLESS_GRAVITY_BASE     1.6f   // px/tick at zone 0 on NORMAL (difficulty then scales this)
 #define ENDLESS_GRAVITY_PER_ZONE 0.04f  // +px/tick per zone cleared, before the difficulty tilt
 #define ENDLESS_GRAVITY_MAX      3.6f   // hard cap (72% of VT_VMAX): full throttle always climbs ~1.4 px/tick
-float endlessGravityDrift(void)
+
+// This sector's gravity heading (unit vector). Rolled per sector in endlessRollGravityDir; both ship
+// paths read it via the X/Y drift helpers. Defaults to straight down so a well with no roll yet, or a
+// plain (non-omni) well, behaves exactly as before.
+static float endlessGravityDirX = 0.0f;
+static float endlessGravityDirY = 1.0f;
+
+// 16 evenly-spaced unit headings for an omnidirectional well: enough to feel "any direction" while
+// avoiding a <math.h> dependency (removed from this file long ago) and staying bit-identical across
+// the PC/Switch/Vita builds. A fixed heading per sector keeps it learnable rather than chaotic.
+static const float endlessGravityHeadings[16][2] = {
+	{  1.000f,  0.000f }, {  0.924f,  0.383f }, {  0.707f,  0.707f }, {  0.383f,  0.924f },
+	{  0.000f,  1.000f }, { -0.383f,  0.924f }, { -0.707f,  0.707f }, { -0.924f,  0.383f },
+	{ -1.000f,  0.000f }, { -0.924f, -0.383f }, { -0.707f, -0.707f }, { -0.383f, -0.924f },
+	{  0.000f, -1.000f }, {  0.383f, -0.924f }, {  0.707f, -0.707f }, {  0.924f, -0.383f },
+};
+
+// Pick this sector's gravity heading: a fixed random one for an omni well, else straight down.
+// Called once per level from endlessRegenerateLevel (in its own seeded reseed phase).
+static void endlessRollGravityDir(void)
 {
-	if (!endlessMode || !(endlessActiveMods & ENDLESS_MOD_GRAVITY))
+	if (endlessMode && (endlessActiveMods & ENDLESS_MOD_GRAVITY_OMNI))
+	{
+		const unsigned h = endlessRand() % COUNTOF(endlessGravityHeadings);
+		endlessGravityDirX = endlessGravityHeadings[h][0];
+		endlessGravityDirY = endlessGravityHeadings[h][1];
+	}
+	else
+	{
+		endlessGravityDirX = 0.0f;
+		endlessGravityDirY = 1.0f;  // classic Gravity Well: straight down
+	}
+}
+
+float endlessGravityDrift(void)  // pull magnitude (px/tick), direction-agnostic
+{
+	// Responds to either bit so a debug-toggled bare OMNI (no GRAVITY) still pulls.
+	if (!endlessMode || !(endlessActiveMods & (ENDLESS_MOD_GRAVITY | ENDLESS_MOD_GRAVITY_OMNI)))
 		return 0.0f;
 	float g = (ENDLESS_GRAVITY_BASE + ENDLESS_GRAVITY_PER_ZONE * (float)endlessRunDepth)
 	        * (float)endlessDifficultyRampPercent() / 100.0f;
-	return (g > ENDLESS_GRAVITY_MAX) ? ENDLESS_GRAVITY_MAX : g;
+	if (g > ENDLESS_GRAVITY_MAX)
+		g = ENDLESS_GRAVITY_MAX;
+	// SLUGGISH slows gravity in lock-step with the ship (endlessMoveScale is 1.0 when not sluggish, so
+	// gravity-only sectors are unchanged). A sluggish+gravity sector then stays flyable: full throttle
+	// out-climbs the pull by the same ratio it always did, just in the slowed frame -- no strand.
+	return g * endlessMoveScale();
 }
 
-int endlessGravityPull(void)  // classic (non-VT) path: integer px/tick that tracks the (fractional) drift
+float endlessGravityDriftX(void) { return endlessGravityDrift() * endlessGravityDirX; }
+float endlessGravityDriftY(void) { return endlessGravityDrift() * endlessGravityDirY; }
+
+// Classic (non-VT) path: integer px/tick per axis that tracks the (fractional) drift. Each axis carries
+// its own sub-pixel remainder between ticks (like endlessExtraScrollSteps) so the integer nudge averages
+// out to exactly the scaled drift, whatever the zone -- not a fixed 1/2 wobble. (int) truncates toward
+// zero, so a negative component -- an omni well pulling up/left -- carries correctly too.
+int endlessGravityPullX(void)
 {
-	const float g = endlessGravityDrift();
-	if (g == 0.0f)
-	{
-		return 0;
-	}
-	// Carry the sub-pixel remainder between ticks (like endlessExtraScrollSteps) so the integer
-	// nudge averages out to exactly the scaled drift, whatever the zone -- not a fixed 1/2 wobble.
 	static float accum = 0.0f;
-	accum += g;
+	accum += endlessGravityDriftX();
 	const int step = (int)accum;
 	accum -= (float)step;
 	return step;
+}
+int endlessGravityPullY(void)
+{
+	static float accum = 0.0f;
+	accum += endlessGravityDriftY();
+	const int step = (int)accum;
+	accum -= (float)step;
+	return step;
+}
+
+// SLUGGISH: the ship crawls. Like GRAVITY, the bite RAMPS with depth and difficulty -- barely slowed
+// early, heavy deep in a run -- but floored so you can ALWAYS move. Returns the traverse-speed scale
+// (1.0 = normal) applied to the committed per-tick displacement in BOTH ship paths (VT tyrian2.c +
+// classic mainint.c), so keyboard, stick, mouse AND touch slow together. endlessGravityDrift multiplies
+// gravity by this same factor, so a sluggish+gravity sector stays climbable (the pull slows to match).
+#define ENDLESS_SLUGGISH_BASE     0.18f  // fraction slowed at zone 0 on NORMAL (=> 0.82x), before the difficulty tilt
+#define ENDLESS_SLUGGISH_PER_ZONE 0.010f // +slowed per zone cleared
+#define ENDLESS_SLUGGISH_MAX      0.55f  // hardest slow (=> 0.45x): still clearly movable, never a standstill
+float endlessMoveScale(void)
+{
+	if (!endlessMode || !(endlessActiveMods & ENDLESS_MOD_SLUGGISH))
+		return 1.0f;
+	float slow = (ENDLESS_SLUGGISH_BASE + ENDLESS_SLUGGISH_PER_ZONE * (float)endlessRunDepth)
+	           * (float)endlessDifficultyRampPercent() / 100.0f;
+	if (slow > ENDLESS_SLUGGISH_MAX)
+		slow = ENDLESS_SLUGGISH_MAX;
+	return 1.0f - slow;
+}
+
+// SHIELDLESS / DEADGEN: the shield stops recharging. SHIELDLESS just freezes regen (you keep the shield
+// you have, then fight on armor once it's spent); DEADGEN is the dead-generator nightmare, which implies
+// no regen too. tyrian2.c gates the shield-regen step on this.
+bool endlessShieldRegenOff(void)
+{
+	return endlessMode && (endlessActiveMods & (ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_DEADGEN));
+}
+
+// DEADGEN: the generator is dead, so it barely trickles charge -- the main gun (which draws generator
+// power per shot, shots.c) sputters and shields never refill, while rear guns / sidekicks / specials
+// (power-free) keep you in the fight. Never zero, so every weapon still EVENTUALLY fires -- brutal, not
+// unwinnable. Returns the normal rate untouched when the modifier is off (byte-identical normal play).
+#define ENDLESS_DEADGEN_POWER_ADD 2u   // generator charge per tick while dead (a normal generator adds ~5-23)
+unsigned endlessGeneratorPowerAdd(unsigned normalAdd)
+{
+	if (endlessMode && (endlessActiveMods & ENDLESS_MOD_DEADGEN))
+		return ENDLESS_DEADGEN_POWER_ADD;
+	return normalAdd;
 }
 
 // Player shot-damage scale (100 = normal): OVERCHARGE is a flat +50%; Overdrive adds +2.5%
@@ -1774,7 +1871,7 @@ long endlessStartingCash(void)
 // Payout/help registry: per-bit clear-cash `reward` (tenths of the base) + monitor `word`.
 // Generation lives in endlessGenerateCourses; every bit a course can carry is listed here.
 typedef struct {
-	unsigned    bit;
+	Uint64      bit;
 	short       reward;    // clear-cash reward in TENTHS of the base (10 = 1.0x base; may be < 0)
 	const char *word;      // short phrase for the generated help line
 } EndlessMod;
@@ -1803,6 +1900,10 @@ static const EndlessMod endlessModTable[] = {
 	{ ENDLESS_MOD_BURNOUT,   18, "kills weaken guns" },
 	{ ENDLESS_MOD_MISFIRE,   14, "kills cut your damage" },
 	{ ENDLESS_MOD_OVERHEAT,  14, "hull burns over time" },  // the reactor cooks you (gamble deal + rare Redline sector)
+	{ ENDLESS_MOD_TOPSY,     10, "upside-down view" },      // the playfield flips; controls invert with it (boss-style) -- a pure disorientation tax
+	{ ENDLESS_MOD_SLUGGISH,  15, "your ship slowed" },      // ship + mouse/touch crawl -- half the reach to dodge with
+	{ ENDLESS_MOD_SHIELDLESS, 12, "no shield regen" },      // shields never recharge -- once spent, you fly on armor
+	{ ENDLESS_MOD_DEADGEN,   30, "generator dead" },        // no shield regen AND the main gun is starved of power (super-rare)
 	// -- boons: they HELP you, so little/no cash (a couple pay big instead) --
 	{ ENDLESS_MOD_FRAGILE,       -5, "less enemy HP" },
 	{ ENDLESS_MOD_TURBODRIVE,      0, "kills quicken guns" },
@@ -1829,7 +1930,7 @@ static long endlessClearBase(void)
 // Clear payout for an ARBITRARY modifier set at the current depth: the base plus the summed
 // per-modifier reward (each in tenths of the base). Used both to pay out (endlessClearBonus)
 // and to SHOW the payout on a course's help line (endlessComboHelp) -- so the two can't disagree.
-static long endlessClearBonusFor(unsigned mods)
+static long endlessClearBonusFor(Uint64 mods)
 {
 	const long base = endlessClearBase();
 	long tenths = 0;
@@ -2240,12 +2341,13 @@ bool endlessTryBuyCleanse(void)
 	return true;
 }
 // Strip the single most-dangerous hostile bit from a modifier set (one per cleanse charge).
-static unsigned endlessStripWorstMod(unsigned mods)
+static Uint64 endlessStripWorstMod(Uint64 mods)
 {
-	static const unsigned order[] = {  // nastiest first
-		ENDLESS_MOD_LEGION, ENDLESS_MOD_APEX, ENDLESS_MOD_RAMPAGE, ENDLESS_MOD_OVERLOAD,
-		ENDLESS_MOD_ELITEPACK, ENDLESS_MOD_DEVASTATING, ENDLESS_MOD_FORTIFIED, ENDLESS_MOD_FRENZY,
-		ENDLESS_MOD_SWIFT, ENDLESS_MOD_OVERCLOCK, ENDLESS_MOD_ENRAGE, ENDLESS_MOD_GRAVITY,
+	static const Uint64 order[] = {  // nastiest first
+		ENDLESS_MOD_LEGION, ENDLESS_MOD_APEX, ENDLESS_MOD_DEADGEN, ENDLESS_MOD_RAMPAGE, ENDLESS_MOD_OVERLOAD,
+		ENDLESS_MOD_ELITEPACK, ENDLESS_MOD_DEVASTATING, ENDLESS_MOD_SHIELDLESS, ENDLESS_MOD_FORTIFIED, ENDLESS_MOD_FRENZY,
+		ENDLESS_MOD_SLUGGISH, ENDLESS_MOD_SWIFT, ENDLESS_MOD_OVERCLOCK, ENDLESS_MOD_ENRAGE,
+		ENDLESS_MOD_GRAVITY | ENDLESS_MOD_GRAVITY_OMNI, ENDLESS_MOD_TOPSY,  // gravity + its omni flag strip together, so a sabotaged well is fully cleared (not left as an orphaned omni pull)
 		ENDLESS_MOD_KAMIKAZE, ENDLESS_MOD_HOMING,  // the two mild homing tiers -- stripped last
 	};
 	for (unsigned i = 0; i < COUNTOF(order); ++i)
@@ -2744,7 +2846,7 @@ static int      endlessCourseCnt = 0;
 static int      endlessCourseEp[ENDLESS_MAX_COURSES];
 static JE_byte  endlessCourseSec[ENDLESS_MAX_COURSES];
 static JE_byte  endlessCourseFile[ENDLESS_MAX_COURSES];  // each course's specific lvlFileNum (see forcedLvlFileNum)
-static unsigned endlessCourseMod[ENDLESS_MAX_COURSES];
+static Uint64 endlessCourseMod[ENDLESS_MAX_COURSES];
 static int      endlessLastEp = 0;
 static JE_byte  endlessLastSec = 0;
 static bool     endlessForced = false;  // this visit is a forced "Ambush" (single dangerous sector)
@@ -2753,7 +2855,7 @@ static bool     endlessForced = false;  // this visit is a forced "Ambush" (sing
 // (endlessComboName looks up an exact bit-set here; anything unlisted gets a generated name).
 // Generation and payout are driven by endlessModTable, not these rows -- so this is purely
 // cosmetic naming, free to extend or trim without touching behaviour.
-typedef struct { unsigned mods; const char *name; } EndlessTheme;
+typedef struct { Uint64 mods; const char *name; } EndlessTheme;
 
 static const EndlessTheme endlessHostileThemes[] = {
 	// -- single dangers --
@@ -2765,6 +2867,8 @@ static const EndlessTheme endlessHostileThemes[] = {
 	{ ENDLESS_MOD_GRAVITY,     "Gravity Well" },
 	{ ENDLESS_MOD_ELITEPACK,   "Elite Pack" },
 	{ ENDLESS_MOD_OVERCLOCK,   "Overclock" },
+	{ ENDLESS_MOD_TOPSY,       "Topsy-Turvy" },  // fork: upside-down screen (boss-style -- controls invert with the view)
+	{ ENDLESS_MOD_SLUGGISH,    "Molasses" },      // fork: slowed ship (depth-scaled; combos below -- its gravity pairing is a rare injection)
 
 	// -- pairs: tough + shots --
 	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY,       "Onslaught" },
@@ -2878,6 +2982,50 @@ static const EndlessTheme endlessHostileThemes[] = {
 
 	// -- mixed (a boon bit riding a hostile course) --
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_DEVASTATING,    "Glass Cannon" },
+
+	// -- fork mods: TOPSY (flipped view) pairs. Safe with everything (purely visual), so it mixes
+	//    freely -- these are the NAMED pairings; TOPSY is also in the combinable pool for emergent combos.
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FORTIFIED,      "Capsize" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FRENZY,         "Vertigo" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_SWIFT,          "Corkscrew" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_DEVASTATING,    "Upheaval" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_ENRAGE,         "Whirligig" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_ELITEPACK,      "Off-Kilter" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_OVERCLOCK,      "Barrel Roll" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_GRAVITY,        "Somersault" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_SLUGGISH,       "Head Rush" },
+	// -- fork mods: SLUGGISH (slowed ship) pairs. GRAVITY is deliberately absent here -- that pairing
+	//    is the rare Tar Pit injection (endlessSluggishThemes) -- but every other pairing is fair game.
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_FORTIFIED,   "Anchored" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_FRENZY,      "Slog" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_SWIFT,       "Bogged Down" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_DEVASTATING, "Lead Boots" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_ENRAGE,      "War of Attrition II" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_ELITEPACK,   "Ballast" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_OVERCLOCK,   "Millstone" },
+	// -- fork mods: a few triples (no SLUGGISH+GRAVITY here) --
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,          "Tumbler" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Keelhaul" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,   "Free Fall" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_FRENZY,       "Disorient" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,       "Bullet Wade" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Deadlock" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ELITEPACK,    "Molasses Run" },
+
+	// -- SHIELDLESS (shields never recharge): a defense debuff, safe to combine and in the pool too --
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_FORTIFIED,   "Attrition" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_FRENZY,      "Exposed" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_SWIFT,       "Pincushion" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_DEVASTATING, "Glass Hull" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_ENRAGE,      "Overexposed" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_ELITEPACK,   "Outmatched" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_OVERCLOCK,   "No Cover" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_GRAVITY,     "Naked Descent" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_TOPSY,       "Spin Out" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_SLUGGISH,    "Sitting Target" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,        "Kill Box" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Last Ditch" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_SWIFT,     "No Quarter" },
 };
 
 // KAMIKAZE sectors (homing rammers) are much harder to fly, so they get their own pool and are
@@ -2934,7 +3082,7 @@ static const EndlessTheme endlessBoonThemes[] = {
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FAVOR,        "Clearance" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_BOUNTY,     "Killing Spree" },
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_BOUNTY,    "Mercenary" },
-	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_BOUNTY,    "Smash 'n' Grab" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_BOUNTY,    "Smash and Grab" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_SLIPSTREAM,  "Time Warp" },
 	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_OVERCHARGE, "Power Surge" },
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_OVERCHARGE, "Deadeye" },
@@ -3020,6 +3168,22 @@ static const EndlessTheme endlessRareThemes[] = {
 	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK, "Wrath of God" },
 	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Purgatory" },
 	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY, "Tartarus" },
+	// -- fork-mod nightmares (Cataclysm pool): the flipped view / crawling ship welded onto a full danger stack --
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,   "Kaleidoscope" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "Oubliette" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE, "Naked Siege" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_TOPSY | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "Sensory Overload" },
+	// -- more Apex-tier (elite) rares --
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,   "Apex Predator" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY,    "Apex Onslaught" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING, "Event Apex" },
+	// -- more Legion-tier (champion) rares --
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Final Legion" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Legion Siege" },
+	// -- more pure multi-danger nightmares (Cataclysm pool: no Apex/Legion bit) --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY,   "Doomtide" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK,    "Deathstorm" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY, "The End" },
 };
 
 // EVIL Turbodrive / Overdrive: hostile mirrors of the two boons -- they SLOW your fire (Evil
@@ -3072,12 +3236,160 @@ static const EndlessTheme endlessRedlineThemes[] = {
 	{ ENDLESS_MOD_OVERHEAT | ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FRENZY, "Redline Frenzy" },
 };
 
+// SLUGGISH + GRAVITY: the "heavy, inescapable" nightmares -- the ship crawls WHILE dragged down.
+// Survivable by design (endlessGravityDrift slows the pull in lock-step with the ship, so full
+// throttle still climbs), but brutal -- its own tiny pool injected RARELY (like Kamikaze / Overload)
+// rather than shuffled into the rotation. The bare pairing is the headline "Tar Pit".
+static const EndlessTheme endlessSluggishThemes[] = {
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_GRAVITY,                           "Tar Pit" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING, "Quicksand" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_FRENZY,      "Quagmire" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_SWIFT,       "Sinkhole" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_FORTIFIED,   "Abyss" },
+};
+
+// DEADGEN (dead generator): shields never refill AND the main gun is starved to a sputter -- a super-
+// rare, evil sabotage sector with its own pool (injected ~1/55; never in the combinable pool or the
+// shuffle). Rear guns / sidekicks / specials still work, so it's brutal, not unwinnable.
+static const EndlessTheme endlessDeadgenThemes[] = {
+	{ ENDLESS_MOD_DEADGEN,                            "Dead Reactor" },
+	{ ENDLESS_MOD_DEADGEN | ENDLESS_MOD_DEVASTATING,  "Defenseless" },
+	{ ENDLESS_MOD_DEADGEN | ENDLESS_MOD_FRENZY,       "Powerless" },
+	{ ENDLESS_MOD_DEADGEN | ENDLESS_MOD_SWIFT,        "Brownout" },
+	{ ENDLESS_MOD_DEADGEN | ENDLESS_MOD_ELITEPACK,    "Cold Start" },
+};
+
+// NAMING ONLY: the bare omnidirectional gravity well gets its own headline so Chart-a-Course reads it
+// as its own thing. Generation never draws from this table (the OMNI bit is added by the 50% roll on
+// any gravity course in endlessGenerateCourses); it only supplies the name. Every OMNI *combo* has no
+// entry here and falls through to its plain-gravity twin's name via the mask in endlessFindTheme.
+static const EndlessTheme endlessGravityOmniThemes[] = {
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_GRAVITY_OMNI, "Rogue Well" },
+};
+
+// MIXED "gambit" sectors: a real BOON welded to real DANGER, so the sector reads as risk AND reward
+// (threats on the monitor's red column, boons on the green). Every entry pairs a boon with hostiles
+// on DIFFERENT levers, so nothing cancels: FRAGILE never rides FORTIFIED (opposite HP), DILATION never
+// rides SWIFT/OVERCLOCK (opposite shot speed), and at most one kill-fire boon appears (they share one
+// stack). Naming/monitor/payout are all driven by endlessModTable, so these rows are purely cosmetic
+// labels -- generation grafts boons onto hostile courses (endlessPickMixBoon) and the matches land here;
+// anything unlisted falls through to the "gambit" generic names. FRAGILE|DEVASTATING is intentionally
+// absent -- it's the hostile table's "Glass Cannon".
+static const EndlessTheme endlessMixedThemes[] = {
+	// -- pairs: your shots hit harder (Overcharge) vs one threat --
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FORTIFIED,   "Can Opener" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FRENZY,      "Return Fire" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_SWIFT,       "Quickdraw" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_DEVASTATING, "Standoff" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_ELITEPACK,   "Giant Slayer" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_GRAVITY,     "Heavy Hitter" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_ENRAGE,      "Beat the Clock" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_SHIELDLESS,  "All In" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_TOPSY,       "Topsy Duel" },
+	// -- pairs: frail foes (Fragile) vs one threat --
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FRENZY,         "Paper Storm" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SWIFT,          "Glass Darts" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_ELITEPACK,      "Brittle Elites" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_ENRAGE,         "Short Fuse" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_GRAVITY,        "Feather Fall" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERCLOCK,      "Blur" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SHIELDLESS,     "Trade Blows" },
+	// -- pairs: enemy shots crawl (Dilation) vs one threat --
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FORTIFIED,     "War of Patience" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FRENZY,        "Slow Motion" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_DEVASTATING,   "Read the Room" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_ELITEPACK,     "Matrix" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_GRAVITY,       "Deep Focus" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_ENRAGE,        "Steady Hand" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_SHIELDLESS,    "Cold Read" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_TOPSY,         "Slow Spin" },
+	// -- pairs: fat cash (Bounty) vs one threat (pure risk-for-money, no safety) --
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_FORTIFIED,       "Big Game" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_FRENZY,          "Hot Zone" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_SWIFT,           "High Stakes" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_DEVASTATING,     "Danger Pay" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_ELITEPACK,       "Trophy Hunt" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_GRAVITY,         "Deep Dive" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_ENRAGE,          "Overtime" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_OVERCLOCK,       "Rush Job" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_SHIELDLESS,      "Hazard Bonus" },
+	// -- pairs: kills feed your guns (Turbodrive) vs one threat --
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FORTIFIED,   "Grind" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FRENZY,      "Trigger Happy" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_SWIFT,       "Fast Hands" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_ELITEPACK,   "Cull the Herd" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_ENRAGE,      "Second Wind" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_GRAVITY,     "Dig In" },
+	// -- pairs: cheaper shop next (Favor) vs one threat --
+	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_FORTIFIED,        "Toll Road" },
+	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_SWIFT,            "Hazard Discount" },
+	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_DEVASTATING,      "Combat Pay" },
+	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_FRENZY,           "Loss Leader" },
+	// -- pairs: kills stack your damage (Overblast) / firepower (Overdrive) / faster level (Slipstream) --
+	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_FORTIFIED,    "Sledge" },
+	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_SWIFT,        "Piercer" },
+	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_ELITEPACK,    "Headhunter" },
+	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_FORTIFIED,    "Snowball" },
+	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_ELITEPACK,    "Killstreaker" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FRENZY,      "Fast Lane" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_DEVASTATING, "Runaway" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FORTIFIED,   "Bypass" },
+
+	// -- triples: boon + two threats --
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,       "Armor Piercer" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,          "Counterstrike" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Slugfest" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_SWIFT,       "Elite Duel" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "Trading Blows" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,   "Sinker" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY,        "Bullet Dance" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,      "Zen Garden" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING,   "Stonewall Zen" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FRENZY,        "Slow Dance" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,             "Confetti" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,        "Glass Storm" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE,            "Tinderbox" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_SWIFT,          "Spun Glass" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,           "Bounty Board" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,        "Blood Money" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,         "Dead or Alive" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED,       "Kingpin" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,          "Frenzy Feed" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ELITEPACK,   "Grinder" },
+	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,            "Risk Premium" },
+	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,        "Overpenetrate" },
+	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,           "Chain Lightning" },
+
+	// -- quads: boon + three threats --
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,      "Last Word" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "Overmatch" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,  "Eye of the Storm" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,       "Shattering" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE,            "Powder Keg" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,        "Death & Taxes" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,          "Payday Run" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,   "Elite Overmatch" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,      "Feeding Frenzy" },
+
+	// -- rare gambits: TWO boons welded to real danger (bigger upside, bigger risk) --
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_DILATION | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Perfect Storm" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,           "Blood Bargain" },
+	{ ENDLESS_MOD_BOUNTY | ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED,     "High Roller" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_DEVASTATING, "Bullet Ballet" },
+};
+
 // Find the theme for an exact effect-bit set (NULL = Calm / no modifiers).
-static const EndlessTheme *endlessFindTheme(unsigned mods)
+static const EndlessTheme *endlessFindTheme(Uint64 mods)
 {
+	for (unsigned i = 0; i < COUNTOF(endlessGravityOmniThemes); ++i)
+		if (endlessGravityOmniThemes[i].mods == mods)
+			return &endlessGravityOmniThemes[i];
 	for (unsigned i = 0; i < COUNTOF(endlessHostileThemes); ++i)
 		if (endlessHostileThemes[i].mods == mods)
 			return &endlessHostileThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessMixedThemes); ++i)
+		if (endlessMixedThemes[i].mods == mods)
+			return &endlessMixedThemes[i];
 	for (unsigned i = 0; i < COUNTOF(endlessKamikazeThemes); ++i)
 		if (endlessKamikazeThemes[i].mods == mods)
 			return &endlessKamikazeThemes[i];
@@ -3099,6 +3411,17 @@ static const EndlessTheme *endlessFindTheme(unsigned mods)
 	for (unsigned i = 0; i < COUNTOF(endlessRedlineThemes); ++i)
 		if (endlessRedlineThemes[i].mods == mods)
 			return &endlessRedlineThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessSluggishThemes); ++i)
+		if (endlessSluggishThemes[i].mods == mods)
+			return &endlessSluggishThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessDeadgenThemes); ++i)
+		if (endlessDeadgenThemes[i].mods == mods)
+			return &endlessDeadgenThemes[i];
+	// OMNI fallthrough: an omnidirectional gravity combo with no exact name reads as its plain-gravity
+	// twin (Dense Matter, Event Horizon, ...). Strip the cosmetic OMNI bit and retry once -- the retry
+	// has no OMNI bit, so it can't recurse further.
+	if (mods & ENDLESS_MOD_GRAVITY_OMNI)
+		return endlessFindTheme(mods & ~ENDLESS_MOD_GRAVITY_OMNI);
 	return NULL;
 }
 
@@ -3106,7 +3429,7 @@ static const EndlessTheme *endlessFindTheme(unsigned mods)
 // and NONE of the `forbid` bits. This lets the injections draw straight from the name tables
 // (endlessBoonThemes / endlessRareThemes) -- so adding a row there makes that sector appear,
 // with no separate injection pool to keep in sync. Returns `must` if nothing matches.
-static unsigned endlessPickThemeMods(const EndlessTheme *tbl, unsigned count, unsigned must, unsigned forbid)
+static Uint64 endlessPickThemeMods(const EndlessTheme *tbl, unsigned count, Uint64 must, Uint64 forbid)
 {
 	unsigned n = 0;
 	for (unsigned i = 0; i < count; ++i)
@@ -3122,23 +3445,65 @@ static unsigned endlessPickThemeMods(const EndlessTheme *tbl, unsigned count, un
 	return must;  // unreachable
 }
 
-// Evocative names for un-curated (randomly generated) combos, picked deterministically per
-// bitset so a given combo always reads the same.
+// Bits that make a sector DANGEROUS. The danger score sums only these, so a pure-boon course -- e.g.
+// Bounty, which pays big but adds no danger -- never reads as a high tier. Cursed is handled apart
+// (it's a trap, not a danger). Defined here (ahead of endlessComboName) because the type-aware naming
+// below classifies a combo as hostile / boon / mixed off these masks.
+#define ENDLESS_HOSTILE_MASK ( \
+	ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | \
+	ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION | ENDLESS_MOD_ENRAGE | \
+	ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_OVERLOAD | \
+	ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_BURNOUT | ENDLESS_MOD_MISFIRE | ENDLESS_MOD_OVERHEAT | \
+	ENDLESS_MOD_HOMING | ENDLESS_MOD_RAMPAGE | ENDLESS_MOD_TOPSY | ENDLESS_MOD_SLUGGISH | \
+	ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_DEADGEN )
+
+// Bits that HELP you -- the boon side. A course carrying any of these plus a hostile bit is a "mixed"
+// gambit (risk + reward). WARP is a boon (rare); the evil kill-fire mirrors are hostile (above), and
+// CURSED is a trap counted on the hostile side, so neither belongs here.
+#define ENDLESS_BOON_MASK ( \
+	ENDLESS_MOD_FRAGILE | ENDLESS_MOD_BOUNTY | ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE | \
+	ENDLESS_MOD_DILATION | ENDLESS_MOD_FAVOR | ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_OVERDRIVE | \
+	ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_WARP )
+
+// Evocative names for un-curated (randomly generated) combos, picked deterministically per bitset so a
+// given combo always reads the same. Three flavors so an un-named combo still reads the RIGHT tone: an
+// ominous word for pure danger, a fortunate word for a pure boon combo, a "gambit" word for a mixed one.
 static const char *const endlessGenericNames[] = {
 	"Havoc", "Chaos", "Carnage", "Ruin", "Fury", "Terror", "Doom", "Peril",
 	"Menace", "Scourge", "Bedlam", "Mayhem", "Torment", "Dread", "Malice",
 	"Ordeal", "Gauntlet", "Crucible", "Inferno", "Tempest", "Reckoning",
 	"Oblivion", "Rampage", "Turmoil", "Onset", "Affliction",
 };
+static const char *const endlessBoonGenericNames[] = {
+	"Godsend", "Reprieve", "Tailwind", "Grace", "Easy Street", "Good Omen",
+	"Lucky Star", "Silver Lining", "Uplift", "Bright Side", "Fair Winds",
+	"Respite", "Blessing", "Sanctuary", "Boon", "Windswept",
+};
+static const char *const endlessMixedGenericNames[] = {
+	"Gambit", "Trade-off", "Bargain", "Double Edge", "Wager", "Faustian",
+	"Devil's Deal", "Two-Edged", "Give and Take", "Long Shot", "Roll the Dice",
+	"Loaded Dice", "Bittersweet", "Mixed Bag", "Toss-Up", "Wild Card", "Crossroads",
+};
 
-const char *endlessComboName(unsigned mods)
+const char *endlessComboName(Uint64 mods)
 {
 	const EndlessTheme *t = endlessFindTheme(mods);
 	if (t)
 		return t->name;                    // curated combos keep their cool names
 	if (mods == 0)
 		return "Calm Sector";
-	unsigned h = mods ^ (mods >> 4) ^ (mods >> 9);  // mix so nearby bitsets differ
+	// Mask the cosmetic OMNI bit so an un-named omni gravity combo shares its plain-gravity twin's
+	// generated name (the direction is a runtime surprise, not a different sector on the chart).
+	Uint64 key = mods & ~ENDLESS_MOD_GRAVITY_OMNI;
+	Uint64 h = key ^ (key >> 4) ^ (key >> 9);  // mix so nearby bitsets differ
+	// Classify off the danger/boon masks so the generated name matches the sector's tone. Cursed counts
+	// hostile-side (it's a trap), matching how the monitor lists it.
+	const bool hasHostile = (key & (ENDLESS_HOSTILE_MASK | ENDLESS_MOD_CURSED)) != 0;
+	const bool hasBoon    = (key & ENDLESS_BOON_MASK) != 0;
+	if (hasBoon && hasHostile)
+		return endlessMixedGenericNames[h % COUNTOF(endlessMixedGenericNames)];
+	if (hasBoon)
+		return endlessBoonGenericNames[h % COUNTOF(endlessBoonGenericNames)];
 	return endlessGenericNames[h % COUNTOF(endlessGenericNames)];
 }
 
@@ -3147,15 +3512,8 @@ const char *endlessComboName(unsigned mods)
 // quick risk read at a glance; the payout (drawn highlighted right after this text by game_menu.c)
 // is the matching reward -- and since both derive from the same reward table, they never disagree.
 
-// Bits that make a sector DANGEROUS. The danger score sums only these, so a pure-boon course -- e.g.
-// Bounty, which pays big but adds no danger -- never reads as a high tier. Cursed is handled apart
-// (it's a trap, not a danger); the personal boons/curses split boon-side vs evil-side here.
-#define ENDLESS_HOSTILE_MASK ( \
-	ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | \
-	ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION | ENDLESS_MOD_ENRAGE | \
-	ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_OVERLOAD | \
-	ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_BURNOUT | ENDLESS_MOD_MISFIRE | ENDLESS_MOD_OVERHEAT | \
-	ENDLESS_MOD_HOMING | ENDLESS_MOD_RAMPAGE )
+// ENDLESS_HOSTILE_MASK / ENDLESS_BOON_MASK are defined earlier (just above endlessComboName), which
+// classifies combos by tone from them; the danger score / tier / rank below reuse the same masks.
 
 // Max pixel width of the description on the Chart-a-Course bar (drawn at x=10 in the 320-wide legacy
 // layout, with the highlighted payout right-aligned to x=305 after it). A curated line wider than this
@@ -3183,9 +3541,9 @@ static const struct { unsigned bit; int credit; } endlessBoonMitigation[] = {
 // base) minus any survival-boon credit above. A course with no hostile bits scores 0, so the tier
 // words it as Boon/Calm and never needs a number. A hostile course floors at 1, so even a heavily
 // mitigated danger still reads at least "Low" rather than collapsing to a boon.
-static int endlessDangerScore(unsigned mods)
+static int endlessDangerScore(Uint64 mods)
 {
-	const unsigned h = mods & ENDLESS_HOSTILE_MASK;
+	const Uint64 h = mods & ENDLESS_HOSTILE_MASK;
 	if (h == 0)
 		return 0;
 	int t = 0;
@@ -3203,7 +3561,7 @@ static int endlessDangerScore(unsigned mods)
 // bands below spread the whole score range so single-danger sectors fan out into distinct rungs;
 // the thresholds are the tuning knobs, and endlessDangerRank below must stay in lockstep with them
 // so the word and the letter grade never disagree.
-static const char *endlessDangerTier(unsigned mods)
+static const char *endlessDangerTier(Uint64 mods)
 {
 	if (mods & ENDLESS_MOD_CURSED)          return "Trap";
 	if ((mods & ENDLESS_HOSTILE_MASK) == 0) return (mods == 0) ? "Calm" : "Boon";
@@ -3224,7 +3582,7 @@ static const char *endlessDangerTier(unsigned mods)
 // hostile course floors at score 1, so even the mildest danger reads E, not F. The numeric level is
 // the single source of truth for both the letter string and the green-to-red tint the monitor draws
 // it in (game_menu.c endlessRankHue[]), so those two can never drift.
-static int endlessDangerRankLevel(unsigned mods)
+static int endlessDangerRankLevel(Uint64 mods)
 {
 	if ((mods & ENDLESS_HOSTILE_MASK) == 0) return 0; // F
 	const int s = endlessDangerScore(mods);
@@ -3239,7 +3597,7 @@ static int endlessDangerRankLevel(unsigned mods)
 	return 9;              // S+++
 }
 static const char *const endlessRankName[10] = { "F", "E", "D", "C", "B", "A", "S", "S+", "S++", "S+++" };
-static const char *endlessDangerRank(unsigned mods)
+static const char *endlessDangerRank(Uint64 mods)
 {
 	return endlessRankName[endlessDangerRankLevel(mods)];
 }
@@ -3299,7 +3657,7 @@ static const struct { unsigned mods; const char *desc; } endlessCuratedDesc[] = 
 	{ ENDLESS_MOD_MISFIRE,     "kills cut your damage" },
 };
 
-static const char *endlessCuratedDescFor(unsigned mods)
+static const char *endlessCuratedDescFor(Uint64 mods)
 {
 	for (unsigned i = 0; i < COUNTOF(endlessCuratedDesc); ++i)
 		if (endlessCuratedDesc[i].mods == mods)
@@ -3336,7 +3694,7 @@ static void endlessJoinThreats(const int *idx, int shown, int total, char *out, 
 // packing in as many as FIT the given pixel budget and tagging "and more" when the rest are dropped --
 // so a busy sector always leads with its deadliest dangers and a cut line only ever loses the mildest.
 // Pure-boon sectors list their top benefits the same way (a boon's low reward just sorts it later).
-static void endlessAutoBody(unsigned mods, char *out, size_t sz, unsigned font, int maxW)
+static void endlessAutoBody(Uint64 mods, char *out, size_t sz, unsigned font, int maxW)
 {
 	int idx[COUNTOF(endlessModTable)], n = 0;
 	for (unsigned i = 0; i < COUNTOF(endlessModTable); ++i)
@@ -3388,7 +3746,7 @@ static void endlessClampWidth(char *s, unsigned font, int maxW)
 		s[--len] = '\0';
 }
 
-const char *endlessComboHelp(unsigned mods)
+const char *endlessComboHelp(Uint64 mods)
 {
 	static char buf[192];
 
@@ -3434,6 +3792,53 @@ long endlessCoursePayout(int i)
 	if (i < 0 || i >= endlessCourseCnt)
 		return 0;
 	return endlessClearBonusFor(endlessCourseMod[i]);
+}
+
+// Pick a random BOON bit safe to weld onto a hostile course that already carries `hostiles`, turning it
+// into a MIXED "gambit" sector (real reward on real danger). Boons that would fight an existing threat on
+// the SAME lever are held back -- frail foes vs +HP (Fortified), crawling shots vs faster shots
+// (Swift/Overclock) -- so the sector's red/green monitor rows never contradict. Only one boon is added, so
+// the one-kill-fire-mod rule holds. The first five are always eligible, so this never returns 0.
+static Uint64 endlessPickMixBoon(Uint64 hostiles)
+{
+	Uint64 cand[8];
+	int n = 0;
+	cand[n++] = ENDLESS_MOD_OVERCHARGE;   // more player damage -- always safe
+	cand[n++] = ENDLESS_MOD_TURBODRIVE;   // kills quicken your guns -- always safe
+	cand[n++] = ENDLESS_MOD_OVERBLAST;    // kills stack your damage -- always safe
+	cand[n++] = ENDLESS_MOD_BOUNTY;       // pure cash, no safety -- always safe
+	cand[n++] = ENDLESS_MOD_FAVOR;        // cheaper next shop -- always safe
+	if (!(hostiles & ENDLESS_MOD_FORTIFIED))                        // frail vs +HP would cancel
+		cand[n++] = ENDLESS_MOD_FRAGILE;
+	if (!(hostiles & (ENDLESS_MOD_SWIFT | ENDLESS_MOD_OVERCLOCK)))  // slow shots vs fast shots would cancel
+		cand[n++] = ENDLESS_MOD_DILATION;
+	if (!(hostiles & ENDLESS_MOD_OVERCLOCK))                        // keep the faster-level boon clean
+		cand[n++] = ENDLESS_MOD_SLIPSTREAM;
+	return cand[endlessRand() % n];
+}
+
+// Build a random emergent PURE-BOON combo (2, sometimes 3 bits) for a boon course -- more variety than
+// the named boon themes alone. The pool holds only ONE kill-fire boon (Turbodrive), so two can never
+// stack, and every pair is on an independent lever, so nothing cancels.
+static Uint64 endlessMakeBoonCombo(void)
+{
+	static const Uint64 pool[] = {
+		ENDLESS_MOD_FRAGILE, ENDLESS_MOD_BOUNTY, ENDLESS_MOD_OVERCHARGE, ENDLESS_MOD_DILATION,
+		ENDLESS_MOD_FAVOR, ENDLESS_MOD_SLIPSTREAM, ENDLESS_MOD_TURBODRIVE,
+	};
+	int ord[COUNTOF(pool)];
+	for (unsigned k = 0; k < COUNTOF(pool); ++k)
+		ord[k] = (int)k;
+	for (int k = (int)COUNTOF(pool) - 1; k > 0; --k)
+	{
+		const int j = endlessRand() % (k + 1);
+		const int t = ord[k]; ord[k] = ord[j]; ord[j] = t;
+	}
+	const int want = 2 + (endlessRand() % 100 < 40);   // 2, sometimes 3
+	Uint64 combo = 0;
+	for (int k = 0; k < want && k < (int)COUNTOF(pool); ++k)
+		combo |= pool[ord[k]];
+	return combo;
 }
 
 void endlessGenerateCourses(void)
@@ -3499,16 +3904,21 @@ void endlessGenerateCourses(void)
 
 	// WIDEN VARIETY: about half the hostile courses instead get a RANDOM combination of the
 	// common hostile bits (any un-named combo still gets a generated name/help). Weighted
-	// toward 2 bits; kamikaze/overload/warp stay out (they're special, injected rarely).
-	static const unsigned combinable[] = {
+	// toward 2-4 bits; kamikaze/overload/warp/sluggish stay out (special or rare-injected -- SLUGGISH's
+	// only combinable pairing, gravity, is a rare injection, so it can't emerge randomly here).
+	static const Uint64 combinable[] = {
 		ENDLESS_MOD_FORTIFIED, ENDLESS_MOD_FRENZY, ENDLESS_MOD_SWIFT, ENDLESS_MOD_DEVASTATING,
 		ENDLESS_MOD_ENRAGE, ENDLESS_MOD_GRAVITY, ENDLESS_MOD_ELITEPACK, ENDLESS_MOD_OVERCLOCK,
+		ENDLESS_MOD_TOPSY,  // the flipped-view mod mixes freely with everything (purely visual, no softlock)
+		ENDLESS_MOD_SHIELDLESS,  // a pure defense debuff -- safe to stack onto any combo (DEADGEN stays out: super-rare, injected only)
 	};
 	for (int c = 1; c < endlessCourseCnt; ++c)
 	{
 		if (endlessRand() % 2 != 0)   // ~half stay curated named themes
 			continue;
-		int want = 1 + (endlessRand() % 100 < 60) + (endlessRand() % 100 < 30) + (endlessRand() % 100 < 8);
+		// Bit-count weights leaning heavier on triples/quads than before, so busy multi-danger sectors
+		// show up as often as clean singles (avg ~2.8 bits, up from ~2.3).
+		int want = 1 + (endlessRand() % 100 < 80) + (endlessRand() % 100 < 55) + (endlessRand() % 100 < 30) + (endlessRand() % 100 < 12);
 		if (want > (int)COUNTOF(combinable))
 			want = (int)COUNTOF(combinable);
 		int ord[COUNTOF(combinable)];
@@ -3519,18 +3929,48 @@ void endlessGenerateCourses(void)
 			const int j = endlessRand() % (k + 1);
 			const int tmp = ord[k]; ord[k] = ord[j]; ord[j] = tmp;
 		}
-		unsigned combo = 0;
+		Uint64 combo = 0;
 		for (int k = 0; k < want; ++k)
 			combo |= combinable[ord[k]];
 		endlessCourseMod[c] = combo;
 	}
 
-	// A boon course is uncommon (~1 in 3 visits replaces a hostile one), drawn straight from the
-	// boon theme table (WARP excluded -- it has its own rare injection below).
+	// A boon course is uncommon (~1 in 3 visits replaces a hostile one): most draw a named boon theme
+	// (single or curated combo, WARP excluded -- it has its own rare injection below), but ~40% instead
+	// roll a fresh emergent boon pair/triple, so pure-good sectors vary beyond the named set too.
 	if (endlessCourseCnt > 1 && (endlessRand() % 3) == 0)
 	{
 		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
-		endlessCourseMod[slot] = endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, ENDLESS_MOD_WARP);
+		if (endlessRand() % 100 < 40)
+			endlessCourseMod[slot] = endlessMakeBoonCombo();
+		else
+			endlessCourseMod[slot] = endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, ENDLESS_MOD_WARP);
+	}
+
+	// MIXED "gambit" sectors: graft a compatible boon onto some ORDINARY hostile courses, welding a real
+	// reward onto real danger. This is the main source of good-mixed-with-bad variety -- roughly a third of
+	// the plain hostile courses become a risk/reward gambit each visit. Only "ordinary" courses (hostile
+	// bits drawn from the combinable pool) are eligible, so rare signatures (Apex / Overload / Kamikaze /
+	// Tar Pit / dead generator / evil-mirror / ...) and boon/clean routes keep their identity. The boon is
+	// chosen to never fight the course's threats (endlessPickMixBoon), and only one is added, so the
+	// one-kill-fire rule holds. Named pairs/triples/quads land their endlessMixedThemes label; the rest read
+	// as a generated "gambit". Runs after the boon roll (won't override a boon course) and before the danger
+	// sort, so the mitigation credit lands the gambit at the right rung.
+	{
+		Uint64 mixCommon = 0;
+		for (unsigned k = 0; k < COUNTOF(combinable); ++k)
+			mixCommon |= combinable[k];
+		for (int c = 1; c < endlessCourseCnt; ++c)
+		{
+			const Uint64 h = endlessCourseMod[c] & ENDLESS_HOSTILE_MASK;
+			if (h == 0 || (h & ~mixCommon) != 0)       // only ordinary hostile courses
+				continue;
+			if (endlessCourseMod[c] & ENDLESS_BOON_MASK) // already a gambit / carries a boon
+				continue;
+			if (endlessRand() % 100 >= 35)             // ~35% of eligible courses gain a boon
+				continue;
+			endlessCourseMod[c] |= endlessPickMixBoon(h);
+		}
 	}
 
 	// Homing sectors are the GENTLEST homing tier (enemies barely lean toward you, no ram) -- rare,
@@ -3581,6 +4021,16 @@ void endlessGenerateCourses(void)
 		endlessCourseMod[slot] = endlessRedlineThemes[endlessRand() % COUNTOF(endlessRedlineThemes)].mods;
 	}
 
+	// Tar Pit (SLUGGISH + GRAVITY: the ship crawls WHILE dragged down) -- rare, ~1 in 30 visits one
+	// hostile course becomes a heavy-and-slow nightmare from its own pool. Brutal, but always flyable
+	// (endlessGravityDrift slows the pull with the ship). SLUGGISH stays out of the combinable pool, so
+	// this injection is the ONLY place the sluggish+gravity pairing appears.
+	if (endlessCourseCnt > 1 && (endlessRand() % 30) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessSluggishThemes[endlessRand() % COUNTOF(endlessSluggishThemes)].mods;
+	}
+
 	// Apex Swarm (every enemy elite) is a rare, nasty sector -- ~1 in 40 visits it takes over one
 	// hostile course, drawn from the Apex-tier rare themes (bare Apex, or Apex + an extra danger).
 	// Rolled late so it can override a boon slot.
@@ -3607,6 +4057,16 @@ void endlessGenerateCourses(void)
 		endlessCourseMod[slot] = endlessPickThemeMods(endlessRareThemes, COUNTOF(endlessRareThemes), 0, ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION);
 	}
 
+	// Dead Generator (DEADGEN: no shield regen AND a power-starved main gun) -- SUPER rare, ~1 in 55
+	// visits one hostile course becomes a sabotage sector from its own pool. The nastiest handicap in
+	// the game, so it's the rarest; rear guns / sidekicks / specials carry the fight. Rolled last of the
+	// danger injections so it claims the slot when it fires.
+	if (endlessCourseCnt > 1 && (endlessRand() % 55) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessDeadgenThemes[endlessRand() % COUNTOF(endlessDeadgenThemes)].mods;
+	}
+
 	// Guarantee the offered courses are all distinct. The shuffle assigns distinct base themes, but
 	// the random-combo widening (and, rarely, an injection) can independently land two slots on the
 	// same modifier set, e.g. two "Fusillade"s (FRENZY|DEVASTATING). Re-roll any duplicate to an
@@ -3623,7 +4083,7 @@ void endlessGenerateCourses(void)
 
 		for (unsigned t = 0; t < COUNTOF(endlessHostileThemes); ++t)
 		{
-			const unsigned m = endlessHostileThemes[idx[t]].mods;  // idx[] = the shuffled theme order
+			const Uint64 m = endlessHostileThemes[idx[t]].mods;  // idx[] = the shuffled theme order
 			bool used = false;
 			for (int k = 0; k < endlessCourseCnt && !used; ++k)
 				if (k != c && endlessCourseMod[k] == m)
@@ -3678,7 +4138,7 @@ void endlessGenerateCourses(void)
 				continue;  // already a danger -- leave it be
 			for (unsigned t = 0; t < COUNTOF(endlessHostileThemes); ++t)
 			{
-				const unsigned m = endlessHostileThemes[idx[t]].mods;
+				const Uint64 m = endlessHostileThemes[idx[t]].mods;
 				bool used = false;
 				for (int k = 0; k < endlessCourseCnt && !used; ++k)
 					if (k != c && endlessCourseMod[k] == m)
@@ -3715,6 +4175,67 @@ void endlessGenerateCourses(void)
 		endlessCourseMod[0] = combos[endlessRand() % COUNTOF(combos)];
 	}
 
+	// DIVERSE CHOICE: with a full slate (4-5 courses), make sure at least one hostile course is a SINGLE
+	// negative modifier -- a clean, legible "light" option beside the busy combos, so Chart-a-Course reads
+	// as a real spread of risk rather than a wall of multi-danger sectors. If none ended up a lone hostile
+	// bit, thin the mildest ORDINARY course (built only from the common combinable bits) down to just its
+	// least-nasty bit -- never touching a rare signature (Tar Pit / Overload / Apex / dead generator / ...)
+	// or a boon / clean route. Runs before the OMNI roll + sort, so the reduced course sorts to the easy end.
+	if (endlessCourseCnt >= 4)
+	{
+		bool haveSingle = false;
+		for (int c = 1; c < endlessCourseCnt && !haveSingle; ++c)
+		{
+			const Uint64 h = endlessCourseMod[c] & ENDLESS_HOSTILE_MASK;
+			if (h != 0 && (h & (h - 1)) == 0)   // exactly one hostile bit
+				haveSingle = true;
+		}
+		if (!haveSingle)
+		{
+			Uint64 commonMask = 0;
+			for (unsigned k = 0; k < COUNTOF(combinable); ++k)
+				commonMask |= combinable[k];
+			int best = -1, bestBits = 99;
+			for (int c = 1; c < endlessCourseCnt; ++c)
+			{
+				const Uint64 h = endlessCourseMod[c] & ENDLESS_HOSTILE_MASK;
+				if (h == 0 || (h & ~commonMask) != 0)   // skip boon/clean routes and rare signature sectors
+					continue;
+				if (endlessCourseMod[c] & ENDLESS_BOON_MASK)  // don't flatten a mixed gambit into a plain single
+					continue;
+				int bits = 0;
+				for (Uint64 x = h; x != 0; x &= x - 1)
+					++bits;
+				if (bits >= 2 && bits < bestBits) { bestBits = bits; best = c; }
+			}
+			if (best >= 0)
+			{
+				// Keep only the least-dangerous hostile bit (lowest reward) so it reads as the easy route.
+				const Uint64 h = endlessCourseMod[best] & ENDLESS_HOSTILE_MASK;
+				Uint64 keep = 0;
+				int keepReward = 0x7fffffff;
+				for (unsigned t = 0; t < COUNTOF(endlessModTable); ++t)
+					if ((h & endlessModTable[t].bit) && endlessModTable[t].reward < keepReward)
+					{
+						keepReward = endlessModTable[t].reward;
+						keep = endlessModTable[t].bit;
+					}
+				if (keep != 0)
+					endlessCourseMod[best] = keep;
+			}
+		}
+	}
+
+	// GRAVITY WELL variant: whenever a course carries a gravity well (from any source above -- a named
+	// theme, the random-combo widen, a rare injection, or the ambush), flip a coin to make it
+	// OMNIDIRECTIONAL -- the pull runs along a fixed random heading for that sector (rolled per-sector
+	// in endlessRegenerateLevel) instead of straight down. Decided ONCE here, as the course is charted,
+	// so it's fixed for the seed and rides the save. Runs after every gravity-adding step, before the
+	// sort (OMNI is masked out of the danger score, so it doesn't disturb the ordering).
+	for (int c = 0; c < endlessCourseCnt; ++c)
+		if ((endlessCourseMod[c] & ENDLESS_MOD_GRAVITY) && (endlessRand() % 2))
+			endlessCourseMod[c] |= ENDLESS_MOD_GRAVITY_OMNI;
+
 	// Present the courses from lowest danger to highest, so Chart-a-Course always reads as a left-
 	// to-right safety ramp (the clean/boon route first, the deadliest sector last). Sort the three
 	// parallel course arrays together by hostile danger score, the same metric that drives the
@@ -3726,7 +4247,7 @@ void endlessGenerateCourses(void)
 		const int      ep   = endlessCourseEp[i];
 		const JE_byte  sec  = endlessCourseSec[i];
 		const JE_byte  file = endlessCourseFile[i];
-		const unsigned mod  = endlessCourseMod[i];
+		const Uint64   mod  = endlessCourseMod[i];
 		const int      key  = endlessDangerScore(mod);
 		int j = i - 1;
 		while (j >= 0 && endlessDangerScore(endlessCourseMod[j]) > key)
@@ -3772,7 +4293,7 @@ const char *endlessCourseHelp(int i)
 		         endlessDangerTier(endlessCourseMod[0]));
 		return buf;
 	}
-	const unsigned mods = endlessCourseMod[i];
+	const Uint64 mods = endlessCourseMod[i];
 	// The letter rank (F easiest .. S+++ hardest) is drawn separately, on the planet monitor's
 	// RANK field (endlessCourseRank + game_menu.c's overlay), so the help line is just the tier.
 	if (mods == 0)
@@ -3813,7 +4334,7 @@ int endlessCourseModRows(int i, EndlessCourseModRow *rows, int max)
 {
 	if (i < 0 || i >= endlessCourseCnt)
 		return 0;
-	const unsigned mods = endlessCourseMod[i];
+	const Uint64 mods = endlessCourseMod[i];
 	int n = 0;
 	for (unsigned t = 0; t < COUNTOF(endlessModTable) && n < max; ++t)
 	{
@@ -3822,6 +4343,10 @@ int endlessCourseModRows(int i, EndlessCourseModRow *rows, int max)
 		rows[n].word    = endlessModTable[t].word;
 		rows[n].weight  = endlessModTable[t].reward;
 		rows[n].hostile = (endlessModTable[t].bit & (ENDLESS_HOSTILE_MASK | ENDLESS_MOD_CURSED)) != 0;
+		// An omnidirectional well doesn't pull DOWN, so relabel the gravity row to say so (OMNI has no
+		// row of its own -- it rides the gravity bit and only changes the pull's direction).
+		if (endlessModTable[t].bit == ENDLESS_MOD_GRAVITY && (mods & ENDLESS_MOD_GRAVITY_OMNI))
+			rows[n].word = "pull any direction";
 		++n;
 	}
 	for (int a = 1; a < n; ++a)  // insertion sort, worst first; n is tiny
@@ -3969,7 +4494,7 @@ void endlessEndRunToTitle(void)
 // by the same slot; restoring the snapshot rather than regenerating stops reload rerolling the shop. notes.md §Save / resume.
 
 #define ENDLESS_SAVE_FILE    "endless.sav"
-#define ENDLESS_SAVE_VERSION 6      // v1 run-state only; v2 added the outpost snapshot; v3 adds the run seed; v4 adds the locked-sortie retry; v5 adds the kill-fire buff recharge; v6 adds the anti-repeat recent-level ring
+#define ENDLESS_SAVE_VERSION 7      // v1 run-state only; v2 added the outpost snapshot; v3 adds the run seed; v4 adds the locked-sortie retry; v5 adds the kill-fire buff recharge; v6 adds the anti-repeat recent-level ring; v7 widens the mod bitsets (courseMod[]/sortieMods) 32->64-bit for TOPSY/SLUGGISH
 #define ENDLESS_SAVE_PERKS   16     // fixed perk-array width on disk (>= PERK_COUNT; headroom for new perks)
 
 typedef struct {
@@ -3997,7 +4522,7 @@ typedef struct {
 	Sint32 courseCnt;
 	Sint32 courseEp[ENDLESS_MAX_COURSES];
 	Uint8  courseSec[ENDLESS_MAX_COURSES];
-	Uint32 courseMod[ENDLESS_MAX_COURSES];
+	Uint64 courseMod[ENDLESS_MAX_COURSES];   // v7: was Uint32 (read narrow from v3-v6 files)
 	Sint32 lastEp;
 	Uint8  lastSec, forced;
 
@@ -4010,7 +4535,7 @@ typedef struct {
 
 	// --- locked sortie (v4): a "gave up the level" outpost, locked to the launch-time choices ---
 	Uint8  lockedSortie;  // 1 = this save reopens the locked retry outpost (else a normal outpost)
-	Uint32 sortieMods;    // endlessActiveMods of the committed level
+	Uint64 sortieMods;    // endlessActiveMods of the committed level (v7: was Uint32)
 	Uint8  sortieSec;     // committed level section
 	Sint32 sortieEp;      // committed episode
 	Uint8  sortieFile;    // committed lvl file number
@@ -4033,9 +4558,11 @@ static EndlessSlotRec endlessSlotCache[SAVE_FILES_NUM];
 // means "no endless save".
 static void endlessPutU8(FILE *f, unsigned v)                 { Uint8 b = (Uint8)v; fwrite(&b, 1, 1, f); }
 static void endlessPutU32(FILE *f, Uint32 v)                  { v = SDL_SwapLE32(v); fwrite(&v, 4, 1, f); }
+static void endlessPutU64(FILE *f, Uint64 v)                  { v = SDL_SwapLE64(v); fwrite(&v, 8, 1, f); }
 static void endlessPutBytes(FILE *f, const void *p, size_t n) { fwrite(p, 1, n, f); }
 static bool endlessGetU8(FILE *f, Uint8 *v)                   { return fread(v, 1, 1, f) == 1; }
 static bool endlessGetU32(FILE *f, Uint32 *v)                 { Uint32 b; if (fread(&b, 4, 1, f) != 1) return false; *v = SDL_SwapLE32(b); return true; }
+static bool endlessGetU64(FILE *f, Uint64 *v)                 { Uint64 b; if (fread(&b, 8, 1, f) != 1) return false; *v = SDL_SwapLE64(b); return true; }
 static bool endlessGetBytes(FILE *f, void *p, size_t n)       { return fread(p, 1, n, f) == n; }
 
 static void endlessWriteRec(FILE *f, const EndlessSlotRec *r)
@@ -4068,7 +4595,7 @@ static void endlessWriteRec(FILE *f, const EndlessSlotRec *r)
 	for (unsigned i = 0; i < ENDLESS_MAX_COURSES; ++i)
 		endlessPutU32(f, (Uint32)r->courseEp[i]);
 	for (unsigned i = 0; i < ENDLESS_MAX_COURSES; ++i)
-		endlessPutU32(f, r->courseMod[i]);
+		endlessPutU64(f, r->courseMod[i]);
 	endlessPutBytes(f, r->courseSec, ENDLESS_MAX_COURSES);
 
 	endlessPutBytes(f, r->itemAvail, sizeof(r->itemAvail));
@@ -4076,7 +4603,7 @@ static void endlessWriteRec(FILE *f, const EndlessSlotRec *r)
 	endlessPutBytes(f, r->seed, sizeof(r->seed));
 
 	endlessPutU8(f, r->lockedSortie);        // v4 locked-sortie block
-	endlessPutU32(f, r->sortieMods);
+	endlessPutU64(f, r->sortieMods);         // v7: 64-bit (was U32 in v4-v6)
 	endlessPutU8(f, r->sortieSec);
 	endlessPutU32(f, (Uint32)r->sortieEp);
 	endlessPutU8(f, r->sortieFile);
@@ -4138,8 +4665,20 @@ static bool endlessReadRec(FILE *f, EndlessSlotRec *r, int version)
 		r->courseEp[i] = (Sint32)t;
 	}
 	for (unsigned i = 0; i < ENDLESS_MAX_COURSES; ++i)
-		if (!endlessGetU32(f, &r->courseMod[i]))
-			return false;
+	{
+		if (version >= 7)
+		{
+			if (!endlessGetU64(f, &r->courseMod[i]))
+				return false;
+		}
+		else
+		{
+			Uint32 t;   // v3-v6 stored the course mods 32-bit (high bits were unused back then)
+			if (!endlessGetU32(f, &t))
+				return false;
+			r->courseMod[i] = t;
+		}
+	}
 	if (!endlessGetBytes(f, r->courseSec, ENDLESS_MAX_COURSES))
 		return false;
 
@@ -4162,9 +4701,19 @@ static bool endlessReadRec(FILE *f, EndlessSlotRec *r, int version)
 		if (!endlessGetU8(f, &u8))
 			return false;
 		r->lockedSortie = u8;
-		if (!endlessGetU32(f, &u32))
-			return false;
-		r->sortieMods = u32;
+		if (version >= 7)   // v7 widened sortieMods to 64-bit; v4-v6 stored it 32-bit
+		{
+			Uint64 u64;
+			if (!endlessGetU64(f, &u64))
+				return false;
+			r->sortieMods = u64;
+		}
+		else
+		{
+			if (!endlessGetU32(f, &u32))
+				return false;
+			r->sortieMods = u32;
+		}
 		if (!endlessGetU8(f, &u8))
 			return false;
 		r->sortieSec = u8;

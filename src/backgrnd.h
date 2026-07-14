@@ -57,10 +57,12 @@ extern float bg_layer_dx[4], bg_layer_frac[4];
 // remainder) per layer, gated by bg_smooth_y_active. notes.md §Slow-scroll smoothing.
 extern float bg_layer_dy[4], bg_layer_yfrac[4];
 extern bool bg_smooth_y_active;
-// this-tick (non-lagged) scroll sub-pixel fraction, for scroll-tracked ENTITIES (enemies + HP
-// bars) which are recorded after the scroll advance (bg_layer_yfrac is lagged for the pre-advance
-// background rows). See backgrnd.c / tyrian2.c.
-extern float bg_layer_yfrac_now[4];
+// this-tick (non-lagged) scroll rate + sub-pixel fraction. Used by things recorded AFTER their
+// scroll advance: scroll-tracked ENTITIES (enemies + HP bars), AND background LAYER 3, which
+// (unlike layers 1/2) advances backPos3 before it records its rows (draw_background_3). The lagged
+// bg_layer_dy/bg_layer_yfrac match the pre-advance layers 1/2; layer 3 needs these this-tick values
+// or its rows drift one tick out of phase and jitter. See backgrnd.c / tyrian2.c.
+extern float bg_layer_yfrac_now[4], bg_layer_dy_now[4];
 
 extern JE_word mapX, mapY, mapX2, mapX3, mapY2, mapY3;
 extern JE_byte **mapYPos, **mapY2Pos, **mapY3Pos;

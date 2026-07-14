@@ -79,12 +79,16 @@ float bg_layer_dy[4]    = { 0.0f, 0.0f, 0.0f, 0.0f };
 float bg_layer_yfrac[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 bool  bg_smooth_y_active = false;
 
-// this-tick (non-lagged) vertical scroll sub-pixel fraction per layer [1..3]. bg_layer_yfrac
-// above is lagged one tick to match the BACKGROUND rows (recorded PRE-advance); scroll-tracked
-// ENTITIES (enemies + their HP bars) are recorded after this tick's scroll advance, so they need
-// this current fraction instead, or they jump 1px against the smooth background on the ticks the
-// integer scroll steps an extra pixel. Set in tyrian2.c beside the publish; 0 when no modifier.
+// this-tick (non-lagged) vertical scroll rate + sub-pixel fraction per layer [1..3]. bg_layer_dy/
+// bg_layer_yfrac above are lagged one tick to match the BACKGROUND rows of layers 1/2 (recorded
+// PRE-advance). Two things are instead recorded AFTER this tick's scroll advance and need these
+// current values: scroll-tracked ENTITIES (enemies + their HP bars), and background LAYER 3 --
+// draw_background_3 advances backPos3 before drawing, unlike layers 1/2. Fed the lagged values they
+// drift one tick out of phase and jitter 1px against the true motion (worst under a scroll modifier,
+// where the integer scroll steps an extra pixel some ticks). Set in tyrian2.c beside the publish;
+// 0 when no modifier and on full-speed integer-rate layers.
 float bg_layer_yfrac_now[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+float bg_layer_dy_now[4]    = { 0.0f, 0.0f, 0.0f, 0.0f };
 
 // Record layer L's float scroll delta and fractional offset for this tick's draw. `cur_f`
 // is the un-floored offset, `cur_int` the whole-pixel one the row was recorded at. A large

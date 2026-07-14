@@ -182,9 +182,9 @@ static void write_player(FILE *f, int p)
 // Decode the endless active-mods bitmask (ENDLESS_MOD_*, endless.h) into readable names.
 // A local table keeps this fault-safe (no call into endless.c) and lists every set bit,
 // flagging any leftover unknown bits so a newly-added mod is still visible in the log.
-static void write_endless_mods(FILE *f, unsigned mods)
+static void write_endless_mods(FILE *f, Uint64 mods)
 {
-	static const struct { unsigned bit; const char *name; } tbl[] = {
+	static const struct { Uint64 bit; const char *name; } tbl[] = {
 		{ ENDLESS_MOD_FORTIFIED,   "Fortified"   }, { ENDLESS_MOD_FRENZY,     "Frenzy"     },
 		{ ENDLESS_MOD_SWIFT,       "Swift"       }, { ENDLESS_MOD_FRAGILE,    "Fragile"    },
 		{ ENDLESS_MOD_BOUNTY,      "Bounty"      }, { ENDLESS_MOD_DEVASTATING,"Devastating"},
@@ -201,16 +201,19 @@ static void write_endless_mods(FILE *f, unsigned mods)
 		{ ENDLESS_MOD_MARKED,      "Marked"      }, { ENDLESS_MOD_NITRO,      "Nitro"      },
 		{ ENDLESS_MOD_OVERHEAT,    "Overheat"    }, { ENDLESS_MOD_DUD,        "Dud"        },
 		{ ENDLESS_MOD_HOMING,      "Homing"      }, { ENDLESS_MOD_RAMPAGE,    "Rampage"    },
+		{ ENDLESS_MOD_TOPSY,       "Topsy"       }, { ENDLESS_MOD_SLUGGISH,   "Sluggish"   },
+		{ ENDLESS_MOD_SHIELDLESS,  "Shieldless"  }, { ENDLESS_MOD_DEADGEN,    "DeadGen"    },
+		{ ENDLESS_MOD_GRAVITY_OMNI,"GravityOmni" },
 	};
 
-	fprintf(f, "  Active mods:  0x%08X", mods);
+	fprintf(f, "  Active mods:  0x%016llX", (unsigned long long)mods);
 	if (mods == 0)
 	{
 		fprintf(f, "  (none)\n");
 		return;
 	}
 
-	unsigned known = 0;
+	Uint64 known = 0;
 	int n = 0;
 	fprintf(f, "\n    ");
 	for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); ++i)
@@ -220,7 +223,7 @@ static void write_endless_mods(FILE *f, unsigned mods)
 			fprintf(f, "%s%s", n++ ? ", " : "", tbl[i].name);
 	}
 	if (mods & ~known)  // bits with no table entry (a mod added since this table was written)
-		fprintf(f, "%s(unknown 0x%08X)", n++ ? ", " : "", mods & ~known);
+		fprintf(f, "%s(unknown 0x%016llX)", n++ ? ", " : "", (unsigned long long)(mods & ~known));
 	fprintf(f, "\n");
 }
 
