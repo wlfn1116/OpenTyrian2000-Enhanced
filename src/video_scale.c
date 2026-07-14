@@ -30,6 +30,9 @@
 static void nn_32(SDL_Surface *src_surface, SDL_Texture *dst_texture);
 static void nn_16(SDL_Surface *src_surface, SDL_Texture *dst_texture);
 
+static void nn_fit_32(SDL_Surface *src_surface, SDL_Texture *dst_texture);
+static void nn_fit_16(SDL_Surface *src_surface, SDL_Texture *dst_texture);
+
 static void scale2x_32(SDL_Surface *src_surface, SDL_Texture *dst_texture);
 static void scale2x_16(SDL_Surface *src_surface, SDL_Texture *dst_texture);
 static void scale3x_32(SDL_Surface *src_surface, SDL_Texture *dst_texture);
@@ -41,7 +44,7 @@ void hq4x_32(SDL_Surface *src_surface, SDL_Texture *dst_texture);
 
 uint scaler;
 
-const struct Scalers scalers[] =
+struct Scalers scalers[] =
 {
 	{ 1 * vga_width, 1 * vga_height, nn_16,      nn_32,      "None" },
 	{ 2 * vga_width, 2 * vga_height, nn_16,      nn_32,      "2x" },
@@ -52,6 +55,14 @@ const struct Scalers scalers[] =
 	{ 3 * vga_width, 3 * vga_height, NULL,       hq3x_32,    "hq3x" },
 	{ 4 * vga_width, 4 * vga_height, nn_16,      nn_32,      "4x" },
 	{ 4 * vga_width, 4 * vga_height, NULL,       hq4x_32,    "hq4x" },
+	{ 5 * vga_width, 5 * vga_height, nn_16,      nn_32,      "5x" },
+	// Fit-to-output: renders at the exact output size (fullscreen: the screen),
+	// one texel per screen pixel, so the final present never rescales. The
+	// dimensions here are placeholders; video.c keeps them synced to the live
+	// window via scaler_set_native_size(). Keep LAST: scaler_plain_equivalent
+	// matches by width, and every algorithm scaler must find its fixed nn twin
+	// first, whatever size this entry currently holds.
+	{ 1 * vga_width, 1 * vga_height, nn_fit_16,  nn_fit_32,  "Native" },
 };
 const uint scalers_count = COUNTOF(scalers);
 
@@ -65,6 +76,48 @@ void set_scaler_by_name(const char *name)
 			break;
 		}
 	}
+}
+
+// Plain scalers only enlarge pixels (nearest-neighbour: None/2x/3x/4x/Native); the
+// rest (Scale2x, hqNx) are pixel-art reconstruction algorithms. The supersampled
+// present path bypasses the algorithm in-game, so while supersampling is enabled only
+// plain scalers are selectable (else gameplay and pause/menus would look different).
+bool scaler_is_plain(uint index)
+{
+	return index < scalers_count
+	    && (scalers[index].scaler32 == nn_32 || scalers[index].scaler32 == nn_fit_32);
+}
+
+bool scaler_is_native(uint index)
+{
+	return index < scalers_count && scalers[index].scaler32 == nn_fit_32;
+}
+
+// Refresh the Native entry's output dimensions (video.c computes them from the
+// live window size and scaling mode whenever they are about to be used).
+void scaler_set_native_size(int w, int h)
+{
+	for (uint i = 0; i < scalers_count; ++i)
+	{
+		if (scalers[i].scaler32 == nn_fit_32)
+		{
+			scalers[i].width = w;
+			scalers[i].height = h;
+		}
+	}
+}
+
+// The same-size plain scaler (hq2x -> 2x); returns `index` itself if already plain.
+uint scaler_plain_equivalent(uint index)
+{
+	if (scaler_is_plain(index) || index >= scalers_count)
+		return index;
+	for (uint i = 0; i < scalers_count; ++i)
+	{
+		if (scalers[i].width == scalers[index].width && scaler_is_plain(i))
+			return i;
+	}
+	return index;  // no plain scaler of that size (cannot happen with the current table)
 }
 
 void nn_32(SDL_Surface *src_surface, SDL_Texture *dst_texture)
@@ -160,6 +213,85 @@ void nn_16(SDL_Surface *src_surface, SDL_Texture *dst_texture)
 			memcpy(dst, dst_temp, dst_width * dst_Bpp);
 			dst += dst_pitch;
 		}
+	}
+
+	SDL_UnlockTexture(dst_texture);
+}
+
+// Arbitrary-ratio nearest-neighbour for the Native scaler: the destination is the
+// exact output size, not an integer multiple, so sample by floor(dst * src / dst_size).
+// At an integer ratio this reproduces nn_32 byte-for-byte; repeated rows are memcpy'd.
+void nn_fit_32(SDL_Surface *src_surface, SDL_Texture *dst_texture)
+{
+	int dst_width, dst_height, dst_pitch;
+	SDL_QueryTexture(dst_texture, NULL, NULL, &dst_width, &dst_height);
+
+	const int src_w = src_surface->w,
+	          src_h = src_surface->h;
+
+	void *tmp_ptr;
+	SDL_LockTexture(dst_texture, NULL, &tmp_ptr, &dst_pitch);
+	Uint8 *dst = tmp_ptr;
+
+	const Uint8 *const src = src_surface->pixels;
+	const Uint8 *prev_row = NULL;
+	int prev_sy = -1;
+
+	for (int y = 0; y < dst_height; ++y)
+	{
+		const int sy = (int)((Sint64)y * src_h / dst_height);
+		if (sy == prev_sy)
+		{
+			memcpy(dst, prev_row, (size_t)dst_width * 4);
+		}
+		else
+		{
+			const Uint8 *src_row = src + (size_t)sy * src_surface->pitch;
+			Uint32 *out = (Uint32 *)dst;
+			for (int x = 0; x < dst_width; ++x)
+				out[x] = rgb_palette[src_row[(Sint64)x * src_w / dst_width]];
+			prev_sy = sy;
+			prev_row = dst;
+		}
+		dst += dst_pitch;
+	}
+
+	SDL_UnlockTexture(dst_texture);
+}
+
+void nn_fit_16(SDL_Surface *src_surface, SDL_Texture *dst_texture)
+{
+	int dst_width, dst_height, dst_pitch;
+	SDL_QueryTexture(dst_texture, NULL, NULL, &dst_width, &dst_height);
+
+	const int src_w = src_surface->w,
+	          src_h = src_surface->h;
+
+	void *tmp_ptr;
+	SDL_LockTexture(dst_texture, NULL, &tmp_ptr, &dst_pitch);
+	Uint8 *dst = tmp_ptr;
+
+	const Uint8 *const src = src_surface->pixels;
+	const Uint8 *prev_row = NULL;
+	int prev_sy = -1;
+
+	for (int y = 0; y < dst_height; ++y)
+	{
+		const int sy = (int)((Sint64)y * src_h / dst_height);
+		if (sy == prev_sy)
+		{
+			memcpy(dst, prev_row, (size_t)dst_width * 2);
+		}
+		else
+		{
+			const Uint8 *src_row = src + (size_t)sy * src_surface->pitch;
+			Uint16 *out = (Uint16 *)dst;
+			for (int x = 0; x < dst_width; ++x)
+				out[x] = (Uint16)rgb_palette[src_row[(Sint64)x * src_w / dst_width]];
+			prev_sy = sy;
+			prev_row = dst;
+		}
+		dst += dst_pitch;
 	}
 
 	SDL_UnlockTexture(dst_texture);

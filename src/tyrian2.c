@@ -21,6 +21,8 @@
 #include "animlib.h"
 #include "backgrnd.h"
 #include "config.h"
+#include "crashlog.h"
+#include "endless.h"
 #include "episodes.h"
 #include "file.h"
 #include "font.h"
@@ -56,13 +58,12 @@
 #include <string.h>
 #include <stdint.h>
 
-// Stage 1 render-list verification: replay the captured list each clean frame
-// and report any pixels that differ from the real frame. Proven complete
-// (pixel-identical over hundreds of demo frames); left in, gated off, for
-// future debugging.
+// Render-list verification harness: replay the captured list each clean frame
+// and report any pixels that differ from the real frame. Gated off; kept for debugging.
 #define RL_SELFTEST 0
 
 inline static void blit_enemy(SDL_Surface *surface, unsigned int i, signed int x_offset, signed int y_offset, signed int sprite_offset);
+static void draw_enemy_health_bars(void);
 
 boss_bar_t boss_bar[2];
 
@@ -80,38 +81,61 @@ char tempStr[31];
 JE_byte itemAvail[9][10]; /* [1..9, 1..10] */
 JE_byte itemAvailMax[9]; /* [1..9] */
 
-// --- Phase 4: render-rate player-ship movement (display side) ---
-// The simulation keeps the ship's authoritative position at the 35Hz tick; here
-// we drive the *displayed* ship at the render rate so steering feels responsive,
-// not merely smooth. Live keyboard moves it every rendered frame (delta-time
-// scaled so it sums to the sim's per-tick step); mouse/joystick/demo fall back
-// to extrapolating the ship's last sim velocity. Reconciled to the sim each
-// tick so it can't drift. Applied via the render-list ship override, which also
-// carries the shadow, charge meter, and sidekicks (all id >= RL_ID_SHIP_BASE).
+// Render-rate ship movement: the displayed ship extrapolates its last per-tick velocity each
+// frame and is reconciled to the 35Hz sim via the ship override. notes.md §Smooth motion.
 static int ship_tick_x[2], ship_tick_y[2];   // ship position captured at the last tick
 static int ship_vel_x[2], ship_vel_y[2];       // per-tick movement (cur - prev tick)
 static bool ship_pred_have_tick = false;
 
-// Fixed-timestep accumulator for judder-free interpolation. Real elapsed time
-// is accumulated; we present every display frame at alpha = accumulator/period
-// and advance the simulation one tick whenever a full period has elapsed. This
-// keeps the displayed motion proportional to real time (even steps -> no
-// judder) and the average sim rate exact, regardless of the refresh rate.
+// Fixed-timestep accumulator: each display frame presents at alpha = accumulator/period, the
+// sim ticks once per full period. Perf-counter timing, not SDL_GetTicks — notes.md §Smooth motion.
 static float sim_accumulator = 0.0f;
-static Uint32 sim_last_ms = 0;
+static Uint64 sim_last_counter = 0;
+static Uint64 sim_perf_freq = 0;
 static bool sim_timing_init = false;
 
-// Persistent interpolation buffer for smoothie levels: the ice/water/lava filters
-// are frame-feedback effects, so the displayed frame must carry over between
-// ticks. Seeded from the authoritative game_screen each tick, then evolved by the
-// replay (which re-applies the filters) every displayed frame.
-static SDL_Surface *render_gs = NULL;
+float debug_interp_alpha = 0.0f;  // last presented interpolation fraction (perf overlay)
 
-static SDL_Surface *get_render_gs(void)
+// Smoothie levels present in two passes: render_gs = persistent background plasma (per tick),
+// smoothie_frame = per-frame display buffer composited on top. notes.md §Smoothie levels.
+static SDL_Surface *render_gs = NULL;
+static SDL_Surface *smoothie_frame = NULL;
+
+// (Re)create a lazily-allocated 8-bit surface at scale x the logical size. A factor
+// change discards the old content — fine for the plasma base: the contractive filters
+// rebuild it from black within a couple of frames (masked by any level fade).
+static SDL_Surface *ensure_scaled_surface(SDL_Surface **surf, int scale)
 {
-	if (render_gs == NULL)
-		render_gs = SDL_CreateRGBSurface(0, vga_width, vga_height, 8, 0, 0, 0, 0);
-	return render_gs;
+	const int w = vga_width * scale, h = vga_height * scale;
+	if (*surf != NULL && ((*surf)->w != w || (*surf)->h != h))
+	{
+		SDL_FreeSurface(*surf);
+		*surf = NULL;
+	}
+	if (*surf == NULL)
+		*surf = SDL_CreateRGBSurface(0, w, h, 8, 0, 0, 0, 0);
+	return *surf;
+}
+
+static SDL_Surface *get_render_gs(int scale)
+{
+	return ensure_scaled_surface(&render_gs, scale);
+}
+
+static SDL_Surface *get_smoothie_frame(int scale)
+{
+	return ensure_scaled_surface(&smoothie_frame, scale);
+}
+
+// Supersampled present path: the interpolated playfield renders NxN into pf_hi, composites into
+// vga_hi with the 1x HUD block-expanded on top, presents via present_hi(). notes.md §Supersampling & video.
+static SDL_Surface *pf_hi = NULL;   // NxN playfield replay target (normal levels)
+static SDL_Surface *vga_hi = NULL;  // NxN final frame (playfield composite + HUD)
+
+static bool ensure_hi_buffers(int scale)
+{
+	return ensure_scaled_surface(&pf_hi, scale) != NULL
+	    && ensure_scaled_surface(&vga_hi, scale) != NULL;
 }
 
 static void ship_pred_on_tick(void)
@@ -137,13 +161,8 @@ static int round_signed(float v)
 
 static void update_ship_override(float alpha)
 {
-	// The ship has momentum (acceleration + friction), so a fixed per-tick step
-	// would fight the sim and snap back every tick (jitter). Instead extrapolate
-	// each ship's *actual* per-tick velocity: this advances it continuously at the
-	// render rate, matches the sim (no jitter), and leads slightly (responsive).
-	// Per player, so two-player mode drives both ships independently. The offset
-	// also carries each ship's shadow and charge meter (same id); sidekicks are
-	// excluded and interpolate by their own motion.
+	// Extrapolate each ship's actual per-tick velocity (a fixed step would fight the sim). The
+	// offset also carries the shadow and charge meter; sidekicks interpolate on their own.
 	const int players = twoPlayerMode ? 2 : 1;
 	for (int p = 0; p < players; ++p)
 	{
@@ -155,53 +174,35 @@ static void update_ship_override(float alpha)
 			vx = 0;
 			vy = 0;
 		}
-		rl_set_ship_override(p, round_signed(vx * alpha), round_signed(vy * alpha));
+		// Float offset: the replay rounds it at the render scale, so a supersampled
+		// ship glides on the sub-pixel grid instead of stepping whole pixels.
+		rl_set_ship_override(p, vx * alpha, vy * alpha);
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Variable-timestep player ship (Option B, first slice).
-//
-// The world (enemies, shots, background, collisions) still advances at the
-// fixed 35Hz tick and is shown via render-list interpolation. The PLAYER SHIP,
-// however, is simulated here at the display/render rate with real dt: it
-// integrates its own momentum every presented frame, so it moves and responds
-// to input at full refresh instead of lagging or being extrapolated.
-//
-// While active this integrator OWNS the ship: JE_playerMovement's own keyboard/
-// joystick/mouse movement and velocity integration are skipped for that player
-// (guarded by `vt` there). We write player.x/y/x_velocity directly each frame
-// and drive the displayed sprite through the existing render-list ship-override
-// channel. The 35Hz sim still reads player.x/y for firing and collisions, so it
-// stays authoritative — only the ship's motion cadence changed. Because the
-// authoritative position now updates at render rate, the sprite and its hitbox
-// move together (no sprite-leads-hitbox), and input latency drops below a tick.
-//
-// First-slice limitations (intentional):
-//   * Single-player only, and reads KEYBOARD + digital-joystick directions.
-//     Mouse / analog-stick steering is bypassed while VT is on — toggle it off
-//     (vt_ship = false) to use the mouse.
-//   * Determinism is broken by design, so VT is force-disabled for demo
-//     playback, demo recording and network games.
-//   * The control feel is a fresh accel/friction model (the original coupled
-//     position-as-acceleration model can't be dt-scaled directly). The tunables
-//     below are deliberate starting points — adjust to taste.
+// Variable-timestep (VT) player ship: the ship alone is simulated at the render rate with
+// real dt while the world stays on the fixed 35Hz tick; the integrator owns it. notes.md §VT ship.
 bool vt_ship = true;
 
-#define VT_ACCEL      1.5f  // velocity gained per tick while a direction is held
+#define VT_ACCEL      1.0f  // velocity gained per tick while a direction is held (orig accelXC: +1/tick)
+#define VT_DIRECT     1.0f  // immediate px/tick while a direction is held (orig CURRENT_KEY_SPEED; kills momentum lag)
 #define VT_FRICTION_X 1.0f  // velocity bled per tick with no x input (orig ~1/tick)
 #define VT_FRICTION_Y 0.5f  // orig y friction fires every 2nd tick => half rate
-#define VT_VMAX       5.0f  // top speed/axis (orig: vel clamp 4 + 1 direct = ~5)
-#define VT_MOUSE_SENS 0.25f // screen-px ship motion per screen-px of mouse motion
-                            // (matches the original's ~1/4; raise for snappier)
+#define VT_VMAX       4.0f  // velocity clamp/axis (orig: vel clamp 4); +VT_DIRECT gives ~5 total like the original
+#define VT_MOUSE_SENS 0.25f // screen-px ship motion per screen-px of mouse motion (orig ~1/4)
 
 static float vt_x[2], vt_y[2], vt_vx[2], vt_vy[2];
 static int vt_wrote_vx[2], vt_wrote_vy[2];  // last velocity VT wrote to player[]
 static bool vt_seeded[2] = { false, false };
 
+// Raw (un-inverted) mouse motion accumulated by vt_ship_step since the last twiddle
+// read; consumed by vt_ship_twiddle_dir (rationale there).
+static float vt_twiddle_mx[2], vt_twiddle_my[2];
+
 bool vt_ship_owns(void)
 {
 	return vt_ship
+	    && smoothMotion                            // user's Enhancements toggle
 	    && smoothScroll != 0 && frameCountMax > 0  // the render-rate present loop must run
 	    && !play_demo && !record_demo && !isNetworkGame  // determinism-sensitive
 	    && !twoPlayerMode && !endLevel;
@@ -248,9 +249,8 @@ void vt_ship_step(float dt)  // dt = this frame's fraction of a 35Hz tick
 		vt_seed_player(p);
 
 	// --- Input ---
-	// Directional input (keyboard, d-pad, analog stick) feeds momentum; mouse
-	// relative motion is applied directly (pointer-style). "Inverted controls"
-	// levels (smoothies[8]) flip the Y axis.
+	// Directional input (keyboard/d-pad/stick) feeds momentum; mouse relative motion
+	// applies directly. "Inverted controls" levels (smoothies[8]) flip the Y axis.
 	const bool invert_y = smoothies[9 - 1];
 	float ix = 0.0f, iy = 0.0f;   // directional input -> momentum
 	float mdx = 0.0f, mdy = 0.0f; // mouse relative motion -> direct position
@@ -263,6 +263,14 @@ void vt_ship_step(float dt)  // dt = this frame's fraction of a 35Hz tick
 	if (joysticks > 0)
 	{
 		poll_joystick(0);
+
+		// Menu/pause/change-fire are edge-triggered (action_pressed) and this render-rate
+		// poll consumes the edge before tick-rate JE_playerMovement can read it, so catch
+		// (latch) them here. Without this the discrete "change fire" is eaten most presses.
+		if (joystick[0].action_pressed[4]) ingamemenu_pressed = true;  // "menu"
+		if (joystick[0].action_pressed[5]) pause_pressed = true;        // "pause"
+		if (joystick[0].action_pressed[1]) changefire_pressed = true;   // "change fire"
+
 		if (joystick[0].analog)
 		{
 			// Stick deflection -> proportional momentum input (clamped ~[-1,1]).
@@ -271,27 +279,36 @@ void vt_ship_step(float dt)  // dt = this frame's fraction of a 35Hz tick
 			ix += (ax < -1.0f) ? -1.0f : (ax > 1.0f) ? 1.0f : ax;
 			iy += (ay < -1.0f) ? -1.0f : (ay > 1.0f) ? 1.0f : ay;
 		}
-		else
-		{
-			if (joystick[0].direction[0]) iy -= 1.0f;  // up
-			if (joystick[0].direction[2]) iy += 1.0f;  // down
-			if (joystick[0].direction[3]) ix -= 1.0f;  // left
-			if (joystick[0].direction[1]) ix += 1.0f;  // right
-		}
+
+		// D-pad / digital directions, read in both modes so the d-pad works even when
+		// the stick is configured analog. (The combined input is clamped below.)
+		if (joystick[0].direction[0]) iy -= 1.0f;  // up
+		if (joystick[0].direction[2]) iy += 1.0f;  // down
+		if (joystick[0].direction[3]) ix -= 1.0f;  // left
+		if (joystick[0].direction[1]) ix += 1.0f;  // right
 	}
 
 	if (has_mouse)
 	{
-		// Relative motion since our last frame, float-scaled so sampling every
-		// render frame doesn't round small/diagonal motion away. Resets
-		// internally; returns 0 when relative mode is off (keyboard-only play).
+		// Float relative motion since our last frame (per-frame sampling would round
+		// small/diagonal motion away); returns 0 when relative mode is off.
 		float mxr = 0.0f, myr = 0.0f;
 		mouseGetRelativeMotionF(&mxr, &myr);
 		mdx = mxr * VT_MOUSE_SENS;
 		mdy = myr * VT_MOUSE_SENS;
+
+		// Stash the raw mouse direction for the twiddle-code detector, un-inverted —
+		// the detector applies the "inverted controls" flip itself, like keyboard.
+		vt_twiddle_mx[p] += mxr;
+		vt_twiddle_my[p] += myr;
 	}
 
 	if (invert_y) { iy = -iy; mdy = -mdy; }
+
+	// Clamp combined directional input (keyboard + analog stick + d-pad) to full
+	// deflection so overlapping sources can't push past 1.
+	if (ix < -1.0f) ix = -1.0f; else if (ix > 1.0f) ix = 1.0f;
+	if (iy < -1.0f) iy = -1.0f; else if (iy > 1.0f) iy = 1.0f;
 
 	// --- Integrate momentum (everything dt-scaled; dt==1 == one old tick) ---
 	if (ix != 0.0f)
@@ -309,16 +326,20 @@ void vt_ship_step(float dt)  // dt = this frame's fraction of a 35Hz tick
 	if (vt_vy[p] >  VT_VMAX) vt_vy[p] =  VT_VMAX;
 	if (vt_vy[p] < -VT_VMAX) vt_vy[p] = -VT_VMAX;
 
-	// Momentum step plus the direct mouse delta.
-	vt_x[p] += vt_vx[p] * dt + mdx;
-	vt_y[p] += vt_vy[p] * dt + mdy;
+	// Momentum step + immediate DIRECT component + direct mouse delta. The direct term is not
+	// folded into vt_vx: releasing input stops it at once, only the momentum glides out.
+	vt_x[p] += (vt_vx[p] + ix * VT_DIRECT) * dt + mdx;
+	vt_y[p] += (vt_vy[p] + iy * VT_DIRECT) * dt + mdy;
+
+	// Endless GRAVITY WELL: a steady downward drag (dt-scaled, so render-rate independent).
+	vt_y[p] += endlessGravityDrift() * dt;
 
 	// Same playfield bounds the sim enforces (mainint.c). Stop velocity at walls
 	// so we don't accumulate phantom momentum while held against an edge.
-	if (vt_x[p] > PLAYFIELD_WIDTH - 8) { vt_x[p] = PLAYFIELD_WIDTH - 8; if (vt_vx[p] > 0) vt_vx[p] = 0; }
-	if (vt_x[p] < 40)                  { vt_x[p] = 40;                  if (vt_vx[p] < 0) vt_vx[p] = 0; }
-	if (vt_y[p] > 160)                 { vt_y[p] = 160;                 if (vt_vy[p] > 0) vt_vy[p] = 0; }
-	if (vt_y[p] < 10)                  { vt_y[p] = 10;                  if (vt_vy[p] < 0) vt_vy[p] = 0; }
+	if (vt_x[p] > PLAYFIELD_WIDTH - SHIP_RIGHT_MARGIN) { vt_x[p] = PLAYFIELD_WIDTH - SHIP_RIGHT_MARGIN; if (vt_vx[p] > 0) vt_vx[p] = 0; }
+	if (vt_x[p] < SHIP_LEFT_MARGIN)                    { vt_x[p] = SHIP_LEFT_MARGIN;                    if (vt_vx[p] < 0) vt_vx[p] = 0; }
+	if (vt_y[p] > SHIP_BOTTOM_MARGIN)                  { vt_y[p] = SHIP_BOTTOM_MARGIN;                  if (vt_vy[p] > 0) vt_vy[p] = 0; }
+	if (vt_y[p] < SHIP_TOP_MARGIN)                     { vt_y[p] = SHIP_TOP_MARGIN;                     if (vt_vy[p] < 0) vt_vy[p] = 0; }
 
 	// Write back so the next 35Hz tick (collisions, firing, homing) sees the
 	// current position/velocity.
@@ -330,8 +351,10 @@ void vt_ship_step(float dt)  // dt = this frame's fraction of a 35Hz tick
 	vt_wrote_vy[p] = player[p].y_velocity;
 
 	// Display the recorded (tick-time) ship sprite at its new continuous position
-	// via the override channel the interpolator already understands.
-	rl_set_ship_override(p, player[p].x - ship_tick_x[p], player[p].y - ship_tick_y[p]);
+	// via the override channel the interpolator already understands. Pass the FLOAT
+	// integrator position, not the rounded player.x: under supersampling the ship
+	// (and everything attached to it) then moves on the sub-pixel grid.
+	rl_set_ship_override(p, vt_x[p] - (float)ship_tick_x[p], vt_y[p] - (float)ship_tick_y[p]);
 }
 
 void vt_ship_tick(void)  // once per 35Hz tick, before ship_pred_on_tick()
@@ -351,15 +374,13 @@ void vt_ship_tick(void)  // once per 35Hz tick, before ship_pred_on_tick()
 		return;
 	}
 
-	// External velocity impulses (magnet fields, enemy-shot knockback) modify
-	// player.x_velocity during the tick; JE_playerMovement's integration is
-	// skipped for us, so fold whatever changed since our last write into VT.
+	// Fold external velocity impulses (magnet fields, knockback) into VT: they modify
+	// player.x_velocity during the tick and JE_playerMovement's integration is skipped.
 	vt_vx[p] += (float)(player[p].x_velocity - vt_wrote_vx[p]);
 	vt_vy[p] += (float)(player[p].y_velocity - vt_wrote_vy[p]);
 
-	// Refresh the ship position history (trailing sidekicks read old_x/old_y).
-	// Vanilla updates it from an intra-tick delta that VT leaves at zero, so do
-	// it here when the ship actually moved since the previous tick.
+	// Refresh the ship position history (trailing sidekicks read old_x/old_y):
+	// vanilla derives it from an intra-tick delta that VT leaves at zero.
 	if (player[p].x != ship_tick_x[p] || player[p].y != ship_tick_y[p])
 	{
 		for (unsigned int i = 1; i < COUNTOF(player[p].old_x); ++i)
@@ -372,12 +393,10 @@ void vt_ship_tick(void)  // once per 35Hz tick, before ship_pred_on_tick()
 	}
 }
 
-// Per-tick ship movement used by shots that track the ship (delta_x_shot_move,
-// e.g. the laser and main pulse). Vanilla derives it from (x - last_x_shot_move)
-// inside the tick, but VT moves the ship BETWEEN ticks, so that reads ~0; supply
-// the authoritative inter-tick delta (current pos vs the previous tick snapshot)
-// instead. ship_tick_x/y are updated by ship_pred_on_tick after JE_playerMovement
-// runs, so here they still hold the previous tick's position.
+// Per-tick ship movement for shots that track the ship (delta_x_shot_move, e.g. the
+// laser). VT moves the ship BETWEEN ticks, so vanilla's intra-tick delta reads ~0;
+// supply current pos vs the previous tick snapshot instead. (ship_tick_x/y still hold
+// the previous tick here — ship_pred_on_tick updates them after JE_playerMovement.)
 void vt_ship_shot_delta(int player_index, int *out_dx, int *out_dy)
 {
 	const int p = (player_index <= 0) ? 0 : 1;
@@ -391,9 +410,40 @@ void vt_ship_shot_delta(int player_index, int *out_dx, int *out_dy)
 	*out_dy = player[p].y - ship_tick_y[p];
 }
 
-// Copy the freshly-drawn playfield from game_screen into VGAScreenSeg, applying
-// the special vertical-flip / lighting composites when active. Factored out so
-// interpolated in-between frames can re-composite after re-rendering.
+// Hand the twiddle-code detector the mouse direction since the last call as a -1/0/+1
+// per axis (raw / un-inverted), then reset the accumulator. vt_ship_step drains the
+// mouse at render rate, so the once-per-tick detector in JE_playerMovement would
+// otherwise never see a mouse direction.
+void vt_ship_twiddle_dir(int player_index, int *out_dx, int *out_dy)
+{
+	const int p = (player_index <= 0) ? 0 : 1;
+	const float deadzone = 1.0f;  // screen px of motion before a direction counts
+
+	const float ax = vt_twiddle_mx[p], ay = vt_twiddle_my[p];
+	vt_twiddle_mx[p] = 0.0f;
+	vt_twiddle_my[p] = 0.0f;
+
+	*out_dx = 0;
+	*out_dy = 0;
+
+	// Twiddle codes are cardinal sequences (diagonals are ignored), so collapse the
+	// flick to its dominant axis — a hand flick is never perfectly straight, and its
+	// off-axis drift would read as a diagonal. Movement itself stays in vt_ship_step.
+	if (fabsf(ax) >= fabsf(ay))
+	{
+		if (ax > deadzone)       *out_dx =  1;
+		else if (ax < -deadzone) *out_dx = -1;
+	}
+	else
+	{
+		if (ay > deadzone)       *out_dy =  1;
+		else if (ay < -deadzone) *out_dy = -1;
+	}
+}
+
+// Copy the freshly-drawn playfield into VGAScreenSeg, applying the special
+// vertical-flip / lighting composites when active; interpolated in-between frames
+// re-composite through here too.
 static void composite_playfield(SDL_Surface *playfield)
 {
 	JE_byte *src;
@@ -402,7 +452,7 @@ static void composite_playfield(SDL_Surface *playfield)
 	int x, y, lightx, lighty, lightdist;
 
 	src = playfield->pixels;
-	src += 24;
+	src += PLAYFIELD_LEFT;  // crop off the off-screen entry margin; see video.h
 
 	if (starShowVGASpecialCode == 1)
 	{
@@ -460,49 +510,255 @@ static void composite_playfield(SDL_Surface *playfield)
 	}
 }
 
+// composite_playfield at NxN: same three modes (normal copy, vertical flip,
+// spotlight) on the supersampled playfield, writing into vga_hi's playfield
+// region. The spotlight math runs in HI units (every distance multiplied by
+// scale), so the light circle is the same size on screen, just smoother.
+static void composite_playfield_hi(SDL_Surface *playfield, SDL_Surface *out, int scale)
+{
+	const int width = PLAYFIELD_WIDTH * scale;
+	const int rows = 184 * scale;
+	const JE_byte *src = (const JE_byte *)playfield->pixels + PLAYFIELD_LEFT * scale;
+	Uint8 *s = (Uint8 *)out->pixels;
+
+	if (starShowVGASpecialCode == 1)
+	{
+		src += (size_t)playfield->pitch * (rows - 1);
+		for (int y = 0; y < rows; y++)
+		{
+			memmove(s, src, width);
+			s += out->pitch;
+			src -= playfield->pitch;
+		}
+	}
+	else if (starShowVGASpecialCode == 2 && processorType >= 2)
+	{
+		const int lighty = (172 - player[0].y) * scale;
+		const int lightx = ((PLAYFIELD_WIDTH - PLAYFIELD_X_SHIFT + 5) - player[0].x) * scale;
+		const int band = 5 * scale;
+
+		for (int y = rows; y; y--)
+		{
+			if (lighty > y)
+			{
+				for (int x = width; x; x--)
+				{
+					*s = (*src & 0xf0) | ((*src >> 2) & 0x03);
+					s++;
+					src++;
+				}
+			}
+			else
+			{
+				for (int x = width; x; x--)
+				{
+					const int lightdist = abs(lightx - x) + lighty;
+					if (lightdist < y)
+						*s = *src;
+					else if (lightdist - y <= band)
+						*s = (*src & 0xf0) | (((*src & 0x0f) + (3 * (band - (lightdist - y))) / scale) / 4);
+					else
+						*s = (*src & 0xf0) | ((*src & 0x0f) >> 2);
+					s++;
+					src++;
+				}
+			}
+			s += out->pitch - width;
+			src += playfield->pitch - width;
+		}
+	}
+	else
+	{
+		for (int y = 0; y < rows; y++)
+		{
+			memmove(s, src, width);
+			s += out->pitch;
+			src += playfield->pitch;
+		}
+	}
+}
+
+// Block-expand the 1x HUD onto the hi frame: the right-hand HUD column for the
+// playfield rows, and the full width below the playfield. The HUD is tick-drawn
+// 1x art (plus the per-frame power gauge), so expanding is exact — it looks
+// identical to the classic path.
+static void expand_hud_to_hi(SDL_Surface *src, SDL_Surface *hi, int scale)
+{
+	for (int y = 0; y < vga_height; ++y)
+	{
+		const int x_start = (y < 184) ? PLAYFIELD_WIDTH : 0;
+		const Uint8 *sp = (const Uint8 *)src->pixels + y * src->pitch + x_start;
+		Uint8 *const d0 = (Uint8 *)hi->pixels + (y * scale) * hi->pitch + x_start * scale;
+
+		Uint8 *d = d0;
+		for (int x = x_start; x < vga_width; ++x, ++sp, d += scale)
+			memset(d, *sp, scale);
+
+		const int row_bytes = (vga_width - x_start) * scale;
+		for (int k = 1; k < scale; ++k)
+			memcpy(d0 + k * hi->pitch, d0, row_bytes);
+	}
+}
+
+// Soul of Zinglon light pillar, drawn at display rate from the per-tick request (zinglonPillar*).
+// cx is in HI units (already scaled); temp is 1x half-width. notes.md §Other render-rate presents.
+static void draw_zinglon_pillar(SDL_Surface *surface, int cx, int temp, int scale)
+{
+	const int bottom = 184 * scale;
+	int x0 = cx - temp * scale;
+	int x1 = cx + temp * scale + (scale - 1);
+	if (x0 < 0) x0 = 0;
+	JE_barBright(surface, x0, 0, x1, bottom);
+	x0 = cx - (temp + 2) * scale;
+	x1 = cx + (temp + 2) * scale + (scale - 1);
+	if (x0 < 0) x0 = 0;
+	JE_barBright(surface, x0, 0, x1, bottom);
+}
+
+// Generator power bar render state: a HUD overlay on VGAScreenSeg, redrawn every presented
+// frame at an interpolated level with a sub-pixel anti-aliased top edge.
+static bool power_gauge_active = false;
+static int power_render_prev = 0, power_render_cur = 0;  // `power` (0..900) at the prev/cur tick
+
+static void draw_power_gauge(float power_value)
+{
+	enum { Y_BOTTOM = 104, BAR_MAX = 93, BASE = 113, POWER_MAX = 900 };
+	// 9 pixels wide (x1..x2). The classic art drew this gauge 1px narrower than the
+	// shield/armor bars; extend it right by one so all three gauges match at 9px.
+	const int x1 = HUD_X(269), x2 = HUD_X(277);
+
+	// power (0..POWER_MAX) -> bar height in pixels (0..BAR_MAX). BAR_MAX drives the full
+	// height, so the bar rescales with it (classic was power/10 with a 90px BAR_MAX).
+	float level = power_value * BAR_MAX / (float)POWER_MAX;
+	if (level < 0.0f)
+		level = 0.0f;
+	else if (level > BAR_MAX)
+		level = BAR_MAX;
+
+	const int full = (int)level;          // solid pixel rows
+	const float frac = level - full;      // sub-pixel remainder for the top edge
+	const int dir = gaugeGradGenerator;   // GaugeGradientDir
+
+	// Kill-fire BOON window: main-gun fire is power-free, so recolour the gauge under the same
+	// condition that gates the free power. notes.md §Course generation & danger labels.
+	int base = BASE;
+	if (endlessMode && endlessTurbodriveActive() && !endlessKillFireIsEvil())
+		base = ENDLESS_FREE_POWER_GAUGE_BASE;
+	const int darkEnd = base & ~0x0F;     // bank floor: the AA top edge blends up from here
+
+	// Clear the bar slot (its background is black, like the original shrink fill).
+	fill_rectangle_xy(VGAScreenSeg, x1, Y_BOTTOM - BAR_MAX, x2, Y_BOTTOM, 0);
+
+	if (dir == GAUGE_GRAD_LEFT || dir == GAUGE_GRAD_RIGHT)
+	{
+		// Horizontal gradient: each column is a fixed shade stepping across the width,
+		// with the sub-pixel anti-aliased top edge applied per column. Lifted +2 shades to
+		// match the slightly-brighter horizontal ramp on the shield/armor bars (in-family).
+		for (int j = 0; j <= x2 - x1; j++)
+		{
+			const int off = (dir == GAUGE_GRAD_RIGHT) ? j : (x2 - x1 - j);
+			const int shade = base + 2 + off;
+			if (full >= 1)
+				fill_rectangle_xy(VGAScreenSeg, x1 + j, Y_BOTTOM - full + 1, x1 + j, Y_BOTTOM, (Uint8)shade);
+			if (full < BAR_MAX && frac > 0.04f)
+			{
+				int edgeCol = darkEnd + (int)(frac * (shade - darkEnd) + 0.5f);
+				if (edgeCol > shade)
+					edgeCol = shade;
+				JE_pix(VGAScreenSeg, x1 + j, Y_BOTTOM - full, (Uint8)edgeCol);
+			}
+		}
+		return;
+	}
+
+	// Vertical gradient, drawn bottom-up in same-shade bands. Up = classic (shade
+	// BASE + h/7, darkest at the bottom); Down mirrors the gradient within the fill.
+	for (int h = 1; h <= full; )
+	{
+		const int shade = (dir == GAUGE_GRAD_DOWN) ? (full - h) / 7 : h / 7;
+		int h2 = h;
+		while (h2 + 1 <= full &&
+		       ((dir == GAUGE_GRAD_DOWN) ? (full - (h2 + 1)) / 7 : (h2 + 1) / 7) == shade)
+			++h2;
+		fill_rectangle_xy(VGAScreenSeg, x1, Y_BOTTOM - h2 + 1, x2, Y_BOTTOM - h + 1, (Uint8)(base + shade));
+		h = h2 + 1;
+	}
+
+	// Anti-aliased leading row: dimmed toward the darkest shade by frac so the top
+	// edge appears to move at sub-pixel resolution as the bar fills. In Down the top
+	// band is the darkest (BASE); in Up it is the current top shade.
+	if (full < BAR_MAX && frac > 0.04f)
+	{
+		const int barCol = (dir == GAUGE_GRAD_DOWN) ? base : (base + full / 7);
+		int edgeCol = darkEnd + (int)(frac * (barCol - darkEnd) + 0.5f);
+		if (edgeCol > barCol)
+			edgeCol = barCol;
+		fill_rectangle_xy(VGAScreenSeg, x1, Y_BOTTOM - full, x2, Y_BOTTOM - full, (Uint8)edgeCol);
+	}
+}
+
 void JE_starShowVGA(void)
 {
 	if (!playerEndLevel && !skipStarShowVGA)
 	{
+		// Zinglon pillar at the tick position: baseline for the non-interpolated
+		// present paths; the interp loop below redraws it shifted after replay.
+		if (zinglonPillarActive)
+			draw_zinglon_pillar(game_screen, zinglonPillarCX, zinglonPillarTemp, 1);
+
 		composite_playfield(game_screen);
 
-		if (smoothScroll != 0 /*&& thisPlayerNum != 2*/)
+		if (smoothScroll != 0)
 		{
-			// Needs a real tick period to scale interpolation against. Smoothie
-			// (ice/water/lava) levels interpolate too now, via a persistent
-			// feedback buffer (render_gs) that the replay re-filters each frame.
-			const bool can_interp = frameCountMax > 0;
+			// Interpolation needs a real tick period. Smoothie levels present in two passes
+			// (notes.md §Smoothie levels); normal levels interpolate straight into game_screen.
+			const bool can_interp = frameCountMax > 0 && smoothMotion;
 
-			// On smoothie levels the replay evolves a persistent buffer; seed it
-			// from this tick's authoritative frame so its feedback starts correct.
-			SDL_Surface *const interp_buf = anySmoothies ? get_render_gs() : game_screen;
-			if (anySmoothies && interp_buf != NULL)
-				memcpy(interp_buf->pixels, game_screen->pixels, (size_t)game_screen->h * game_screen->pitch);
+			// Supersample factor for this present pass (Auto follows the scaler; see
+			// video.h). The hi path needs its buffers; on any allocation failure it
+			// degrades to the classic 1x path — never to a missing frame.
+			int rss = can_interp ? effective_supersample() : 1;
+			const bool use_hi = rss > 1 && ensure_hi_buffers(rss);
+			if (!use_hi)
+				rss = 1;
 
-			if (can_interp && interp_buf != NULL)
+			SDL_Surface *const interp_buf  = anySmoothies ? get_smoothie_frame(rss)
+			                               : (use_hi ? pf_hi : game_screen);
+			SDL_Surface *const bg_feedback = anySmoothies ? get_render_gs(rss) : NULL;
+
+			if (can_interp && interp_buf != NULL && (!anySmoothies || bg_feedback != NULL))
 			{
-				// Fixed-timestep accumulator: present every display frame at
-				// alpha = accumulator/period (derived from REAL elapsed time, so
-				// motion is smooth and even at ANY refresh), and return to run the
-				// next sim tick once a full period has elapsed. The leftover time
-				// carries over, so the average sim rate stays exact (~35Hz).
+				// Present every display frame at alpha = accumulator/period (real
+				// elapsed time); break to run the next sim tick once a full period has
+				// elapsed. Leftover time carries over, keeping the sim rate exact.
 				const float period = (float)frameCountMax * get_delay_period();
 
 				if (!sim_timing_init)
 				{
-					sim_last_ms = SDL_GetTicks();
+					sim_perf_freq = SDL_GetPerformanceFrequency();
+					sim_last_counter = SDL_GetPerformanceCounter();
 					sim_accumulator = 0.0f;
 					sim_timing_init = true;
 				}
 
+				const float counter_to_ms = 1000.0f / (float)sim_perf_freq;
+
 				for (;;)
 				{
-					const Uint32 now = SDL_GetTicks();
-					float elapsed = (float)(now - sim_last_ms);
-					sim_last_ms = now;
+					const Uint64 now = SDL_GetPerformanceCounter();
+					float elapsed = (float)(now - sim_last_counter) * counter_to_ms;
+					sim_last_counter = now;
 					if (elapsed > period * 4.0f)
 						elapsed = period;  // spiral guard (lag spike / resume from pause)
 					sim_accumulator += elapsed;
+
+					// Advance the VT ship by the REAL elapsed time before the break check:
+					// stepping only on rendered frames discards the elapsed time of the
+					// iteration that triggers a sim tick, which reads as visible stutter
+					// even at a solid 60 fps (notes.md §VT ship).
+					const bool vt_owns = vt_ship_owns();
+					if (vt_owns)
+						vt_ship_step(elapsed / period);
 
 					if (sim_accumulator >= period)
 					{
@@ -513,14 +769,51 @@ void JE_starShowVGA(void)
 					}
 
 					const float alpha = sim_accumulator / period;
-					const float frame_dt = elapsed / period;  // this frame's fraction of a tick
-					if (vt_ship_owns())
-						vt_ship_step(frame_dt);       // simulate the ship at the render rate (variable dt)
+					debug_interp_alpha = alpha;  // expose for the perf overlay
+					if (!vt_owns)
+						update_ship_override(alpha);  // extrapolate the ship for this frame (non-VT path)
+
+					if (anySmoothies)
+					{
+						// Pass 1: derive this frame's background by filtering a COPY of
+						// the fixed plasma base with the interpolated backgrounds.
+						memcpy(interp_buf->pixels, bg_feedback->pixels, (size_t)bg_feedback->h * bg_feedback->pitch);
+						rl_replay_bg(interp_buf, alpha, rss);
+						// Pass 2: composite the interpolated entities + overlays on top.
+						rl_replay_fg(interp_buf, alpha, rss);
+					}
 					else
-						update_ship_override(alpha);  // otherwise extrapolate the ship for this frame
-					rl_replay_interp(interp_buf, alpha, anySmoothies, frame_dt);
-					composite_playfield(interp_buf);
-					JE_showVGA();
+					{
+						rl_replay_interp(interp_buf, alpha, false, rss);
+					}
+
+					// Zinglon pillar onto the freshly-interpolated frame, centred on the
+					// ship's render-rate position so it glides rather than snapping.
+					if (zinglonPillarActive)
+						draw_zinglon_pillar(interp_buf,
+						                    round_signed(((float)zinglonPillarCX + rl_get_ship_override_dx(0)) * rss),
+						                    zinglonPillarTemp, rss);
+
+					if (use_hi)
+					{
+						// NxN composite + block-expanded 1x HUD, presented through the
+						// dedicated hi path (same on-screen rect as the classic path).
+						composite_playfield_hi(interp_buf, vga_hi, rss);
+						if (power_gauge_active)
+							draw_power_gauge((float)power_render_prev + (power_render_cur - power_render_prev) * alpha);
+						expand_hud_to_hi(VGAScreenSeg, vga_hi, rss);
+						present_hi(vga_hi);
+					}
+					else
+					{
+						composite_playfield(interp_buf);
+
+						// Power bar at the interpolated level: rises smoothly instead of per-tick steps.
+						if (power_gauge_active)
+							draw_power_gauge((float)power_render_prev + (power_render_cur - power_render_prev) * alpha);
+
+						JE_showVGA();
+					}
 
 					if (!output_vsync)
 						limit_render_fps();
@@ -534,6 +827,12 @@ void JE_starShowVGA(void)
 				service_wait_delay();
 				setDelay(frameCountMax);
 			}
+
+			// Advance the persistent plasma base one filter step to this tick's plasma,
+			// the base for the next tick's interpolated frames. This is the only place
+			// the smoothie feedback accumulates — exactly once per tick, like the sim.
+			if (anySmoothies && bg_feedback != NULL)
+				rl_replay_bg(bg_feedback, 1.0f, rss);
 		}
 		else
 		{
@@ -585,6 +884,15 @@ static void copy_buffer_to_screen(const Uint8* buffer)
 	}
 }
 
+// Sub-pixel fraction of tempMapXOfs, set beside every tempMapXOfs assignment so enemies float
+// their parallax onto the background layer's sub-pixel offset. notes.md §Sub-pixel parallax.
+static float tempMapXOfs_frac = 0.0f;
+
+// Vertical sub-pixel frac of the layer the current enemy scroll-tracks. TWO variants: the
+// sprite draws before the ey advance (lagged frac), the bar after. notes.md §Sub-pixel parallax.
+static float tempScrollYfrac    = 0.0f;
+static float tempScrollYfracNow = 0.0f;
+
 inline static void blit_enemy(SDL_Surface *surface, unsigned int i, signed int x_offset, signed int y_offset, signed int sprite_offset)
 {
 	if (enemy[i].sprite2s == NULL)
@@ -595,15 +903,56 @@ inline static void blit_enemy(SDL_Surface *surface, unsigned int i, signed int x
 	
 	const int x = enemy[i].ex + x_offset + tempMapXOfs,
 	          y = enemy[i].ey + y_offset;
-	const unsigned int index = enemy[i].egr[enemy[i].enemycycle - 1] + sprite_offset;
+
+	// enemycycle indexes egr[] 1-based; skip anything that doesn't name a real in-sheet sprite
+	// instead of underflowing into a wild read in blit_sprite2 (notes.md §General pitfalls).
+	const unsigned int cycle = enemy[i].enemycycle;
+	if (cycle < 1 || cycle > 20)
+		return;
+	const unsigned int index = enemy[i].egr[cycle - 1] + sprite_offset;
+	if (index == 0 || (size_t)index * sizeof(Uint16) > enemy[i].sprite2s->size)
+		return;
 
 	rl_current_id = RL_ID_ENEMY_BASE + (int)i;  // tag for cross-frame interpolation
+	rl_current_par_frac = tempMapXOfs_frac;     // float the parallax to match the background
+	rl_current_par_yfrac = tempScrollYfrac;     // float the vertical scroll to match the background
 	if (enemy[i].filter != 0)
 		blit_sprite2_filter(surface, x, y, *enemy[i].sprite2s, index, enemy[i].filter);
 	else
 		blit_sprite2(surface, x, y, *enemy[i].sprite2s, index);
 	rl_current_id = 0;
+	rl_current_par_frac = 0.0f;
+	rl_current_par_yfrac = 0.0f;
 }
+
+// Extra off-screen margin for the enemy-draw visibility tests: the interpolated position lags
+// the tick position by up to one tick of motion. Equals the interpolation snap threshold.
+enum { ENEMY_DRAW_MARGIN = 40 };
+
+// True if this live enemy is stuck above the top of the screen with no way to ever leave:
+// beyond shot reach (ey <= -58) and vertically frozen. HORIZONTAL state is deliberately
+// ignored (HARVEST's anchor carries a sideways sway). notes.md §Map-stop softlock watchdog.
+static bool enemy_stuck_above_screen(unsigned int i)
+{
+	return enemy[i].ey   <= -58 &&
+	       enemy[i].eyc  <= 0 &&
+	       enemy[i].eycc <= 0 &&
+	       enemy[i].fixedmovey <= 0;
+}
+
+// Count live enemies stuck above the screen: a dedicated full-pool scan, deliberately not the
+// draw loop's on-screen census (notes.md §Map-stop softlock watchdog).
+static unsigned int count_stuck_above_screen(void)
+{
+	unsigned int n = 0;
+	for (int i = 0; i < 100; i++)
+		if (enemyAvail[i] != 1 && enemy_stuck_above_screen(i))
+			++n;
+	return n;
+}
+
+// Sim ticks (~6s) a stuck-above stall is left alone before the watchdog culls it (notes.md §Map-stop softlock watchdog).
+enum { MAP_STOP_STALL_LIMIT = 210 };
 
 void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just drawing
 {
@@ -614,6 +963,18 @@ void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just d
 		if (enemyAvail[i] != 1)
 		{
 			enemy[i].mapoffset = tempMapXOfs;
+			enemy[i].mapoffset_frac = tempMapXOfs_frac;  // for the health bar's smooth-H match
+			enemy[i].scroll_yfrac = tempScrollYfracNow;  // for the health bar's smooth-V match (bar is drawn post-advance -> this-tick frac, unlike the pre-advance sprite)
+
+			// Endless: decide once (per linkgroup) this enemy's tier -- 0 undecided, 1 normal,
+			// 2 elite, 3 champion; score pickups and invincible (255-armor) enemies excluded.
+			if (endlessMode && enemy[i].eliteState == 0)
+			{
+				if (!enemy[i].scoreitem && enemy[i].armorleft > 0 && enemy[i].armorleft < 255)
+					enemy[i].eliteState = (JE_byte)endlessRollEliteTier(enemy[i].linknum);
+				else
+					enemy[i].eliteState = 1;
+			}
 
 			if (enemy[i].xaccel && enemy[i].xaccel - 89u > mt_rand() % 11)
 			{
@@ -655,17 +1016,23 @@ void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just d
 						enemy[i].enemycycle = enemy[i].animin;
 				}
 
-				if (enemy[i].egr[enemy[i].enemycycle - 1] == 999)
+				if (enemy[i].enemycycle >= 1 && enemy[i].enemycycle <= 20 &&
+				    enemy[i].egr[enemy[i].enemycycle - 1] == 999)
 					goto enemy_gone;
+
+				// Elite/champion tint: filter is zeroed every frame (below), so re-apply it
+				// here each frame. Skip if something already set filter (e.g. a hit flash).
+				if (enemy[i].eliteState >= 2 && enemy[i].filter == 0)
+					enemy[i].filter = (enemy[i].eliteState == 3) ? ENDLESS_CHAMPION_FILTER : ENDLESS_ELITE_FILTER;
 
 				if (enemy[i].size == 1) // 2x2 enemy
 				{
-					if (enemy[i].ey > -13)
+					if (enemy[i].ey > -13 - ENEMY_DRAW_MARGIN)
 					{
 						blit_enemy(VGAScreen, i, -6, -7, 0);
 						blit_enemy(VGAScreen, i,  6, -7, 1);
 					}
-					if (enemy[i].ey > -26 && enemy[i].ey < 182)
+					if (enemy[i].ey > -26 - ENEMY_DRAW_MARGIN && enemy[i].ey < 182 + ENEMY_DRAW_MARGIN)
 					{
 						blit_enemy(VGAScreen, i, -6,  7, 19);
 						blit_enemy(VGAScreen, i,  6,  7, 20);
@@ -673,7 +1040,7 @@ void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just d
 				}
 				else
 				{
-					if (enemy[i].ey > -13)
+					if (enemy[i].ey > -13 - ENEMY_DRAW_MARGIN)
 						blit_enemy(VGAScreen, i, 0, 0, 0);
 				}
 
@@ -728,7 +1095,10 @@ void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just d
 				}
 			}
 
-			enemy[i].ey += enemy[i].fixedmovey;
+			// Scroll-tracking (background attach): scale by the endless overclock so the enemy keeps
+			// up with the faster-scrolling terrain. The enemy's own velocity (eyc, below) is not
+			// scaled, so flight/attack speed stays normal -- only the "ride the scroll" part speeds up.
+			enemy[i].ey += enemy[i].fixedmovey * (1 + endlessScrollExtraThisTick);
 
 			enemy[i].ex += enemy[i].exc;
 			if (enemy[i].ex < -80 || enemy[i].ex > vga_width + 20)
@@ -764,7 +1134,11 @@ enemy_still_exists:
 					enemy[i].ex--;
 			}
 
-			enemy[i].ey += tempBackMove;
+			// Scroll-track at overclock pace using the SMOOTH per-tick px of whichever layer this
+			// enemy rides, so ground enemies glide with the terrain. notes.md §Endless scroll boost.
+			int scrollExtraPx = (tempBackMove == backMove)  ? endlessScrollExtraPx1 :
+			                    (tempBackMove == backMove3) ? endlessScrollExtraPx3 : 0;
+			enemy[i].ey += tempBackMove + scrollExtraPx;
 
 			if (enemy[i].ex <= -24 || enemy[i].ex >= vga_width - 24)
 				goto draw_enemy_end;
@@ -804,6 +1178,18 @@ enemy_still_exists:
 							enemy[i].eshotwait[j-1] = (enemy[i].eshotwait[j-1] / 2) + 1;
 							if (difficultyLevel > DIFFICULTY_MANIACAL)
 								enemy[i].eshotwait[j-1] = (enemy[i].eshotwait[j-1] / 2) + 1;
+						}
+
+						if (endlessMode)
+						{
+							// Endless: enemies fire faster with depth (lower cooldown = faster);
+							// champions fire faster still.
+							int fd = endlessFireDelayPercent();
+							if (enemy[i].eliteState == 3)
+								fd = fd * endlessChampionFireDelayPercent() / 100;
+							enemy[i].eshotwait[j-1] = enemy[i].eshotwait[j-1] * fd / 100;
+							if (enemy[i].eshotwait[j-1] < 1)
+								enemy[i].eshotwait[j-1] = 1;
 						}
 
 						if (galagaMode && (enemy[i].eyc == 0 || (mt_rand() % 400) >= galagaShotFreq))
@@ -862,19 +1248,29 @@ enemy_still_exists:
 							break;
 						default:
 						/*Rot*/
-							for (int tempCount = weapons[temp3].multi; tempCount > 0; tempCount--)
+							if (cheatNoEnemyFire)  // debug: enemies behave but don't shoot
+								break;
+							// Endless "rising tide": once faster-fire has saturated, enemies add EXTRA
+							// shots per volley (fanned out below) rather than firing quicker -- bullet
+							// count is the one difficulty axis with no engine ceiling. Zero early on.
+							int endlessBaseMulti = weapons[temp3].multi;
+							int endlessVolley = endlessBaseMulti + (endlessMode ? endlessExtraEnemyShots() : 0);
+							// Only endless draws on the enlarged enemy-shot pool; normal levels keep the
+							// original 60-slot cap so they play exactly as before.
+							const int enemyShotCap = endlessMode ? ENEMY_SHOT_MAX : ENEMY_SHOT_NORMAL;
+							for (int shotNum = 0; shotNum < endlessVolley; shotNum++)
 							{
-								for (b = 0; b < ENEMY_SHOT_MAX; b++)
+								for (b = 0; b < enemyShotCap; b++)
 								{
 									if (enemyShotAvail[b] == 1)
 										break;
 								}
-								if (b == ENEMY_SHOT_MAX)
+								if (b == enemyShotCap)
 									goto draw_enemy_end;
 
 								enemyShotAvail[b] = !enemyShotAvail[b];
 
-								if (weapons[temp3].sound > 0)
+								if (weapons[temp3].sound > 0 && shotNum < endlessBaseMulti)
 								{
 									do
 									{
@@ -967,6 +1363,44 @@ enemy_still_exists:
 									enemyShot[b].sxm = roundf((float)aimX / maxMagAim * aim);
 									enemyShot[b].sym = roundf((float)aimY / maxMagAim * aim);
 								}
+
+								if (endlessMode)
+								{
+									// Endless: enemy projectiles get faster with depth. Scale both
+									// velocity components (set above for fixed-direction and aimed
+									// shots alike); round away from zero so slow shots still speed up.
+									int spct = endlessShotSpeedPercent();
+									enemyShot[b].sxm = (enemyShot[b].sxm * spct + (enemyShot[b].sxm >= 0 ? 50 : -50)) / 100;
+									enemyShot[b].sym = (enemyShot[b].sym * spct + (enemyShot[b].sym >= 0 ? 50 : -50)) / 100;
+
+									// ...and hit harder with depth (DEVASTATING sector adds more; champion
+									// shooters add more still). sdmg is a byte fed straight to
+									// JE_playerDamage; round to nearest and clamp so it can't wrap past 255.
+									int dpct = endlessShotDamagePercent();
+									if (enemy[i].eliteState == 3)
+										dpct = dpct * endlessChampionShotDamagePercent() / 100;
+									int dmg = (enemyShot[b].sdmg * dpct + 50) / 100;
+									enemyShot[b].sdmg = (JE_byte)(dmg > 255 ? 255 : dmg);
+
+									// Tide fan: the EXTRA shots (beyond the weapon's own volley) get a small
+									// alternating angular offset, so they spread into a readable fan instead
+									// of stacking on the base trajectory. Done after the speed scale, so the
+									// larger velocity rotates with some resolution.
+									if (shotNum >= endlessBaseMulti)
+									{
+										int fanK = shotNum - endlessBaseMulti;   // 0, 1, 2, ... per extra shot
+										float fanAng = ((fanK & 1) ? -1.0f : 1.0f) * (fanK / 2 + 1) * 0.20f;
+										float fc = cosf(fanAng), fs = sinf(fanAng);
+										int ox = enemyShot[b].sxm, oy = enemyShot[b].sym;
+										enemyShot[b].sxm = roundf(ox * fc - oy * fs);
+										enemyShot[b].sym = roundf(ox * fs + oy * fc);
+										if (enemyShot[b].sxm == 0 && enemyShot[b].sym == 0)  // rounding zeroed a tiny vector
+										{
+											enemyShot[b].sxm = ox;
+											enemyShot[b].sym = oy;
+										}
+									}
+								}
 							}
 							break;
 						}
@@ -1057,11 +1491,27 @@ void JE_main(void)
 
 	int lastEnemyOnScreen;
 
-	/* NOTE: BEGIN MAIN PROGRAM HERE AFTER LOADING A GAME OR STARTING A NEW ONE */
+	/* NOTE: BEGIN MAIN PROGRAM HERE after LOADING A GAME OR STARTING A NEW ONE */
 
 	/* ----------- GAME ROUTINES ------------------------------------- */
 	/* We need to jump to the beginning to make space for the routines */
 	/* --------------------------------------------------------------- */
+	if (endlessMode)
+	{
+		// First level of the run: run the starting shop before level 1 (the normal between-
+		// level flow only runs after a level clears). The shop's Start Level submenu IS the
+		// course choice -- it sets mainLevel + the mutators and launches.
+		endlessBetweenLevels();
+
+		// Player chose Quit Game in the shop instead of charting a course: end the run and
+		// return to the title. On quit the shop leaves mainLevel == 0 (and has already faded out).
+		if (mainLevel == 0)
+		{
+			endlessEndRunToTitle();  // hardcore shows the Run Over summary first
+			return;
+		}
+	}
+
 	goto start_level_first;
 
 	/*------------------------------GAME LOOP-----------------------------------*/
@@ -1115,17 +1565,60 @@ start_level:
 
 	if (!play_demo)
 	{
+		// Endless "Quit Level": don't end the run. Revert to the launch-time snapshot and reopen the
+		// buy/sell menu LOCKED to those choices -- relaunch the same level, or save/load, or quit the
+		// run. No depth++ and no level-clear screen: this is a retry, not a completed zone.
+		if (endlessMode && endlessQuitToOutpost && endlessSortieValid())
+		{
+			endlessQuitToOutpost = false;
+			fade_song();
+			fade_black(10);
+			endlessRestoreSortie();   // revert player loadout + endless state; arms the locked outpost
+			endlessBetweenLevels();   // reopens the shop (locked); sets mainLevel on relaunch, 0 on quit-run
+			if (mainLevel == 0)          // player chose Quit Game in the locked outpost: end the run and
+			{                            // return to the title (hardcore shows the Run Over summary first,
+				endlessEndRunToTitle();  // since a hardcore quit is as final as a death).
+				return;
+			}
+			goto start_level_first;   // re-run the same level (endlessCaptureSortie re-snapshots + clears the lock)
+		}
+
 		if ((!all_players_dead() || normalBonusLevelCurrent || bonusLevelCurrent) && !playerEndLevel)
 		{
-			mainLevel = nextLevel;
-			JE_endLevelAni();
+			if (endlessMode)
+				endlessRunDepth++;
+			else
+				mainLevel = nextLevel;
+
+			JE_endLevelAni();  // level-complete screen first...
 
 			fade_song();
+
+			if (endlessMode)
+			{
+				endlessBetweenLevels();  // ...then the between-level shop, whose Start Level submenu is the
+				                         // course choice: it sets mainLevel + the mutators and launches.
+
+				// Player chose Quit Game instead of a course: end the run, back to the title.
+				if (mainLevel == 0)
+				{
+					endlessEndRunToTitle();  // hardcore shows the Run Over summary first
+					return;
+				}
+			}
 		}
 		else
 		{
 			fade_song();
 			fade_black(10);
+
+			if (endlessMode)
+			{
+				endlessOnRunEnd();
+				endlessMode = false;
+				mainLevel = 0;
+				return;
+			}
 
 			if (timedBattleMode)
 			{
@@ -1166,6 +1659,29 @@ start_level_first:
 	if (mainLevel == 0)  // if quit itemscreen
 		return;          // back to titlescreen
 
+	// An endless run just loaded from within a shop resumes at its OUTPOST, not by dropping
+	// straight into the loaded level. (Title-screen loads already ran the outpost at JE_main's
+	// entry; this covers the buy/sell-menu load, where JE_loadMap bailed out above.)
+	if (endlessMode && endlessResumePending())
+	{
+		gameLoaded = false;      // consumed -- don't let the shop see it and close instantly
+		endlessBetweenLevels();  // reopens the SAVED outpost snapshot (no reroll)
+		if (mainLevel == 0)      // player quit the outpost
+		{
+			endlessEndRunToTitle();  // hardcore shows Run Over first (a resumed run is never hardcore, but keep it uniform)
+			return;
+		}
+		goto start_level_first;
+	}
+
+	if (endlessMode)
+	{
+		endlessRegenerateLevel();
+		endlessCaptureSortie();  // snapshot the launch-time loadout + committed level for a possible Quit Level retry
+	}
+
+	crashlog_set_phase("playing level");
+
 	if (!play_demo)
 		mouseSetRelative(true);
 
@@ -1203,14 +1719,14 @@ start_level_first:
 	JE_loadPic(VGAScreen, twoPlayerMode ? 6 : 3, false);
 
 	// Relocate the HUD to the new right edge when the playfield is wider
-	const int hud_shift = vga_width - 320;
+	const int hud_shift = vga_width - LEGACY_WIDTH;
 	if (hud_shift > 0)
 	{
 		for (int y = 0; y < vga_height; ++y)
 		{
 			Uint8* row = (Uint8*)VGAScreen->pixels + y * VGAScreen->pitch;
-			memmove(row + PLAYFIELD_WIDTH, row + 320 - HUD_WIDTH, HUD_WIDTH);
-			memset(row + 320 - HUD_WIDTH, 0, hud_shift);
+			memmove(row + PLAYFIELD_WIDTH, row + LEGACY_WIDTH - HUD_WIDTH, HUD_WIDTH);
+			memset(row + LEGACY_WIDTH - HUD_WIDTH, 0, hud_shift);
 		}
 	}
 
@@ -1296,6 +1812,7 @@ start_level_first:
 	}
 	stopBackgrounds = false;
 	stopBackgroundNum = 0;
+	mapStopStallTicks = 0;
 	background3x1   = false;
 	background3x1b  = false;
 	background3over = 0;
@@ -1346,8 +1863,10 @@ start_level_first:
 	JE_drawShield();
 	JE_drawArmor();
 
-	for (uint i = 0; i < COUNTOF(player); ++i)
-		player[i].superbombs = 0;
+	// Endless keeps its bought bombs across levels (like cash/armor/perks); campaign resets each level.
+	if (!endlessMode)
+		for (uint i = 0; i < COUNTOF(player); ++i)
+			player[i].superbombs = 0;
 
 	/* Set cubes to 0 */
 	cubeMax = 0;
@@ -1380,10 +1899,13 @@ start_level_first:
 	set_volume(tyrMusicVolume, fxVolume);
 
 	/*Save backup game*/
-	if (!play_demo && !doNotSaveBackup && !timedBattleMode)
+	// Skip this mid-level autosave point for endless: its continue-slot autosave lives at the
+	// OUTPOST instead (endlessBetweenLevels), the one coherent resume point. notes.md §Save / resume.
+	if (!play_demo && !doNotSaveBackup && !timedBattleMode && !endlessMode)
 	{
 		temp = twoPlayerMode ? 22 : 11;
 		JE_saveGame(temp, "LAST LEVEL    ");
+		endlessSaveSlot(temp);  // not in endless mode: drops any stale endless sidecar record for this slot
 	}
 
 	if (!play_demo && record_demo)
@@ -1497,14 +2019,21 @@ start_level_first:
 	memset(enemySpriteSheetIds, 0, sizeof(enemySpriteSheetIds));
 	memset(enemy,               0, sizeof(enemy));
 
+	if (endlessMode)
+		endlessPreloadBanks();  // load starting sprite banks now so early spawns aren't invisible
+
 	memset(SFCurrentCode,    0, sizeof(SFCurrentCode));
 	memset(SFExecuted,       0, sizeof(SFExecuted));
 
 	zinglonDuration = 0;
 	specialWait = 0;
 	nextSpecialWait = 0;
-	optionAttachmentMove  = 0;    /*Launch the Attachments!*/
-	optionAttachmentLinked = true;
+	for (uint i = 0; i < 2; i++)  /*Launch the Attachments!*/
+	{
+		optionAttachmentMove[i]   = 0;
+		optionAttachmentLinked[i] = true;
+		optionAttachmentReturn[i] = false;
+	}
 
 	editShip1 = false;
 	editShip2 = false;
@@ -1546,6 +2075,18 @@ level_loop:
 	else
 	{
 		starShowVGASpecialCode = smoothies[9-1] + (smoothies[6-1] << 1);
+
+		// Endless decouples the light-cone spotlight (special code 2) from the level's own script:
+		// strip a spotlight any level would set by default, and show it only for the zones that
+		// rolled the seeded 1-in-10 chance (endlessRegenerateLevel). Inverted-control levels (code
+		// 1, or the rare code 3) are left alone so their flipped display and controls stay in sync.
+		if (endlessMode)
+		{
+			if (starShowVGASpecialCode == 2)
+				starShowVGASpecialCode = 0;
+			if (starShowVGASpecialCode == 0 && endlessLightConeActive())
+				starShowVGASpecialCode = 2;
+		}
 	}
 
 	/*Background Wrapping*/
@@ -1626,7 +2167,7 @@ level_loop:
 			{
 				if (--shieldWait == 0)
 				{
-					shieldWait = 15;
+					shieldWait = endlessPerkShieldWait(15);  // Shield Matrix perk shortens this in endless (no-op otherwise)
 
 					for (uint i = 0; i < COUNTOF(player); ++i)
 					{
@@ -1641,7 +2182,7 @@ level_loop:
 			{
 				if (--shieldWait == 0)
 				{
-					shieldWait = 15;
+					shieldWait = endlessPerkShieldWait(15);  // Shield Matrix perk shortens this in endless (no-op otherwise)
 
 					power -= shieldT;
 
@@ -1680,6 +2221,7 @@ level_loop:
 		if (twoPlayerMode || onePlayerAction)
 		{
 			power = 900;
+			power_gauge_active = false;
 		}
 		else
 		{
@@ -1687,22 +2229,18 @@ level_loop:
 			if (power > 900)
 				power = 900;
 
-			temp = power / 10;
+			// Track prev/cur tick levels for the present loop to interpolate between;
+			// draw now so the non-interpolated path still updates each tick.
+			power_render_prev = power_render_cur;
+			power_render_cur = (int)power;
+			power_gauge_active = true;
+			lastPower = power / 10;  // keep the legacy counter consistent
 
-			if (temp != lastPower)
-			{
-				const int hud_x1 = HUD_X(269);
-				const int hud_x2 = HUD_X(276);
-				if (temp > lastPower)
-					fill_rectangle_xy(VGAScreenSeg, hud_x1, 113 - 11 - temp, hud_x2, 114 - 11 - lastPower, 113 + temp / 7);
-				else
-					fill_rectangle_xy(VGAScreenSeg, hud_x1, 113 - 11 - lastPower, hud_x2, 114 - 11 - temp, 0);
-				
-				lastPower = temp;
-			}
+			draw_power_gauge((float)power);
 		}
 
 		oldMapX3Ofs = mapX3Ofs;
+		oldMapX3Ofs_f = mapX3Ofs_f;  // matching un-floored mirror (see backgrnd.c)
 
 		enemyOnScreen = 0;
 	}
@@ -1713,6 +2251,9 @@ level_loop:
 	// Begin capturing this tick's playfield draws into the render list so they
 	// can be replayed (interpolated) for in-between frames at the display rate.
 	rl_begin_record();
+
+	// Cleared each tick; JE_doSpecialShot re-sets it while the Zinglon blast is live.
+	zinglonPillarActive = false;
 
 	/*---------------------------EVENTS-------------------------*/
 	while (eventRec[eventLoc-1].eventtime <= curLoc && eventLoc <= maxEvent)
@@ -1729,6 +2270,11 @@ level_loop:
 	/* --- BACKGROUNDS --- */
 	/* --- BACKGROUND 1 --- */
 
+	// A boosted scroll can advance more than one tile (28px) per tick, so widen the render
+	// list's bottom interpolation margin or its up-shift uncovers a strip below the playfield.
+	// Set once per tick (before any layer draws) so all three layers agree; 3 rows cover ~96px/tick.
+	bgMarginRows = (endlessMode && endlessScrollBoostActive()) ? 3 : 1;
+
 	if (forceEvents && !backMove)
 		curLoc++;
 
@@ -1742,6 +2288,10 @@ level_loop:
 		JE_clr256(VGAScreen);
 
 	/*Set Movement of background 1*/
+	// base1ScrollPx: px layer 1 (and the event pointer) actually scrolled this tick -- 0 on a
+	// delay-gated "off" tick (map1YDelayMax > 1). Feeds the smooth overclock boost below so it
+	// fills the off-ticks instead of pulsing with the (0-on-off-ticks) instantaneous backMove.
+	int base1ScrollPx = 0;
 	if (--map1YDelay == 0)
 	{
 		map1YDelay = map1YDelayMax;
@@ -1749,6 +2299,7 @@ level_loop:
 		curLoc += backMove;
 
 		backPos += backMove;
+		base1ScrollPx = backMove;
 
 		if (backPos > 27)
 		{
@@ -1756,6 +2307,59 @@ level_loop:
 			mapY--;
 			mapYPos -= 14;  /*Map Width*/
 		}
+	}
+
+	// Endless scroll boost: cache the per-tick extra-step count once (the accumulator must be
+	// consumed exactly once) so backgrounds 2/3 and enemy scroll-tracking apply the same boost as
+	// the event pointer, keeping enemies and scripted bosses in sync. notes.md §Endless scroll boost.
+	endlessScrollExtraThisTick = endlessMode ? endlessExtraScrollSteps() : 0;
+	// Publish the PREVIOUS tick's smooth vertical scroll rate + sub-pixel fraction for the render
+	// list (the present loop shows this tick's list at its pre-advance position, so the data lags
+	// one tick, matching bgScrollDeltaY). notes.md §Slow-scroll smoothing.
+	static float bgSmoothRatePend[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	static float bgSmoothFracPend[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	static bool  bgSmoothActivePend  = false;
+	for (int L = 1; L <= 3; ++L)
+	{
+		bg_layer_dy[L]    = bgSmoothRatePend[L];
+		bg_layer_yfrac[L] = bgSmoothFracPend[L];
+	}
+	bg_smooth_y_active = bgSmoothActivePend;
+
+	// Smooth every layer to its true average scroll rate so a delay-gated slow section (event 3:
+	// layer 1 1px/3 ticks, layer 2 1px/2 ticks) slides sub-pixel instead of freezing then jumping.
+	// Runs on EVERY level; a scroll modifier additionally emits extra px. fireN = per-fire step (1
+	// while delay-gated, else backMoveN); baseN = px that actually moved this tick.
+	{
+		int fire1 = (map1YDelayMax > 1 && backMove < 2) ? 1 : (int)backMove;
+		endlessScrollExtraPx1 = endlessScrollExtraPx(0, fire1, map1YDelayMax, base1ScrollPx,
+		                                             &bgSmoothRatePend[1], &bgSmoothFracPend[1]);
+
+		int fire2 = (map2YDelayMax > 1 && backMove2 < 2) ? 1 : (int)backMove2;
+		int base2 = (map2YDelay == 1) ? fire2 : 0;
+		endlessScrollExtraPx2 = endlessScrollExtraPx(1, fire2, map2YDelayMax, base2,
+		                                             &bgSmoothRatePend[2], &bgSmoothFracPend[2]);
+
+		endlessScrollExtraPx3 = endlessScrollExtraPx(2, (int)backMove3, 1, (int)backMove3,
+		                                             &bgSmoothRatePend[3], &bgSmoothFracPend[3]);
+	}
+	bgSmoothActivePend = true;
+
+	// Publish this tick's (non-lagged) fraction for scroll-tracked entities drawn later this tick
+	// (enemies + HP bars): recorded after the scroll advance, they need frac_T, not the one-tick-
+	// lagged bg_layer_yfrac the pre-advance background rows use. notes.md §Sub-pixel parallax.
+	for (int L = 1; L <= 3; ++L)
+		bg_layer_yfrac_now[L] = bgSmoothFracPend[L];
+
+	// Layer 1 (+ the event pointer, which must ride the identical delta so scripted stops stay
+	// aligned to the terrain). One combined advance; the wrap can cross more than one tile.
+	curLoc += endlessScrollExtraPx1;
+	backPos += endlessScrollExtraPx1;
+	while (backPos > 27)
+	{
+		backPos -= 28;
+		mapY--;
+		mapYPos -= 14;
 	}
 
 	if (starActive || astralDuration > 0)
@@ -1807,7 +2411,10 @@ level_loop:
 	lastEnemyOnScreen = enemyOnScreen;
 
 	tempMapXOfs = mapXOfs + PLAYFIELD_X_SHIFT;
+	tempMapXOfs_frac = mapXOfs_f - mapXOfs;
 	tempBackMove = backMove;
+	tempScrollYfrac    = bg_layer_yfrac[1];      // sprite (pre-advance): lagged frac, glued to layer 1
+	tempScrollYfracNow = bg_layer_yfrac_now[1];  // HP bar (post-advance): this-tick frac
 	JE_drawEnemy(50);
 	JE_drawEnemy(100);
 
@@ -1855,7 +2462,7 @@ level_loop:
 		draw_background_3(VGAScreen);
 
 	/* New Enemy */
-	if (enemiesActive && mt_rand() % 100 > levelEnemyFrequency)
+	if (enemiesActive && levelEnemyMax > 0 && mt_rand() % 100 > levelEnemyFrequency)
 	{
 		tempW = levelEnemy[mt_rand() % levelEnemyMax];
 		if (tempW == 2)
@@ -1865,11 +2472,15 @@ level_loop:
 
 	if (processorType > 1 && smoothies[3-1])
 	{
+		if (render_list_recording)
+			rl_rec_smoothie_filter(RC_ICED_BLUR);
 		iced_blur_filter(game_screen, VGAScreen);
 		VGAScreen = game_screen;
 	}
 	if (processorType > 1 && smoothies[4-1])
 	{
+		if (render_list_recording)
+			rl_rec_smoothie_filter(RC_BLUR);
 		blur_filter(game_screen, VGAScreen);
 		VGAScreen = game_screen;
 	}
@@ -1880,7 +2491,10 @@ level_loop:
 		lastEnemyOnScreen = enemyOnScreen;
 
 		tempMapXOfs = mapX2Ofs + PLAYFIELD_X_SHIFT;
+		tempMapXOfs_frac = mapX2Ofs_f - mapX2Ofs;
 		tempBackMove = 0;
+		tempScrollYfrac    = 0.0f;  // not vertically scroll-tracked (layer-2 anchor): no sub-pixel glue
+		tempScrollYfracNow = 0.0f;
 		JE_drawEnemy(25);
 
 		if (enemyOnScreen == lastEnemyOnScreen)
@@ -1897,7 +2511,10 @@ level_loop:
 	if (!topEnemyOver)
 	{
 		tempMapXOfs = ((background3x1 == 0) ? oldMapX3Ofs : mapXOfs) + PLAYFIELD_X_SHIFT;
+		tempMapXOfs_frac = (background3x1 == 0) ? (oldMapX3Ofs_f - oldMapX3Ofs) : (mapXOfs_f - mapXOfs);
 		tempBackMove = backMove3;
+		tempScrollYfrac    = bg_layer_yfrac[3];      // sprite (pre-advance): lagged frac, glued to layer 3
+		tempScrollYfracNow = bg_layer_yfrac_now[3];  // HP bar (post-advance): this-tick frac
 		JE_drawEnemy(75);
 	}
 
@@ -1917,6 +2534,11 @@ level_loop:
 			{
 				goto draw_player_shot_loop_end;
 			}
+
+			// OVERCHARGE / Overdrive / Heavy Rounds perk (endless): your weapons hit harder.
+			// Gate on the computed percent so any damage source (sector mod or run perk) applies.
+			if (endlessMode && endlessPlayerDamagePercent() != 100)
+				damage = damage * endlessPlayerDamagePercent() / 100;
 
 			for (b = 0; b < 100; b++)
 			{
@@ -1984,8 +2606,24 @@ level_loop:
 							if (enemy[b].linknum == boss_bar[i].link_num)
 								has_boss_bar = true;
 
-						if (expertMode && has_boss_bar)
-							damage = (damage + 24) / 25;
+						// Nx boss HP (expert-mode and/or endless-depth). Both use the same
+						// damage accumulator: spend 1 armor per N damage dealt, so the boss
+						// effectively has N times its HP. The two multipliers combine.
+						int bossHpMult = 1;
+						if (expertMode)
+							bossHpMult *= expertBossHpMult;
+						if (endlessMode)
+							bossHpMult *= endlessBossHpMult();
+						// Combined divisor: boss depth-scaling and/or endless elite/champion
+						// tier (elites use the accumulator too; an elite boss gets a capped bump).
+						int hpMult = endlessMode ? endlessEnemyHpMult(has_boss_bar, bossHpMult, enemy[b].eliteState)
+						                         : (has_boss_bar ? bossHpMult : 1);
+						if (hpMult > 1)
+						{
+							enemy[b].damageAccum += damage;
+							damage = enemy[b].damageAccum / hpMult;
+							enemy[b].damageAccum -= damage * hpMult;
+						}
 
 						temp = enemy[b].linknum;
 						if (temp == 0)
@@ -2019,12 +2657,18 @@ level_loop:
 							{
 								if (enemy[b].armorleft != 255)
 								{
+									if (!enemy[b].healthbar_seen)
+									{
+										// latch the pre-hit armor as the bar's "full" value
+										enemy[b].healthbar_seen = true;
+										enemy[b].healthbar_max = armorleft;
+									}
 									enemy[b].armorleft -= damage;
 									JE_setupExplosion(tempShotX, tempShotY, 0, 0, false, false);
 								}
 								else
 								{
-									JE_doSP(tempShotX + 6, tempShotY + 6, damage / 2 + 3, damage / 4 + 2, temp2);
+									JE_doSP(tempShotX + 6, tempShotY + 6, damage / 2 + 3, damage / 4 + 2, temp2, false);
 								}
 							}
 
@@ -2078,6 +2722,9 @@ level_loop:
 											{
 												enemyAvail[temp3] = 1;
 												enemyKilled++;
+												endlessCountKill(enemy[temp3].linknum);
+												if (endlessMode && enemy[temp3].eliteState >= 2)
+													endlessAwardEliteKill(enemy[temp3].eliteState);
 											}
 
 											enemy[temp3].aniwhenfire = 0;
@@ -2159,7 +2806,10 @@ level_loop:
 										{
 											if (enemy[temp2].evalue == 1)
 											{
-												cubeMax++;
+												if (endlessMode)  // datacube -> random special weapon in endless (no cube archive)
+													endlessGrantSpecial();
+												else
+													cubeMax++;
 											}
 											else
 											{
@@ -2184,6 +2834,9 @@ level_loop:
 										{
 											enemyAvail[temp2] = 1;
 											enemyKilled++;
+											endlessCountKill(enemy[temp2].linknum);
+											if (endlessMode && enemy[temp2].eliteState >= 2)
+												endlessAwardEliteKill(enemy[temp2].eliteState);
 										}
 
 										if (enemyDat[enemy[temp2].enemytype].esize == 1)
@@ -2330,11 +2983,22 @@ draw_player_shot_loop_end:
 						}
 
 						rl_current_id = RL_ID_ESHOT_BASE + z;
+						// Record the shot's real per-tick velocity AND acceleration so the
+						// render list can extrapolate it smoothly (past the generic snap
+						// threshold, and without a decelerating shot appearing to reverse).
+						rl_current_vel_x = enemyShot[z].sxm;
+						rl_current_vel_y = enemyShot[z].sym;
+						rl_current_acc_x = enemyShot[z].sxc;
+						rl_current_acc_y = enemyShot[z].syc;
 						if (enemyShot[z].sgr >= 500)
 							blit_sprite2(VGAScreen, enemyShot[z].sx, enemyShot[z].sy, spriteSheet12, enemyShot[z].sgr + enemyShot[z].animate - 500);
 						else
 							blit_sprite2(VGAScreen, enemyShot[z].sx, enemyShot[z].sy, spriteSheet8, enemyShot[z].sgr + enemyShot[z].animate);
 						rl_current_id = 0;
+						rl_current_vel_x = 0;
+						rl_current_vel_y = 0;
+						rl_current_acc_x = 0;
+						rl_current_acc_y = 0;
 					}
 				}
 
@@ -2349,7 +3013,10 @@ draw_player_shot_loop_end:
 	if (topEnemyOver)
 	{
 		tempMapXOfs = ((background3x1 == 0) ? oldMapX3Ofs : oldMapXOfs) + PLAYFIELD_X_SHIFT;
+		tempMapXOfs_frac = (background3x1 == 0) ? (oldMapX3Ofs_f - oldMapX3Ofs) : (oldMapXOfs_f - oldMapXOfs);
 		tempBackMove = backMove3;
+		tempScrollYfrac    = bg_layer_yfrac[3];      // sprite (pre-advance): lagged frac, glued to layer 3
+		tempScrollYfracNow = bg_layer_yfrac_now[3];  // HP bar (post-advance): this-tick frac
 		JE_drawEnemy(75);
 	}
 
@@ -2359,7 +3026,10 @@ draw_player_shot_loop_end:
 		lastEnemyOnScreen = enemyOnScreen;
 
 		tempMapXOfs = mapX2Ofs + PLAYFIELD_X_SHIFT;
+		tempMapXOfs_frac = mapX2Ofs_f - mapX2Ofs;
 		tempBackMove = 0;
+		tempScrollYfrac    = 0.0f;  // not vertically scroll-tracked (layer-2 anchor): no sub-pixel glue
+		tempScrollYfracNow = 0.0f;
 		JE_drawEnemy(25);
 
 		if (enemyOnScreen == lastEnemyOnScreen)
@@ -2383,7 +3053,7 @@ draw_player_shot_loop_end:
 				continue;
 			}
 
-			rep_explosions[i].y += backMove2 + 1;
+			rep_explosions[i].y += backMove2 + endlessScrollExtraPx2 + 1;  // scroll-track layer 2 at smooth overclock pace; +1 fall speed unchanged
 			JE_integer tempX = rep_explosions[i].x + (mt_rand() % 24) - 12;
 			JE_integer tempY = rep_explosions[i].y + (mt_rand() % 27) - 24;
 
@@ -2434,7 +3104,11 @@ draw_player_shot_loop_end:
 			}
 			else
 			{
-				rl_current_id = 0;  // explosions snap: transient puffs reuse slots, so interp mis-pairs them into bogus "random direction" smoke
+				// Stable per-instance id: puff churn recycles slots, and a plain slot id
+				// would mis-pair a recycled slot with its previous occupant. Fold in the
+				// per-slot generation (4 values disambiguate consecutive reuses); j*4 + 3
+				// stays within the EXPL id range (MAX_EXPLOSIONS*4 < 1000).
+				rl_current_id = RL_ID_EXPL_BASE + j * 4 + (explosions[j].id_gen & 3);
 				if (explosionTransparent)
 					blit_sprite2_blend(VGAScreen, explosions[j].x, explosions[j].y, explosionSpriteSheet, explosions[j].sprite + 1);
 				else
@@ -2462,6 +3136,24 @@ draw_player_shot_loop_end:
 				draw_background_2(VGAScreen);
 		}
 	}
+
+	// Explosion sparks (superpixels): drawn AND recorded here, before the residual
+	// snapshot below, so they're part of its baseline and interpolate via the replay
+	// instead of snapping through the residual.
+	JE_drawSP();
+
+	// Smoothie levels: draw+record the enemy health bars before the residual snapshot
+	// (like the sparks above) so they interpolate with their enemy and diff out of
+	// rl_capture_residual_delta. Normal levels draw them later, after the filter, to keep
+	// that path's z-order (bars above the level fade).
+	if (anySmoothies)
+		draw_enemy_health_bars();
+
+	// Smoothie levels: snapshot the frame here -- after the last recorded blit (sparks/bars above
+	// diff out), before the non-blit overlays (WARNING bars, fades, boss bar, HUD) so those are
+	// captured as the per-frame residual and don't freeze at 35fps. notes.md §Smoothie levels.
+	if (anySmoothies)
+		memcpy(VGAScreen2->pixels, game_screen->pixels, (size_t)game_screen->h * game_screen->pitch);
 
 	/*-------------------------Warning---------------------------*/
 	if ((player[0].is_alive && player[0].armor < 6) ||
@@ -2514,7 +3206,7 @@ draw_player_shot_loop_end:
 			{
 				warningColChange = -warningColChange;
 			}
-			const int playfield_left = -2 * PLAYFIELD_X_SHIFT;
+			const int playfield_left = PLAYFIELD_LEFT;
 			const int playfield_right = playfield_left + PLAYFIELD_WIDTH - 1;
 			const char warning_text[] = "WARNING";
 			const int warning_text_width = JE_textWidth(warning_text, TINY_FONT);
@@ -2530,8 +3222,10 @@ draw_player_shot_loop_end:
 	}
 
 	/*------- Random Explosions --------*/
+	// Full visible playfield: 280 was the pre-widescreen width, so explosions used to
+	// stop short of the widened right edge (see composite_playfield / video.h).
 	if (randomExplosions && mt_rand() % 10 == 1)
-		JE_setupExplosionLarge(false, 20, mt_rand() % 280, mt_rand() % 180);
+		JE_setupExplosionLarge(false, 20, PLAYFIELD_LEFT + mt_rand() % PLAYFIELD_WIDTH, mt_rand() % 180);
 
 	/*=================================*/
 	/*=======The Sound Routine=========*/
@@ -2591,18 +3285,6 @@ draw_player_shot_loop_end:
 		lastDebugTime = debugTime;
 	}
 
-	if (displayTime > 0)
-	{
-		displayTime--;
-		const int playfield_left = -2 * PLAYFIELD_X_SHIFT;
-		const int secret_text_width = JE_textWidth(miscText[59], FONT_SHAPES);
-		const int secret_text_x = playfield_left + (PLAYFIELD_WIDTH - secret_text_width) / 2;
-		JE_outTextAndDarken(VGAScreen, secret_text_x, 10, miscText[59], 15, (JE_byte)flash - 8, FONT_SHAPES);
-		flash += flashChange;
-		if (flash > 4 || flash == 0)
-			flashChange = -flashChange;
-	}
-
 	/*Pentium Speed Mode?*/
 	if (pentiumMode)
 	{
@@ -2636,9 +3318,13 @@ draw_player_shot_loop_end:
 		// Don't use floats due to rounding.
 		sprintf(buffer, "%d.%d", levelTimerCountdown / 100, (levelTimerCountdown / 10) % 10);
 
-		const int playfield_left = -2 * PLAYFIELD_X_SHIFT;
-		const int label_x = playfield_left + 24 + (PLAYFIELD_WIDTH - JE_textWidth(miscText[66], TINY_FONT)) / 2;
-		const int counter_x = playfield_left + (PLAYFIELD_WIDTH - JE_textWidth(buffer, SMALL_FONT_SHAPES) - 64) / 2;
+		// Lay the countdown number and its "TIME" label out as one group and centre
+		// that group on the playfield.
+		const int label_w = JE_textWidth(miscText[66], TINY_FONT);
+		const int counter_w = JE_textWidth(buffer, SMALL_FONT_SHAPES);
+		const int group_w = counter_w + 3 + label_w;
+		const int counter_x = PLAYFIELD_CENTER_X(group_w);
+		const int label_x = counter_x + counter_w + 3;
 
 		JE_textShade(VGAScreen, label_x, 6, miscText[66], 7, (levelTimerCountdown % 20) / 3, FULL_SHADE);
 		JE_dString(VGAScreen, counter_x, 2, buffer, SMALL_FONT_SHAPES);
@@ -2662,7 +3348,7 @@ draw_player_shot_loop_end:
 					reallyEndLevel = true;
 				else
 				{
-					const int playfield_left = -2 * PLAYFIELD_X_SHIFT;
+					const int playfield_left = PLAYFIELD_LEFT;
 					const int game_over_width = JE_textWidth(miscText[21], FONT_SHAPES);
 					const int game_over_x = playfield_left + (PLAYFIELD_WIDTH - game_over_width) / 2;
 					JE_dString(VGAScreen, game_over_x, 60, miscText[21], FONT_SHAPES); // game over
@@ -2675,13 +3361,19 @@ draw_player_shot_loop_end:
 						play_song(SONG_GAMEOVER);
 						set_volume(tyrMusicVolume, fxVolume);
 					}
+					// Drop any input still held/queued from the moment of death, so
+					// GAME OVER doesn't dismiss itself instantly — require a fresh press.
+					newkey = newmouse = false;
 					firstGameOver = false;
 				}
 
 				if (!play_demo)
 				{
 					push_joysticks_as_keyboard();
-					service_SDL_events(true);
+					// Poll without clearing: the smooth-present loop in JE_starShowVGA
+					// already consumed inter-tick SDL events into newkey/newmouse, so
+					// clearing here would discard the press and GAME OVER would never respond.
+					service_SDL_events(false);
 					if ((newkey || button[0] || button[1] || button[2]) || newmouse)
 					{
 						reallyEndLevel = true;
@@ -2817,25 +3509,25 @@ draw_player_shot_loop_end:
 	}
 #endif
 
-	/** Test **/
-	JE_drawSP();
-
 	/*Filtration*/
 	if (filterActive)
 	{
 		if (render_list_recording)
 			rl_rec_filter_screen(levelFilter, levelBrightness);
+
+		// Smoothie residual: any full-screen grade -- colour flare (levelFilter != -99) or
+		// brightness-only flash (levelBrightness != -99) -- must hit the pre-overlay snapshot too,
+		// or it bakes into the residual and freezes the playfield. notes.md §Smoothie levels.
+		if (anySmoothies)
+			JE_filterScreenApply(VGAScreen2, levelFilter, levelBrightness);
+
 		JE_filterScreen(levelFilter, levelBrightness);
 	}
 
-	// Snapshot the post-filter frame on feedback (smoothie) levels, before the
-	// boss bar / in-game displays are drawn, so we can diff it out below and
-	// capture just those overlays. They're drawn on top of the per-pixel filter,
-	// and the replayed filter would otherwise smear/recolor them every frame
-	// (e.g. water_filter turning the boss bar grey on DREAD-NOT).
-	if (anySmoothies)
-		memcpy(VGAScreen2->pixels, game_screen->pixels, (size_t)game_screen->h * game_screen->pitch);
-
+	// Smoothie levels already drew+recorded the enemy bars before the residual
+	// snapshot (above) so they interpolate; here we draw them for normal levels only.
+	if (!anySmoothies)
+		draw_enemy_health_bars();
 	draw_boss_bar();
 
 	JE_inGameDisplays();
@@ -2847,9 +3539,13 @@ draw_player_shot_loop_end:
 	if (!anySmoothies)
 		rl_capture_residual(game_screen, VGAScreen2);  // non-blit pixels (superpixels, boss bar)
 	else
-		rl_capture_residual_delta(VGAScreen2, game_screen);  // overlay-only (boss bar, HUD) -> re-applied unfiltered
+		rl_capture_residual_delta(VGAScreen2, game_screen);  // overlay-only (WARNING bars, boss bar, HUD) -> re-applied unfiltered on the display frame
 	vt_ship_tick();       // fold external forces / repositions into the variable-dt ship
 	ship_pred_on_tick();  // snapshot authoritative ship pos for render-rate prediction
+	// This tick's ship velocity lets the render list interpolate ship-attached shots
+	// (the orbiting killer's circle); matches the c->dx just computed by rl_finalize.
+	for (int p = 0; p < (twoPlayerMode ? 2 : 1); ++p)
+		rl_set_ship_vel(p, ship_vel_x[p], ship_vel_y[p]);
 #if RL_SELFTEST
 	{
 		static int seen = 0;
@@ -2860,9 +3556,8 @@ draw_player_shot_loop_end:
 			        seen, (int)anySmoothies, (int)filterActive, rl_count());
 		}
 	}
-	// On frames without smoothie per-pixel effects (lava/water/ice blur), the
-	// replayed list — including the full-screen colour filter, which we record
-	// explicitly — must reproduce game_screen exactly.
+	// Without smoothie per-pixel effects the replayed list (including the recorded
+	// full-screen colour filter) must reproduce game_screen exactly.
 	if (!anySmoothies)
 	{
 		const size_t mism = rl_replay_and_compare(VGAScreen2, game_screen);
@@ -2933,6 +3628,24 @@ draw_player_shot_loop_end:
 		}
 	}
 
+	// Map-stop softlock watchdog: a boss killed before its script finishes staging the fight can
+	// orphan a group member frozen above the screen -- unreachable, and with the event clock
+	// stopped unmovable -- so it holds enemyOnScreen != 0 forever. After a stop is held long enough
+	// with one present, cull it like an off-playfield enemy and the level resumes. notes.md §Level scripting.
+	enemyParkedAbove = count_stuck_above_screen();
+	if (!endLevel && stopBackgrounds && !forceEvents && enemyParkedAbove != 0)
+	{
+		if (++mapStopStallTicks >= MAP_STOP_STALL_LIMIT)
+		{
+			for (int i = 0; i < 100; i++)
+				if (enemyAvail[i] != 1 && enemy_stuck_above_screen(i))
+					enemyAvail[i] = 1;
+			mapStopStallTicks = 0;
+		}
+	}
+	else
+		mapStopStallTicks = 0;
+
 	/*Other Network Functions*/
 	JE_handleChat();
 
@@ -2941,6 +3654,131 @@ draw_player_shot_loop_end:
 		goto start_level;
 	}
 	goto level_loop;
+}
+
+// Full-screen picture-wipe styles used by the level-script commands U / V / R.
+typedef enum
+{
+	WIPE_U,  // vertical wipe (new picture slides in over the old)
+	WIPE_V,  // vertical wipe (new picture revealed from the opposite edge)
+	WIPE_R,  // horizontal wipe
+} WipeKind;
+
+// Composite one frame of a picture wipe at boundary position z: the old image
+// (VGAScreen2) and the new image (pic_buffer) meet at row/column z. These are the
+// original per-step inner loops verbatim -- only the outer pacing changes, in
+// animate_picture_wipe below.
+static void compose_wipe_frame(WipeKind kind, int z, const Uint8 *pic_buffer)
+{
+	const int pitch = VGAScreen->pitch;
+	Uint8 *vga = VGAScreen->pixels;
+	Uint8 *vga2 = VGAScreen2->pixels;
+	const Uint8 *pic;
+
+	switch (kind)
+	{
+	case WIPE_U:
+		pic = pic_buffer + (vga_height - 1 - z) * pitch;
+		for (int y = 0; y < vga_height; y++)
+		{
+			if (y <= z)
+			{
+				memcpy(vga, pic, pitch);
+				pic += pitch;
+			}
+			else
+			{
+				memcpy(vga, vga2, pitch);
+				vga2 += pitch;
+			}
+			vga += pitch;
+		}
+		break;
+
+	case WIPE_V:
+		pic = pic_buffer;
+		for (int y = 0; y < vga_height; y++)
+		{
+			if (y <= vga_height - 1 - z)
+			{
+				memcpy(vga, vga2, pitch);
+				vga2 += pitch;
+			}
+			else
+			{
+				memcpy(vga, pic, pitch);
+				pic += pitch;
+			}
+			vga += pitch;
+		}
+		break;
+
+	case WIPE_R:
+		pic = pic_buffer;
+		for (int y = 0; y < vga_height; y++)
+		{
+			memcpy(vga, vga2 + z, pitch - 1 - z);
+			vga += pitch - z;
+			vga2 += VGAScreen2->pitch;
+			memcpy(vga, pic, z + 1);
+			vga += z;
+			pic += pitch;
+		}
+		break;
+	}
+}
+
+// Animate a full-screen picture wipe. The classic path advances the wipe boundary
+// one row/column per sim tick (setDelay(1) + wait); the smooth path advances it by
+// real elapsed time and presents every display frame (vsync-aligned), so the wipe
+// glides at the monitor's refresh instead of the ~35Hz-paced SDL_Delay cadence.
+// Same total duration and end image; a key press skips to the end, as before.
+static void animate_picture_wipe(WipeKind kind, const Uint8 *pic_buffer)
+{
+	const int steps = (kind == WIPE_R) ? (VGAScreen->pitch - 1) : vga_height;
+
+	if (smoothMotion)
+	{
+		const float duration = steps * get_delay_period();  // ms; == classic (steps x one delay unit)
+		const Uint64 freq = SDL_GetPerformanceFrequency();
+		const Uint64 begin = SDL_GetPerformanceCounter();
+		const float counter_to_ms = 1000.0f / (float)freq;
+
+		for (;;)
+		{
+			if (newkey)
+				break;
+
+			const float t = (float)(SDL_GetPerformanceCounter() - begin) * counter_to_ms / duration;
+			const bool done = t >= 1.0f;
+			int z = done ? steps - 1 : (int)(t * steps);
+			if (z > steps - 1)
+				z = steps - 1;
+
+			compose_wipe_frame(kind, z, pic_buffer);
+			JE_showVGA();
+
+			if (done)
+				break;
+
+			if (!output_vsync)
+				limit_render_fps();
+			service_SDL_events(false);
+		}
+	}
+	else
+	{
+		for (int z = 0; z < steps; z++)
+		{
+			if (!newkey)
+			{
+				setDelay(1);
+				compose_wipe_frame(kind, z, pic_buffer);
+				JE_showVGA();
+				service_wait_delay();
+			}
+		}
+	}
 }
 
 /* --- Load Level/Map Data --- */
@@ -2960,7 +3798,8 @@ void JE_loadMap(void)
 	char buffer[256];
 	int i;
 	Uint8 pic_buffer[vga_width * vga_height]; /* screen buffer, 8-bit specific */
-	Uint8 *vga, *pic, *vga2; /* screen pointer, 8-bit specific */
+
+	crashlog_set_phase("loading level map");
 
 	lastCubeMax = cubeMax;
 
@@ -3010,6 +3849,8 @@ new_game:
 
 					if (mainLevel == 0)  // if quit itemscreen
 						return;          // back to title screen
+					else if (endlessMode)  // endless save loaded from within this shop: bail out so JE_main
+						return;             // resumes at its outpost (endlessBetweenLevels), not a campaign reload
 					else
 						goto new_game;
 				}
@@ -3142,7 +3983,11 @@ new_game:
 							temp = 22;
 						else
 							temp = 11;
-						JE_saveGame(11, "LAST LEVEL    ");
+						if (!endlessMode)  // mid-level savepoint: unstable for endless; it autosaves at the outpost instead (endlessBetweenLevels)
+						{
+							JE_saveGame(11, "LAST LEVEL    ");
+							endlessSaveSlot(11);  // keep the endless sidecar in sync: drop any stale record so this campaign save isn't read back as endless
+						}
 						break;
 
 					case 'i':
@@ -3166,7 +4011,20 @@ new_game:
 							itemAvailMax[i] = j;
 						}
 
-						JE_itemScreen();
+						// Re-offer the DOS Charge-Laser Cannon in its original shops. Tyrian
+						// 2000 reused its option slot 16 for the Mint-O-Ship, so it can't ride
+						// the stock shop data; inject its re-added slot into the Opt1/Opt2
+						// sidekick lists (per originaldostyriandata/LEVELS{2,3}.DAT).
+						if (chargeLaserSlot > 0 &&
+						    ((episodeNum == 2 && (mainLevel == 3 || mainLevel == 11 || mainLevel == 16)) ||
+						     (episodeNum == 3 && mainLevel == 16)))
+						{
+							if (itemAvailMax[5] < 10) itemAvail[5][itemAvailMax[5]++] = chargeLaserSlot;
+							if (itemAvailMax[6] < 10) itemAvail[6][itemAvailMax[6]++] = chargeLaserSlot;
+						}
+
+						if (!endlessMode)
+							JE_itemScreen();
 						break;
 
 					case 'L':
@@ -3325,41 +4183,7 @@ new_game:
 
 							service_SDL_events(true);
 
-							for (int z = 0; z < vga_height; z++)
-							{
-								if (!newkey)
-								{
-									vga = VGAScreen->pixels;
-									vga2 = VGAScreen2->pixels;
-									pic = pic_buffer + (vga_height - 1 - z) * VGAScreen->pitch;
-
-									setDelay(1);
-
-									for (y = 0; y < vga_height; y++)
-									{
-										if (y <= z)
-										{
-											memcpy(vga, pic, VGAScreen->pitch);
-											pic += VGAScreen->pitch;
-										}
-										else
-										{
-											memcpy(vga, vga2, VGAScreen->pitch);
-											vga2 += VGAScreen->pitch;
-										}
-										vga += VGAScreen->pitch;
-									}
-
-									JE_showVGA();
-
-									if (isNetworkGame)
-									{
-										/* TODO: NETWORK */
-									}
-
-									service_wait_delay();
-								}
-							}
+							animate_picture_wipe(WIPE_U, pic_buffer);
 
 							copy_buffer_to_screen(pic_buffer);
 						}
@@ -3376,41 +4200,8 @@ new_game:
 							copy_screen_to_buffer(pic_buffer);
 
 							service_SDL_events(true);
-							for (int z = 0; z < vga_height; z++)
-							{
-								if (!newkey)
-								{
-									vga = VGAScreen->pixels;
-									vga2 = VGAScreen2->pixels;
-									pic = pic_buffer;
 
-									setDelay(1);
-
-									for (y = 0; y < vga_height; y++)
-									{
-										if (y <= vga_height - 1 - z)
-										{
-											memcpy(vga, vga2, VGAScreen->pitch);
-											vga2 += VGAScreen->pitch;
-										}
-										else
-										{
-											memcpy(vga, pic, VGAScreen->pitch);
-											pic += VGAScreen->pitch;
-										}
-										vga += VGAScreen->pitch;
-									}
-
-									JE_showVGA();
-
-									if (isNetworkGame)
-									{
-										/* TODO: NETWORK */
-									}
-
-									service_wait_delay();
-								}
-							}
+							animate_picture_wipe(WIPE_V, pic_buffer);
 
 							copy_buffer_to_screen(pic_buffer);
 						}
@@ -3428,37 +4219,7 @@ new_game:
 
 							service_SDL_events(true);
 
-							const int width = VGAScreen->pitch;
-							for (int z = 0; z <= width - 2; z++)
-							{
-								if (!newkey)
-								{
-									vga = VGAScreen->pixels;
-									vga2 = VGAScreen2->pixels;
-									pic = pic_buffer;
-
-									setDelay(1);
-
-									for (y = 0; y < vga_height; y++)
-									{
-										memcpy(vga, vga2 + z, width - 1 - z);
-										vga += width - z;
-										vga2 += VGAScreen2->pitch;
-										memcpy(vga, pic, z + 1);
-										vga += z;
-										pic += width;
-									}
-
-									JE_showVGA();
-
-									if (isNetworkGame)
-									{
-										/* TODO: NETWORK */
-									}
-
-									service_wait_delay();
-								}
-							}
+							animate_picture_wipe(WIPE_R, pic_buffer);
 
 							copy_buffer_to_screen(pic_buffer);
 						}
@@ -3590,6 +4351,16 @@ new_game:
 
 	/* Return the display to the normal gameplay offset after the fade */
 	set_menu_centered(false);
+
+	// The scan above set lvlFileNum from the section's first ']L', but a caller may need a LATER
+	// ']L' in the same section (Episode 1 section 3's second TYRIAN cut) -- reachable via the endless
+	// pool or the debug/level-select menu. select_level and the endless commit paths stash that in
+	// forcedLvlFileNum; apply it here, then consume it so normal campaign progression is untouched.
+	if (forcedLvlFileNum != 0)
+	{
+		lvlFileNum = forcedLvlFileNum;
+		forcedLvlFileNum = 0;
+	}
 
 	FILE* level_f = dir_fopen_die(data_dir(), levelFile, "rb");
 	fseek(level_f, lvlPos[(lvlFileNum-1) * 2], SEEK_SET);
@@ -3842,6 +4613,7 @@ bool titleScreen(void)
 		MENU_ITEM_HIGH_SCORES,
 		MENU_ITEM_INSTRUCTIONS,
 		MENU_ITEM_SETUP,
+		MENU_ITEM_EXTRA,
 		MENU_ITEM_DEMO,
 		MENU_ITEM_QUIT,
 	};
@@ -3854,10 +4626,24 @@ bool titleScreen(void)
 	size_t selectedIndex = MENU_ITEM_NEW_GAME;
 	size_t specialNameProgress[SA_ENGAGE] = { 0 };
 
-	const int xCenter = VGAScreen->w / 2 - (VGAScreen->w - 320) / 2;
-	const int yMenuItems = 104;
-	const int hMenuItem = 13;
-	int wMenuItem[COUNTOF(menuText)] = { 0 };
+	// Title menu labels: the 7 data-file entries (menuText[]) with "Extra" inserted
+	// after Setup. Keep in sync with enum MenuItemIndex above.
+	const char *const titleLabels[] =
+	{
+		menuText[0],  // Start New Game
+		menuText[1],  // Load Game
+		menuText[2],  // High Scores
+		menuText[3],  // Instructions
+		menuText[4],  // Setup
+		"Extra",
+		menuText[5],  // Demo
+		menuText[6],  // Quit
+	};
+
+	const int xCenter = LEGACY_WIDTH / 2;
+	const int yMenuItems = 98;
+	const int hMenuItem = 12;
+	int wMenuItem[COUNTOF(titleLabels)] = { 0 };
 
 	for (; ; )
 	{
@@ -3877,16 +4663,49 @@ bool titleScreen(void)
 				blit_sprite(VGAScreenSeg, 155, 41, PLANET_SHAPES, 151); // 2000(tm)
 				fade_palette(colors, 10, 0, 255 - 16);
 
-				for (int yLogo = 60, y2K = 45; yLogo >= 4; yLogo -= 2, ++y2K)
+				if (smoothMotion)
 				{
-					setDelay(2);
+					// Slide the logo up by real elapsed time, presented at the display
+					// rate (the original stepped 2 px per 35Hz tick). yLogo runs 60->4
+					// and y2K runs 45->73 over the slide.
+					const Uint32 slideStart = SDL_GetTicks();
+					const Uint32 slideMs = 800;  // ~matches the original stepped slide
 
-					memcpy(VGAScreen->pixels, VGAScreen2->pixels, VGAScreen->pitch * VGAScreen->h);
-					blit_sprite(VGAScreenSeg, 11, yLogo, PLANET_SHAPES, 146); // tyrian logo
-					blit_sprite(VGAScreenSeg, 155, y2K, PLANET_SHAPES, 151); // 2000(tm)
-					JE_showVGA();
+					for (;;)
+					{
+						float t = (float)(SDL_GetTicks() - slideStart) / (float)slideMs;
+						if (t > 1.0f)
+							t = 1.0f;
 
-					service_wait_delay();
+						const int yLogo = (int)(60.0f - 56.0f * t + 0.5f);
+						const int y2K   = (int)(45.0f + 28.0f * t + 0.5f);
+
+						memcpy(VGAScreen->pixels, VGAScreen2->pixels, VGAScreen->pitch * VGAScreen->h);
+						blit_sprite(VGAScreenSeg, 11, yLogo, PLANET_SHAPES, 146); // tyrian logo
+						blit_sprite(VGAScreenSeg, 155, y2K, PLANET_SHAPES, 151); // 2000(tm)
+						JE_showVGA();
+
+						if (t >= 1.0f)
+							break;
+
+						service_SDL_events(false);
+						if (!output_vsync)
+							limit_render_fps();
+					}
+				}
+				else
+				{
+					for (int yLogo = 60, y2K = 45; yLogo >= 4; yLogo -= 2, ++y2K)
+					{
+						setDelay(2);
+
+						memcpy(VGAScreen->pixels, VGAScreen2->pixels, VGAScreen->pitch * VGAScreen->h);
+						blit_sprite(VGAScreenSeg, 11, yLogo, PLANET_SHAPES, 146); // tyrian logo
+						blit_sprite(VGAScreenSeg, 155, y2K, PLANET_SHAPES, 151); // 2000(tm)
+						JE_showVGA();
+
+						service_wait_delay();
+					}
 				}
 				moveTyrianLogoUp = false;
 			}
@@ -3898,19 +4717,19 @@ bool titleScreen(void)
 			}
 
 			// Draw menu items.
-			for (size_t i = 0; i < COUNTOF(menuText); ++i)
+			for (size_t i = 0; i < COUNTOF(titleLabels); ++i)
 			{
-				const char *const text = menuText[i];
+				const char *const text = titleLabels[i];
 
 				wMenuItem[i] = JE_textWidth(text, normal_font);
 				const int x = xCenter - wMenuItem[i] / 2;
 				const int y = yMenuItems + hMenuItem * i;
 
-				draw_font_hv(VGAScreen, x - 1, y - 1, menuText[i], normal_font, left_aligned, 15, -10);
-				draw_font_hv(VGAScreen, x + 1, y + 1, menuText[i], normal_font, left_aligned, 15, -10);
-				draw_font_hv(VGAScreen, x + 1, y - 1, menuText[i], normal_font, left_aligned, 15, -10);
-				draw_font_hv(VGAScreen, x - 1, y + 1, menuText[i], normal_font, left_aligned, 15, -10);
-				draw_font_hv(VGAScreen, x,     y,     menuText[i], normal_font, left_aligned, 15, -3);
+				draw_font_hv(VGAScreen, x - 1, y - 1, text, normal_font, left_aligned, 15, -10);
+				draw_font_hv(VGAScreen, x + 1, y + 1, text, normal_font, left_aligned, 15, -10);
+				draw_font_hv(VGAScreen, x + 1, y - 1, text, normal_font, left_aligned, 15, -10);
+				draw_font_hv(VGAScreen, x - 1, y + 1, text, normal_font, left_aligned, 15, -10);
+				draw_font_hv(VGAScreen, x,     y,     text, normal_font, left_aligned, 15, -3);
 			}
 
 			memcpy(VGAScreen2->pixels, VGAScreen->pixels, VGAScreen2->pitch * VGAScreen2->h);
@@ -3926,18 +4745,24 @@ bool titleScreen(void)
 		memcpy(VGAScreen->pixels, VGAScreen2->pixels, VGAScreen->pitch * VGAScreen->h);
 
 		// Highlight selected menu item.
-		draw_font_hv(VGAScreen, xCenter, yMenuItems + hMenuItem * selectedIndex, menuText[selectedIndex], normal_font, centered, 15, -1);
+		draw_font_hv(VGAScreen, xCenter, yMenuItems + hMenuItem * selectedIndex, titleLabels[selectedIndex], normal_font, centered, 15, -1);
 
 		service_SDL_events(true);
 
 		JE_mouseStartFilter(0xF0);
 		JE_showVGA();
 		JE_mouseReplace();
+		if (!output_vsync)
+			limit_render_fps();  // pace the cursor redraw to the render-fps cap
 
 		const Uint32 idleStartTick = SDL_GetTicks();
 
+		// Poll finely instead of sleeping 16 ms so the outer loop (and mouse cursor)
+		// redraws at the display's refresh rate; a still cursor yields the CPU.
+		const Uint16 startMouseX = mouse_x;
+		const Uint16 startMouseY = mouse_y;
 		bool mouseMoved = false;
-		do
+		for (;;)
 		{
 			// Play demo after idle for 30 seconds.
 			if (SDL_GetTicks() - idleStartTick > 30000)
@@ -3948,16 +4773,15 @@ bool titleScreen(void)
 				return true;
 			}
 
-			SDL_Delay(16);
-
-			Uint16 oldMouseX = mouse_x;
-			Uint16 oldMouseY = mouse_y;
-
 			push_joysticks_as_keyboard();
 			service_SDL_events(false);
 
-			mouseMoved = mouse_x != oldMouseX || mouse_y != oldMouseY;
-		} while (!(newkey || new_text || newmouse || mouseMoved));
+			mouseMoved = mouse_x != startMouseX || mouse_y != startMouseY;
+			if (newkey || new_text || newmouse || mouseMoved)
+				break;
+
+			SDL_Delay(1);  // brief idle poll; a still cursor doesn't need redrawing
+		}
 
 		// Handle interaction.
 
@@ -3967,7 +4791,7 @@ bool titleScreen(void)
 		if (mouseMoved || newmouse)
 		{
 			// Find menu item that was hovered or clicked.
-			for (size_t i = 0; i < COUNTOF(menuText); ++i)
+			for (size_t i = 0; i < COUNTOF(titleLabels); ++i)
 			{
 				const int xMenuItem = xCenter - wMenuItem[i] / 2;
 				if (mouse_x >= xMenuItem && mouse_x < xMenuItem + wMenuItem[i])
@@ -4013,7 +4837,7 @@ bool titleScreen(void)
 				JE_playSampleNum(S_CURSOR);
 
 				selectedIndex = selectedIndex == 0
-					? COUNTOF(menuText) - 1
+					? COUNTOF(titleLabels) - 1
 					: selectedIndex - 1;
 				break;
 			}
@@ -4021,7 +4845,7 @@ bool titleScreen(void)
 			{
 				JE_playSampleNum(S_CURSOR);
 
-				selectedIndex = selectedIndex == COUNTOF(menuText) - 1
+				selectedIndex = selectedIndex == COUNTOF(titleLabels) - 1
 					? 0
 					: selectedIndex + 1;
 				break;
@@ -4148,6 +4972,16 @@ bool titleScreen(void)
 				restart = true;
 				break;
 			}
+			case MENU_ITEM_EXTRA:
+			{
+				fade_black(15);
+
+				if (extraMenu())  // launched a game (SuperTyrian / Super Arcade)?
+					return true;
+
+				restart = true;
+				break;
+			}
 			case MENU_ITEM_DEMO:
 			{
 				fade_black(15);
@@ -4179,6 +5013,11 @@ bool newGame(void)
 {
 	if (gameplaySelect())
 	{
+		// Endless was picked in the mode menu: newEndlessGame does its own difficulty select
+		// and full setup (episode 1, starting cash, flags) and resets endlessMode on cancel.
+		if (endlessMode)
+			return newEndlessGame();
+
 		if (timedBattleMode)
 		{
 			onePlayerAction = true;
@@ -4240,7 +5079,14 @@ bool newSuperArcadeGame(unsigned int i)
 		tempW = ships[player[0].items.ship].shipgraphic;
 		if (tempW > 500)
 			blit_sprite2x2(VGAScreen, 148, 70, spriteSheetT2000, tempW - 500);
-		else if (tempW != 1)
+		else if (tempW == 1)
+		{
+			// Nort Ship: shipgraphic 1 is a sentinel (see JE_playerMovement / JE_drawItem), so draw
+			// its two-piece hull here instead of skipping it (previously left blank).
+			blit_sprite2x2(VGAScreen, 148, 70, spriteSheet9, 220);
+			blit_sprite2x2(VGAScreen, 172, 70, spriteSheet9, 222);
+		}
+		else
 			blit_sprite2x2(VGAScreen, 148, 70, spriteSheet9, tempW);
 
 		JE_showVGA();
@@ -4325,6 +5171,56 @@ bool newSuperTyrianGame(void)
 		return false;
 	}
 
+}
+
+bool newEndlessGame(void)
+{
+	/* Endless roguelite mode. */
+
+	// Absorb the menu-selection keypress/click so it doesn't fall straight through
+	// into the difficulty picker (which would auto-select the default and skip it).
+	wait_noinput(true, true, true);
+
+	// Endless always starts at episode 1; the run traverses episodes as it deepens.
+	JE_initEpisode(1);
+	initial_episode_num = episodeNum;
+
+	// Choose the run seed (random or typed) and the Hardcore toggle before the difficulty picker.
+	// Cancelling here backs all the way out to the title, exactly like cancelling difficulty.
+	char seedbuf[ENDLESS_SEED_MAXLEN];
+	bool hardcore = false;
+	if (!endlessSeedSelect(seedbuf, sizeof(seedbuf), &hardcore))
+	{
+		endlessMode = false;
+		play_song(SONG_TITLE);
+		return false;
+	}
+
+	if (!difficultySelect())
+	{
+		endlessMode = false;  // cancelled: don't leave the mode flag set for the next new game
+		play_song(SONG_TITLE);
+		return false;
+	}
+	initialDifficulty = difficultyLevel;
+
+	endlessResetRun();
+	endlessSetSeed(seedbuf);  // establish the run's seeded structural RNG (endlessResetRun blanked it)
+	endlessHardcore = hardcore;  // apply the seed screen's Hardcore choice (endlessResetRun cleared it)
+
+	endlessMode = true;
+	onePlayerAction = false;  // full game: cash economy + between-level shops, NOT arcade orb drops
+	timedBattleMode = false;
+	twoPlayerMode = false;
+	superTyrian = false;
+	superArcadeMode = SA_NONE;
+	gameLoaded = true;
+	difficultyLevel = initialDifficulty;
+
+	player[0].cash = endlessStartingCash();  // difficulty-based starting cash for the first shop
+
+	fade_black(10);
+	return true;
 }
 
 void intro_logos(void)
@@ -4492,6 +5388,8 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 	enemy->enemydatofs = &enemyDat[eDatI];
 
 	enemy->mapoffset = 0;
+	enemy->mapoffset_frac = 0.0f;
+	enemy->scroll_yfrac = 0.0f;
 
 	for (uint i = 0; i < 3; ++i)
 	{
@@ -4518,6 +5416,26 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 
 	enemy->xaccel = enemyDat[eDatI].xaccel;
 	enemy->yaccel = enemyDat[eDatI].yaccel;
+
+	// RAMPAGE / KAMIKAZE / HOMING (endless): force a minimum tracking accel so enemies home in on you.
+	// The accel maps to tracking strength as (accel - 89). Three tiers, hardest first:
+	//   RAMPAGE  96 -> strength 7, and ALSO rams for extra collision damage (see mainint.c) -- the
+	//            original brutal Kamikaze, now a super-rare gamble-only mod.
+	//   KAMIKAZE 92 -> strength 3, no ram -- the moderate sector tier (what HOMING used to be).
+	//   HOMING   90 -> strength 1, no ram -- the gentlest sector tier (barely leans toward you).
+	// Only ever RAISE a weak enemy to the floor; an enemy that already tracks harder keeps its accel.
+	if (endlessMode)
+	{
+		const int trackFloor = (endlessActiveMods & ENDLESS_MOD_RAMPAGE)  ? 96
+		                     : (endlessActiveMods & ENDLESS_MOD_KAMIKAZE) ? 92
+		                     : (endlessActiveMods & ENDLESS_MOD_HOMING)   ? 90
+		                     : 0;
+		if (trackFloor)
+		{
+			if (enemy->xaccel < trackFloor) enemy->xaccel = trackFloor;
+			if (enemy->yaccel < trackFloor) enemy->yaccel = trackFloor;
+		}
+	}
 
 	enemy->xminbounce = -10000;
 	enemy->xmaxbounce = 10000;
@@ -4659,6 +5577,8 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 			tempValue = enemyDat[eDatI].value * 8;
 			break;
 		}
+		if (expertMode)  // expert-mode cash bonus to offset the harsher economy
+			tempValue = tempValue * expertScorePct / 100;
 		if (tempValue > 10000)
 			tempValue = 10000;
 		enemy->evalue = tempValue;
@@ -4709,6 +5629,14 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 				break;
 			}
 
+			if (endlessMode)
+				tempArmor = tempArmor * endlessArmorPercent() / 100;
+
+			// Expert mode toughens every enemy; bosses sit near the 254 cap already
+			// and get their extra HP from expertBossHpMult instead.
+			if (expertMode)
+				tempArmor = tempArmor * expertEnemyArmorPct / 100;
+
 			if (tempArmor > 254)
 			{
 				tempArmor = 254;
@@ -4731,6 +5659,11 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 		if (enemy->evalue != 0)
 			enemy->scoreitem = true;
 	}
+
+	enemy->damageAccum = 0;  // reset expert-mode boss-HP accumulator on (re)spawn
+	enemy->healthbar_seen = false;  // no enemy HP bar until this slot takes damage
+	enemy->healthbar_max = 0;
+	enemy->eliteState = 0;  // endless: elite undecided until first processed (see JE_drawEnemy)
 
 	if (!enemy->scoreitem)
 	{
@@ -5644,7 +6577,9 @@ void JE_eventSystem(void)
 					enemy[temp].yminbounce = eventRec[eventLoc-1].eventdat6;
 
 				if (eventRec[eventLoc-1].eventdat != -99)
-					enemy[temp].xmaxbounce = eventRec[eventLoc-1].eventdat;
+					// Bounce data was authored for the 320px field; shift the right bound
+					// out by the widescreen extension so enemies sweep the full playfield.
+					enemy[temp].xmaxbounce = eventRec[eventLoc-1].eventdat + (vga_width - LEGACY_WIDTH);
 
 				if (eventRec[eventLoc-1].eventdat2 != -99)
 					enemy[temp].ymaxbounce = eventRec[eventLoc-1].eventdat2;
@@ -5854,6 +6789,406 @@ static void JE_barX(JE_word x1, JE_word y1, JE_word x2, JE_word y2, JE_byte col)
 	fill_rectangle_xy(VGAScreen, x1, y2,     x2, y2,     col - 1);
 }
 
+// Palette-bank base for a boss bar, matching the boss's endless tier tint (elite / champion)
+// so the bar reads as part of that boss; ordinary and campaign bosses keep bank 7.
+static int boss_bar_tint_base(JE_byte link_num)
+{
+	int tier = 0;  // highest tier among the boss's live parts
+	if (endlessMode && link_num != 0)
+		for (unsigned int e = 0; e < COUNTOF(enemy); e++)
+			if (enemyAvail[e] != 1 && enemy[e].linknum == link_num && enemy[e].eliteState > tier)
+				tier = enemy[e].eliteState;
+	if (tier == 3) return ENDLESS_CHAMPION_FILTER;
+	if (tier == 2) return ENDLESS_ELITE_FILTER;
+	return 112;  // palette bank 7 (default)
+}
+
+// One enhanced boss bar: a framed, recessed track with a glossy gradient fill. (gx,gy)/gw/gh are
+// the outer frame; horizontal fills left->right, vertical bottom->up; fraction is 0..1; flash
+// 0..6 brightens on a hit. Colours stay within the one palette bank passed as base.
+static void draw_boss_bar_gauge(int gx, int gy, int gw, int gh,
+                                bool horizontal, float fraction, int flash, int base)
+{
+	if (gw < 4 || gh < 4)
+		return;
+	if (fraction < 0.0f)
+		fraction = 0.0f;
+	else if (fraction > 1.0f)
+		fraction = 1.0f;
+
+	const int BASE  = base;        // palette bank 7 normally; elite/champion tint in endless
+	const int FRAME = BASE + 6;    // visible outline
+	const int TRACK = BASE + 2;    // dark empty groove
+
+	const int ix = gx + 1, iy = gy + 1;     // inner track origin
+	const int iw = gw - 2, ih = gh - 2;     // inner track size
+	const int cross = horizontal ? ih : iw; // bar thickness (across the fill)
+	const int along = horizontal ? iw : ih; // bar length (along the fill)
+
+	// Outline + recessed empty groove (always drawn, so a depleted bar still reads).
+	JE_rectangle(VGAScreen, gx, gy, gx + gw - 1, gy + gh - 1, FRAME);
+	fill_rectangle_xy(VGAScreen, ix, iy, ix + iw - 1, iy + ih - 1, TRACK);
+
+	const int fillLen = (int)(along * fraction + 0.5f);
+	if (fillLen <= 0)
+		return;  // boss at (near) zero: just the empty groove shows
+
+	// Glossy fill: a brightness gradient across the thickness (highlight near the
+	// first edge, darker at the far edge), lifted by the hit-flash amount.
+	for (int c = 0; c < cross; ++c)
+	{
+		int shade = (cross <= 1) ? 13 : 15 - (c * 6) / (cross - 1);  // 127 -> ~121
+		int col = BASE + shade + flash;
+		if (col > BASE + 15)
+			col = BASE + 15;
+
+		if (horizontal)
+			fill_rectangle_xy(VGAScreen, ix, iy + c, ix + fillLen - 1, iy + c, (Uint8)col);
+		else
+			fill_rectangle_xy(VGAScreen, ix + c, iy + ih - fillLen, ix + c, iy + ih - 1, (Uint8)col);
+	}
+
+	// Bright leading-edge cap at the tip of the fill for a crisp, readable edge.
+	if (horizontal)
+		fill_rectangle_xy(VGAScreen, ix + fillLen - 1, iy, ix + fillLen - 1, iy + ih - 1, (Uint8)(BASE + 15));
+	else
+		fill_rectangle_xy(VGAScreen, ix, iy + ih - fillLen, ix + iw - 1, iy + ih - fillLen, (Uint8)(BASE + 15));
+}
+
+// Shared by draw_boss_bars_enhanced and boss_bar_right_edge_x (below), so the two can never
+// drift apart: the enhanced gauge's thickness and the gap between two grouped bars.
+static const int BOSS_BAR_THICK = 7;
+static const int BOSS_BAR_GAP   = 4;
+
+// Lay out and draw the enhanced boss bars per the player's Enhancements
+// settings (bossBarLayout / bossBarTwoMode). barCount is 1 or 2.
+static void draw_boss_bars_enhanced(unsigned int barCount)
+{
+	// Bars draw into game_screen (playfield space); JE_inGameDisplays draws the corner HUD
+	// indicators in the same space, so keep bars centred on the playfield and clear of them.
+	// notes.md §Widescreen, §Boss & enemy health bars.
+	const int PF_L  = PLAYFIELD_LEFT;        // 24: left visible edge
+	const int PF_R  = PLAYFIELD_RIGHT;       // 322: right visible edge, just before the HUD
+	const int PF_CX = PF_L + PLAYFIELD_WIDTH / 2;    // 173: playfield centre
+	const bool two  = (barCount == 2);
+
+	const int THICK = BOSS_BAR_THICK;   // bar thickness
+	const int GAP   = BOSS_BAR_GAP;     // spacing between two grouped bars
+
+	const bool vertical  = (bossBarLayout == BOSS_BAR_LEFT || bossBarLayout == BOSS_BAR_RIGHT);
+	const bool splitMode = (bossBarTwoMode == BOSS_BAR_TWO_SPLIT);
+	const bool stackMode = (bossBarTwoMode == BOSS_BAR_TWO_STACKED);
+
+	if (!vertical)
+	{
+		// ----- Horizontal bars (Top / Bottom) -----
+		const bool top = (bossBarLayout == BOSS_BAR_TOP);
+		const bool sideBySide = two && splitMode;  // halves on one row; else stacked rows
+
+		// Longest centred span that clears the corner indicators: at the TOP the
+		// special-weapon icon ends ~x49 (and player 2's indicators start ~x208 in
+		// 2-player); near the BOTTOM the playfield edge is the limit.
+		const int leftClear  = top ? 64 : PF_L + 2;
+		const int rightClear = (top && twoPlayerMode) ? 208 : PF_R;
+		const int leftHalf   = PF_CX - leftClear;
+		const int rightHalf  = rightClear - PF_CX;
+		const int half       = (leftHalf < rightHalf) ? leftHalf : rightHalf;
+		const int fullL      = PF_CX - half;
+		const int fullR      = PF_CX + half;
+		const int fullW      = fullR - fullL + 1;
+
+		// Top drops below the level timer when it shows; bottom sits above the score
+		// row (y175+) and the low-armor WARNING (y178+).
+		const int topAnchor = levelTimer ? 18 : 6;
+		const int botAnchor = 174;
+
+		for (unsigned int b = 0; b < barCount; b++)
+		{
+			int bx = fullL, bw = fullW, by;
+
+			if (sideBySide)
+			{
+				bw = (fullW - GAP) / 2;
+				bx = (b == 0) ? fullL : fullR - bw + 1;
+			}
+
+			if (top)
+				by = topAnchor + ((two && !sideBySide) ? (int)b * (THICK + GAP) : 0);
+			else  // bottom: stacked grows upward, bar 0 on top
+				by = botAnchor - THICK + 1
+				   - ((two && !sideBySide) ? (int)(barCount - 1 - b) * (THICK + GAP) : 0);
+
+			draw_boss_bar_gauge(bx, by, bw, THICK, true,
+			                    boss_bar[b].armor / 254.0f, boss_bar[b].color,
+			                    boss_bar_tint_base(boss_bar[b].link_num));
+
+			if (boss_bar[b].color > 0)
+				boss_bar[b].color--;
+		}
+	}
+	else
+	{
+		// ----- Vertical bars (Left / Right) -----
+		// Bars hug the side edges: the left edge carries player-1 corner indicators
+		// (use the clear middle band); the right is full-height in 1-player but
+		// banded in 2-player. Two-bar modes: Split = one per side, Together =
+		// parallel on the chosen side, Stacked = one above the other on that side.
+		const int edgeL    = PF_L + 2;            // left bar's left edge
+		const int edgeR    = PF_R - 1;            // right bar's right edge
+		const int clearTop = 48, clearBot = 158;  // between the top & bottom corner HUD
+		const int fullTop  = 8,  fullBot  = 176;  // clear of the top/bottom WARNING strips
+
+		for (unsigned int b = 0; b < barCount; b++)
+		{
+			const bool onLeft = (two && splitMode)
+				? (b == 0)                              // one bar on each side
+				: (bossBarLayout == BOSS_BAR_LEFT);     // single, or both on chosen side
+
+			// Parallel ("Together") offsets the second bar inward; split/stacked share a column.
+			const int slot = (two && !splitMode && !stackMode) ? (int)b : 0;
+
+			int bx = onLeft
+				? edgeL + slot * (THICK + GAP)
+				: edgeR - THICK + 1 - slot * (THICK + GAP);
+
+			// Full height only on a HUD-free side; split forces both sides to the
+			// clear band so the pair matches.
+			const bool clearColumn = (two && splitMode) ? true : (onLeft || twoPlayerMode);
+			int vTop = clearColumn ? clearTop : fullTop;
+			int vBot = clearColumn ? clearBot : fullBot;
+
+			// Stacked: split this side's span into a top half and a bottom half.
+			if (two && stackMode)
+			{
+				const int mid = (vTop + vBot) / 2;
+				if (b == 0)
+					vBot = mid - GAP / 2;          // upper bar
+				else
+					vTop = mid + GAP / 2 + 1;      // lower bar
+			}
+
+			draw_boss_bar_gauge(bx, vTop, THICK, vBot - vTop + 1, false,
+			                    boss_bar[b].armor / 254.0f, boss_bar[b].color,
+			                    boss_bar_tint_base(boss_bar[b].link_num));
+
+			if (boss_bar[b].color > 0)
+				boss_bar[b].color--;
+		}
+	}
+}
+
+// Original compact double-sided boss bar (kept for the "Classic" setting).
+static void draw_boss_bars_classic(unsigned int bars)
+{
+	const int playfield_left = PLAYFIELD_LEFT;
+	const int center_x = playfield_left + PLAYFIELD_WIDTH / 2;
+
+	for (unsigned int b = 0; b < bars; b++)
+	{
+		unsigned int x;
+
+		if (bars == 2)
+			x = center_x + ((b == 0) ? -30 : 30);
+		else
+			x = center_x + ((levelTimer) ? 95 : 0);  // level timer and boss bar would overlap
+
+		unsigned int y = (levelTimer) ? 15 : 7;
+
+		const int base = boss_bar_tint_base(boss_bar[b].link_num);  // bank 7, or elite/champion tint
+		JE_barX(x - 25, y, x + 25, y + 5, base + 3);
+		JE_barX(x - (boss_bar[b].armor / 10), y, x + (boss_bar[b].armor + 5) / 10, y + 5, base + 6 + boss_bar[b].color);
+
+		if (boss_bar[b].color > 0)
+			boss_bar[b].color--;
+	}
+}
+
+// Tunables for the tiny per-enemy health bars.
+enum
+{
+	ENEMY_BAR_MIN_HP  = 1,   // show a bar on every enemy that survives a hit (incl. low-HP trash)
+	ENEMY_BAR_MAX_LEN = 48,  // cap so a spread-out linkgroup can't paint a screen-long bar
+	ENEMY_BAR_MIN_LEN = 3,   // shorter than this and the gauge can't be read; skip it
+	ENEMY_BAR_THICK   = 2,   // bar thickness across the fill (groove row/col + shadow)
+};
+
+// Lay out and draw one enemy's thin health bar from the group's on-screen bounding box
+// [boxL..boxR] x [boxT..boxB-1] (boxB is one row past the sprites). Orientation,
+// placement and opacity come from the Enemy Bars settings. frac fills the bar
+// (left->right horizontal, bottom->up vertical); the fill colour tracks health on the
+// bank-7 (112..127) ramp, so it reads on every level palette.
+static void draw_enemy_hp_bar(int id, int boxL, int boxR, int boxT, int boxB, float frac, int barBase, float par_frac, float par_yfrac)
+{
+	if (frac < 0.0f) frac = 0.0f; else if (frac > 1.0f) frac = 1.0f;
+
+	const Uint8 opacity = (Uint8)(enemyBarOpacity * 255 / 100);
+	if (opacity == 0)
+		return;  // fully transparent: nothing to draw or record
+
+	const bool vertical  = (enemyBarLayout == ENEMY_BAR_VERTICAL);
+	const int  boxBottom = boxB - 1;                 // inclusive bottom sprite row
+	const int  cx = (boxL + boxR) / 2;               // enemy centre
+	const int  cy = (boxT + boxBottom) / 2;
+	const int  T  = ENEMY_BAR_THICK;
+
+	int along, x, y;
+
+	if (!vertical)
+	{
+		// Horizontal bar: length spans the enemy width, inset 1px each end so
+		// enemies packed into a row keep a visible gap between their bars.
+		int xl = boxL + 1, xr = boxR - 1;
+		along = xr - xl + 1;
+		if (along < ENEMY_BAR_MIN_LEN)
+			return;
+		if (along > ENEMY_BAR_MAX_LEN)
+		{
+			xl = cx - ENEMY_BAR_MAX_LEN / 2;
+			along = ENEMY_BAR_MAX_LEN;
+		}
+		x = xl;
+
+		switch (enemyBarPosition)
+		{
+		case ENEMY_BAR_POS_TOP:    y = boxT - T - 1;                     break;  // above the enemy
+		case ENEMY_BAR_POS_CENTER: y = cy - T / 2;                       break;  // over the enemy's centre
+		case ENEMY_BAR_POS_LEFT:   x = boxL - along - 1; y = cy - T / 2; break;  // left of the enemy
+		case ENEMY_BAR_POS_RIGHT:  x = boxR + 2;         y = cy - T / 2; break;  // right of the enemy
+		case ENEMY_BAR_POS_BOTTOM:
+		default:                   y = boxB + 1;                         break;  // below (original)
+		}
+	}
+	else
+	{
+		// Vertical bar: length spans the enemy height, inset 1px each end.
+		int yt = boxT + 1, yb = boxBottom - 1;
+		along = yb - yt + 1;
+		if (along < ENEMY_BAR_MIN_LEN)
+			return;
+		if (along > ENEMY_BAR_MAX_LEN)
+		{
+			yt = cy - ENEMY_BAR_MAX_LEN / 2;
+			along = ENEMY_BAR_MAX_LEN;
+		}
+		y = yt;
+
+		switch (enemyBarPosition)
+		{
+		case ENEMY_BAR_POS_LEFT:   x = boxL - T - 1;                     break;  // left of the enemy
+		case ENEMY_BAR_POS_CENTER: x = cx - T / 2;                       break;  // over the enemy's centre
+		case ENEMY_BAR_POS_TOP:    y = boxT - along - 1; x = cx - T / 2; break;  // above the enemy
+		case ENEMY_BAR_POS_BOTTOM: y = boxB + 1;         x = cx - T / 2; break;  // below the enemy
+		case ENEMY_BAR_POS_RIGHT:
+		default:                   x = boxR + 2;                         break;  // right of the enemy
+		}
+	}
+
+	const int fill = (int)(along * frac + 0.5f);
+	// Fill colour tracks remaining health within the bar's palette bank: full -> +15
+	// (bright), near-empty -> +5 (dark). barBase is bank 7 (112) normally, or the elite /
+	// champion tint bank so a special enemy's bar matches its tint.
+	const int col = (fill > 0) ? barBase + 5 + (int)(frac * 10.0f + 0.5f) : barBase;
+
+	// Draw into the authoritative tick frame.
+	rl_draw_hp_bar(VGAScreen, x, y, along, fill, (Uint8)col, vertical, opacity);
+
+	// Record the bar so the replay reproduces AND interpolates it with its enemy
+	// (id = RL_ID_ENEMYBAR_BASE + slot). It stays out of the residual via recording
+	// (normal levels) / pre-snapshot call order (smoothie levels) — see the call sites.
+	if (render_list_recording)
+	{
+		rl_current_id = id;
+		rl_current_par_frac = par_frac;    // float the bar's parallax to match its enemy
+		rl_current_par_yfrac = par_yfrac;  // float the bar's vertical scroll to match its enemy
+		rl_rec_hp_bar(x, y, along, fill, (Uint8)col, vertical, opacity);
+		rl_current_id = 0;
+		rl_current_par_frac = 0.0f;
+		rl_current_par_yfrac = 0.0f;
+	}
+}
+
+// Tiny per-enemy health bars: one bar per linknum group, spanning the group and showing its
+// most-damaged part. Shown once an enemy has taken damage (healthbar_seen latch); boss-linked
+// groups are skipped; only active, damageable slots qualify. notes.md §Boss & enemy health bars.
+static void draw_enemy_health_bars(void)
+{
+	if (!enemyBars)
+		return;
+
+	bool done[100] = { false };
+
+	for (unsigned int e = 0; e < 100; e++)
+	{
+		if (enemyAvail[e] != 0 || done[e])
+			continue;
+
+		const int link = enemy[e].linknum;
+
+		// Groups that already own a boss bar are handled by draw_boss_bar().
+		if (link != 0 && (link == boss_bar[0].link_num || link == boss_bar[1].link_num))
+		{
+			done[e] = true;
+			continue;
+		}
+
+		// Accumulate the group's on-screen bounding box and most-damaged fraction.
+		bool shown = false;
+		float frac = 1.0f;
+		int left = 99999, right = -99999, top = 99999, bottom = -99999;
+
+		for (unsigned int f = e; f < 100; f++)
+		{
+			// Skip freed (1) and lingering non-damageable (2) slots; this also shrinks
+			// a linkgroup's bar to just its surviving parts.
+			if (enemyAvail[f] != 0)
+				continue;
+			if (link == 0 ? (f != e) : (enemy[f].linknum != (JE_byte)link))
+				continue;
+
+			done[f] = true;
+
+			// Sprite footprint: a normal enemy is one 12x14 cell at (ex+mapoffset, ey);
+			// a "2x2" enemy (size==1) is four cells around that point (+-6 x, +-7 y),
+			// i.e. 24x28.
+			const bool big = (enemy[f].size == 1);
+			const int sx = enemy[f].ex + enemy[f].mapoffset + (big ? -6 : 0);
+			const int sy = enemy[f].ey + (big ? -7 : 0);
+			const int sw = big ? 24 : 12;
+			const int sh = big ? 28 : 14;
+
+			if (sx < left)             left = sx;
+			if (sx + sw - 1 > right)   right = sx + sw - 1;
+			if (sy < top)              top = sy;
+			if (sy + sh > bottom)      bottom = sy + sh;
+
+			// Bar only while alive AND damageable: armorleft == 0 is dead/dying, 255 is the
+			// "invincible" sentinel. A level-script event (types 25/47) can raise an
+			// already-damaged enemy's armor to 255 mid-fight; it can then never lose armor
+			// again, so its bar would hang over an unkillable enemy forever.
+			if (enemy[f].healthbar_seen && enemy[f].armorleft > 0 && enemy[f].armorleft < 255 &&
+			    enemy[f].healthbar_max >= ENEMY_BAR_MIN_HP)
+			{
+				shown = true;
+				const float f2 = (float)enemy[f].armorleft / (float)enemy[f].healthbar_max;
+				if (f2 < frac)
+					frac = f2;
+			}
+		}
+
+		if (shown)
+		{
+			// Endless special enemies get a bar in their tint bank (elite / champion) so the
+			// bar reads as part of the enemy; ordinary enemies keep the bank-7 yellow ramp.
+			int barBase = 112;  // palette bank 7
+			if (endlessMode && enemy[e].eliteState == 2)
+				barBase = ENDLESS_ELITE_FILTER;
+			else if (endlessMode && enemy[e].eliteState == 3)
+				barBase = ENDLESS_CHAMPION_FILTER;
+			draw_enemy_hp_bar(RL_ID_ENEMYBAR_BASE + (int)e, left, right, top, bottom, frac, barBase, enemy[e].mapoffset_frac, enemy[e].scroll_yfrac);
+		}
+	}
+}
+
 void draw_boss_bar(void)
 {
 	for (unsigned int b = 0; b < COUNTOF(boss_bar); b++)
@@ -5871,7 +7206,15 @@ void draw_boss_bar(void)
 		}
 
 		if (armor > 255 || armor == 0)  // boss dead?
+		{
 			boss_bar[b].link_num = 0;
+			// Tally "Bosses slain" here -- the one definitive moment a boss that actually
+			// had a health bar is destroyed. Each such boss counts exactly once (the bar is
+			// skipped once link_num is 0); high-armor mini-bosses that never spawn a bar
+			// are never counted.
+			if (endlessMode)
+				++endlessRunBossKills;
+		}
 		else
 			boss_bar[b].armor = (armor == 255) ? 254 : armor;  // 255 would make the bar too long
 	}
@@ -5886,24 +7229,47 @@ void draw_boss_bar(void)
 		boss_bar[1].link_num = 0;
 	}
 
-	const int playfield_left = -2 * PLAYFIELD_X_SHIFT;
-	const int center_x = playfield_left + PLAYFIELD_WIDTH / 2;
+	if (bars == 0)
+		return;
 
-	for (unsigned int b = 0; b < bars; b++)
-	{
-		unsigned int x;
+	if (bossBarStyle == BOSS_BAR_ENHANCED)
+		draw_boss_bars_enhanced(bars);
+	else
+		draw_boss_bars_classic(bars);
+}
 
-		if (bars == 2)
-			x = center_x + ((b == 0) ? -30 : 30);
-		else
-			x = center_x + ((levelTimer) ? 95 : 0);  // level timer and boss bar would overlap
+// How far LEFT the endless kill-fire HUD (bottom-right of the playfield, right-aligned to
+// hudRightX) must shift to clear a currently-shown RIGHT-side vertical boss bar, or 0 if none is
+// in the way. Classic style and non-right layouts never occupy that column. Mirrors the bx
+// geometry in draw_boss_bars_enhanced exactly (same BOSS_BAR_THICK/GAP) so the two can't drift.
+int boss_bar_hud_left_shift(int hudRightX)
+{
+	const unsigned int bars = (boss_bar[0].link_num != 0 ? 1 : 0)
+	                         + (boss_bar[1].link_num != 0 ? 1 : 0);
+	if (bars == 0 || bossBarStyle != BOSS_BAR_ENHANCED)
+		return 0;
+	if (bossBarLayout != BOSS_BAR_LEFT && bossBarLayout != BOSS_BAR_RIGHT)
+		return 0;  // horizontal layouts never occupy the right edge column
 
-		unsigned int y = (levelTimer) ? 15 : 7;
+	const bool splitMode = (bossBarTwoMode == BOSS_BAR_TWO_SPLIT);
+	const bool onRight = (bossBarLayout == BOSS_BAR_RIGHT) || (bars == 2 && splitMode);
+	if (!onRight)
+		return 0;  // vertical bar(s) confined to the left edge
 
-		JE_barX(x - 25, y, x + 25, y + 5, 115);
-		JE_barX(x - (boss_bar[b].armor / 10), y, x + (boss_bar[b].armor + 5) / 10, y + 5, 118 + boss_bar[b].color);
+	// Two bars side-by-side ("Together") widen the occupied column; Stacked/Split/single share
+	// just one THICK-wide column (see the bx formula in draw_boss_bars_enhanced).
+	const bool together = (bars == 2 && !splitMode && bossBarTwoMode == BOSS_BAR_TWO_TOGETHER);
+	const int slots = together ? 1 : 0;
+	const int leftmostX = (PLAYFIELD_RIGHT - 1) - BOSS_BAR_THICK + 1 - slots * (BOSS_BAR_THICK + BOSS_BAR_GAP);
 
-		if (boss_bar[b].color > 0)
-			boss_bar[b].color--;
-	}
+	return (hudRightX >= leftmostX) ? (hudRightX - leftmostX + 4) : 0;  // +4px clearance
+}
+
+// True while an Enhanced BOTTOM horizontal boss bar is shown -- it can span near the full
+// playfield width and sits close to the bottom edge, unlike TOP which never reaches there.
+bool boss_bar_hud_needs_up_shift(void)
+{
+	const unsigned int bars = (boss_bar[0].link_num != 0 ? 1 : 0)
+	                        + (boss_bar[1].link_num != 0 ? 1 : 0);
+	return bars > 0 && bossBarStyle == BOSS_BAR_ENHANCED && bossBarLayout == BOSS_BAR_BOTTOM;
 }

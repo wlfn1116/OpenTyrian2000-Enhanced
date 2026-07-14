@@ -42,5 +42,6 @@ extern JE_word mouseXB, mouseYB;
 void JE_mouseStart(void);
 void JE_mouseStartFilter(Uint8 filter);
 void JE_mouseReplace(void);
+void JE_drawMouseToMenuScreen(SDL_Surface *dst, int x_offset);
 
 #endif /* MOUSE_H */

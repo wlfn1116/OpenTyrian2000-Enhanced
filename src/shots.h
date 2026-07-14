@@ -30,7 +30,13 @@ typedef struct {
 	JE_byte shotBlastFilter, chainReaction, playerNumber, aimAtEnemy, aimDelay, aimDelayMax;
 } PlayerShotDataType;
 
-#define MAX_PWEAPON     81 /* 81*/
+// Player-shot pool size, bumped from the original 81 so a sustained special (e.g. an autofired
+// Minefield) — or a wide custom weapon — can't fill the pool and starve the main weapon. The
+// render-list id range gates this: ids RL_ID_PSHOT_BASE(3000)+slot must stay below the next id
+// range (RL_ID_ESHOT_BASE), so those bases were re-spaced (see render_list.h) to give the pool
+// room. 8000 comfortably covers the widest possible weapon (255 bullets x ~30 concurrent volleys);
+// larger just costs memory/frame time for bullets that would be off-screen anyway.
+#define MAX_PWEAPON     8000
 extern PlayerShotDataType playerShotData[MAX_PWEAPON + 1];
 extern JE_byte shotAvail[MAX_PWEAPON];
 

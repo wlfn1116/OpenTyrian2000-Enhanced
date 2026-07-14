@@ -27,6 +27,12 @@ typedef JE_byte JE_MenuChoiceType[MENU_MAX];
 JE_longint JE_cashLeft(void);
 void JE_itemScreen(void);
 
+// Fill `out` with up to `maxOut` combat-level section numbers for `episode` (the same
+// level scan the debug level picker uses); returns how many were written. When `fileOut`
+// is non-NULL it receives each entry's lvlFileNum in parallel, so callers can distinguish
+// two levels that share a section (Episode 1 section 3's two TYRIAN cuts, files 9 and 15).
+uint JE_getLevelSections(int episode, JE_byte *out, JE_byte *fileOut, uint maxOut);
+
 void load_cubes(void);
 bool load_cube(int cube_slot, int cube_index);
 
@@ -51,6 +57,8 @@ void JE_genItemMenu(JE_byte itemnum);
 void JE_scaleInPicture(SDL_Surface *dst, const SDL_Surface *src);
 void JE_drawScore(void);
 void JE_menuFunction(JE_byte select);
+bool JE_debugLevelSelect(void);
+bool JE_customWeaponCreator(bool canEquip);
 void JE_drawShipSpecs(SDL_Surface *, SDL_Surface *);
 void JE_weaponSimUpdate(void);
 void JE_weaponViewFrame(void);

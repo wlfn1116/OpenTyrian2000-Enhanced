@@ -18,8 +18,11 @@
  */
 #include "varz.h"
 
+#include <stdlib.h>  // _Exit (Switch clean-exit path in JE_tyrianHalt)
+
 #include "config.h"
 #include "editship.h"
+#include "endless.h"
 #include "episodes.h"
 #include "joystick.h"
 #include "lds_play.h"
@@ -31,6 +34,7 @@
 #include "nortsong.h"
 #include "nortvars.h"
 #include "opentyr.h"
+#include "render_list.h"
 #include "shots.h"
 #include "sprite.h"
 #include "vga256d.h"
@@ -179,6 +183,12 @@ JE_byte SFExecuted[2]; /* [1..2] */
 
 /*Special General Data*/
 JE_byte lvlFileNum;
+// One-shot override for the next level load: forces lvlFileNum after JE_loadMap's section rescan
+// (which otherwise snaps it to the section's first ']L'). Lets a level pool entry / debug pick reach
+// a section's non-first level file -- e.g. Episode 1 section 3's second TYRIAN cut (file 15). Set by
+// select_level (from its file_num arg) and by the endless commit paths; consumed + cleared by
+// JE_loadMap. 0 = use the section default. See endless.c / game_menu.c.
+JE_byte forcedLvlFileNum = 0;
 JE_word maxEvent, eventLoc;
 /*JE_word maxenemies;*/
 JE_word tempBackMove, explodeMove; /*Speed of background movement*/
@@ -264,6 +274,8 @@ JE_MultiEnemyType enemy;
 JE_EnemyAvailType enemyAvail;  /* values: 0: used, 1: free, 2: secret pick-up */
 JE_word enemyOffset;
 JE_word enemyOnScreen;
+JE_word enemyParkedAbove;   // of enemyOnScreen: parked above the screen with no way to ever enter it (map-stop watchdog, tyrian2.c)
+JE_word mapStopStallTicks;  // consecutive ticks a scripted map stop has been held ONLY by parked-above enemies
 JE_word superEnemy254Jump;
 
 /*EnemyShotData*/
@@ -273,6 +285,14 @@ EnemyShotType enemyShot[ENEMY_SHOT_MAX]; /* [1..Enemyshotmax]  */
 
 /* Player Shot Data */
 JE_byte     zinglonDuration;
+
+/* Soul-of-Zinglon light pillar render request: JE_doSpecialShot records the pillar
+   here each tick instead of drawing it, so JE_starShowVGA can draw it at the render-
+   rate ship position rather than frozen into the 35Hz residual. */
+bool        zinglonPillarActive = false;
+int         zinglonPillarCX = 0;    /* pillar centre x in game_screen coords */
+int         zinglonPillarTemp = 0;  /* pillar half-width */
+
 JE_byte     astralDuration;
 JE_word     flareDuration;
 JE_boolean  flareStart;
@@ -285,10 +305,49 @@ JE_boolean  infiniteShot;
 JE_boolean  cheatInfiniteSidekickAmmo = false;
 JE_boolean  cheatInfiniteShields = false;
 JE_boolean  cheatInfiniteArmor = false;
+JE_boolean  cheatInfiniteGenerator = false;  /* debug: weapons don't drain generator power */
+JE_boolean  cheatNoEnemyFire = false;
+JE_boolean  cheatInstantCharge = false;  /* debug: charge sidekicks reach full charge instantly */
+JE_byte     noclipMode = NOCLIP_OFF;     /* debug: pass through enemies (see enum in varz.h) */
+JE_boolean  debugHitboxOverlay = false;
+JE_boolean  debugPerfOverlay = false;
 JE_boolean  autoFireSpecial = false;
-JE_boolean  chargeSidekickAutofire = false;
+JE_byte     debugTwiddleSpecial = 0;       /* debug: selected twiddle's special index (0 = none) */
+JE_boolean  debugAutofireTwiddle = false;  /* debug: auto-fire the selected twiddle while fire is held */
+JE_boolean  debugTwiddleTrigger = false;   /* debug: one-shot "fire the twiddle now" request from the menu */
+JE_boolean  debugToggleFire = false;       /* debug: fire button toggles auto-fire instead of hold-to-fire */
+JE_boolean  debugToggleFireActive = false; /* debug: the Toggle Fire latch -- ship is currently auto-firing */
+JE_byte     chargeSidekickAutofire = CHARGE_AUTOFIRE_OFF;
 JE_boolean  difficultyAdjust = true;
 JE_boolean  expertMode = false;
+
+int expertBossHpMult      = EXPERT_DEF_BOSS_HP;
+int expertEnemyArmorPct   = EXPERT_DEF_ENEMY_ARMOR;
+int expertEnergyPct       = EXPERT_DEF_ENERGY;
+int expertShopCostMult    = EXPERT_DEF_SHOP_COST;
+int expertUpgradeCostMult = EXPERT_DEF_UPGRADE_COST;
+int expertScorePct        = EXPERT_DEF_CASH;
+
+ExpertSetting expertSettings[] =
+{
+	{ "Boss HP",       "expert_boss_hp",      &expertBossHpMult,        1,  25, 1, EXPERT_DEF_BOSS_HP,      'x' },
+	{ "Enemy Armor",   "expert_enemy_armor",  &expertEnemyArmorPct,   100, 300, 5, EXPERT_DEF_ENEMY_ARMOR, '%' },
+	{ "Weapon Energy", "expert_energy",       &expertEnergyPct,       100, 300, 5, EXPERT_DEF_ENERGY,      '%' },
+	{ "Shop Cost",     "expert_shop_cost",    &expertShopCostMult,      1,  20, 1, EXPERT_DEF_SHOP_COST,   'x' },
+	{ "Upgrade Cost",  "expert_upgrade_cost", &expertUpgradeCostMult,   1,  20, 1, EXPERT_DEF_UPGRADE_COST,'x' },
+	{ "Cash Bonus",    "expert_cash",         &expertScorePct,        100, 400, 5, EXPERT_DEF_CASH,        '%' },
+};
+const int expertSettingsCount = (int)(sizeof(expertSettings) / sizeof(expertSettings[0]));
+
+void clamp_expert_settings(void)
+{
+	for (int i = 0; i < expertSettingsCount; ++i)
+	{
+		ExpertSetting* s = &expertSettings[i];
+		if (*s->value < s->lo) *s->value = s->lo;
+		if (*s->value > s->hi) *s->value = s->hi;
+	}
+}
 
 /*PlayerData*/
 JE_boolean allPlayersGone; /*Both players dead and finished exploding*/
@@ -297,8 +356,8 @@ const uint shadowYDist = 10;
 
 JE_real optionSatelliteRotate;
 
-JE_integer optionAttachmentMove;
-JE_boolean optionAttachmentLinked, optionAttachmentReturn;
+JE_integer optionAttachmentMove[2];                               // per sidekick slot (LEFT/RIGHT)
+JE_boolean optionAttachmentLinked[2], optionAttachmentReturn[2];  // so both front options can launch
 
 JE_byte chargeWait, chargeLevel, chargeMax, chargeGr, chargeGrWait;
 
@@ -354,6 +413,14 @@ void JE_getShipInfo(void)
 	{
 		shipGr = ships[player[0].items.ship].shipgraphic - (shipGrPtr == &spriteSheetT2000 ? 500 : 0);
 		player[0].armor = ships[player[0].items.ship].dmg;
+	}
+
+	// Endless: apply the run-persistent hull upgrades (outpost Reinforce + Ablative Plating perk;
+	// the perk bonus can be NEGATIVE with Glass Cannon, so clamp the result to at least 1 armor).
+	if (endlessMode)
+	{
+		int a = (int)player[0].armor + endlessArmorBonus + endlessPerkArmorBonus();
+		player[0].armor = (a < 1) ? 1 : (a > 250 ? 250 : a);  // clamp both ends: >=1, and byte-safe so no JE_byte armor path wraps
 	}
 
 	extraShip2 = player[1].items.ship > 90;
@@ -423,7 +490,7 @@ void JE_drawOptions(void)
 		this_player->sidekick[i].animation_frame = 0;
 
 		this_player->sidekick[i].charge = 0;
-		this_player->sidekick[i].charge_ticks = 20;
+		this_player->sidekick[i].charge_ticks = endlessPerkChargeTicks(20);
 
 		// draw initial sidekick HUD
 		const int y = hud_sidekick_y[twoPlayerMode ? 1 : 0][i];
@@ -509,7 +576,14 @@ void JE_tyrianHalt(JE_byte code)
 	}
 
 	SDL_Quit();
+
+#ifdef __SWITCH__
+	// Switch: libc exit()'s atexit/stdio teardown NULL-derefs in newlib once romfs is
+	// gone; everything is already flushed, so _Exit and skip it. notes.md §Console ports.
+	_Exit(code);
+#else
 	exit(code);
+#endif
 }
 
 void JE_specialComplete(JE_byte playerNum, JE_byte specialType)
@@ -528,19 +602,22 @@ void JE_specialComplete(JE_byte playerNum, JE_byte specialType)
 			break;
 		/*Repulsor*/
 		case 2:
-			for (temp = 0; temp < ENEMY_SHOT_MAX; temp++)
+			// Local int counter, not the global JE_byte `temp`: ENEMY_SHOT_MAX is 500, which a byte
+			// counter can never reach (it wraps at 255), so `temp` here would loop forever and hang
+			// the moment the Repulsor fires. (The pool grew past 255 for endless; see ENEMY_SHOT_MAX.)
+			for (int es = 0; es < ENEMY_SHOT_MAX; es++)
 			{
-				if (!enemyShotAvail[temp])
+				if (!enemyShotAvail[es])
 				{
-					if (player[0].x > enemyShot[temp].sx)
-						enemyShot[temp].sxm--;
-					else if (player[0].x < enemyShot[temp].sx)
-						enemyShot[temp].sxm++;
+					if (player[0].x > enemyShot[es].sx)
+						enemyShot[es].sxm--;
+					else if (player[0].x < enemyShot[es].sx)
+						enemyShot[es].sxm++;
 
-					if (player[0].y > enemyShot[temp].sy)
-						enemyShot[temp].sym--;
-					else if (player[0].y < enemyShot[temp].sy)
-						enemyShot[temp].sym++;
+					if (player[0].y > enemyShot[es].sy)
+						enemyShot[es].sym--;
+					else if (player[0].y < enemyShot[es].sy)
+						enemyShot[es].sym++;
 				}
 			}
 			break;
@@ -687,8 +764,22 @@ void JE_specialComplete(JE_byte playerNum, JE_byte specialType)
 	}
 }
 
+// Flare-type specials hold flareDuration > 0 while active; instant specials don't.
+// Used to decide whether the equipped special can fire alongside a twiddle flare.
+static bool special_is_flare(JE_byte sidx)
+{
+	const JE_byte st = special[sidx].stype;
+	return (st >= 5 && st <= 11) || st == 16;
+}
+
 void JE_doSpecialShot(JE_byte playerNum, uint *armor, uint *shield)
 {
+	// Debug twiddle autofire runs its own pipeline: flareFromTwiddle marks the flare
+	// as the twiddle's (the equipped special keeps firing) and twiddleFlareShotWait
+	// paces its shots independently of shotRepeat[SHOT_SPECIAL].
+	static JE_boolean flareFromTwiddle = false;
+	static JE_word twiddleFlareShotWait = 0;
+
 	if (player[0].items.special > 0)
 	{
 		if (shotRepeat[SHOT_SPECIAL] == 0 && specialWait == 0 && flareDuration < 2 && zinglonDuration < 2)
@@ -705,6 +796,7 @@ void JE_doSpecialShot(JE_byte playerNum, uint *armor, uint *shield)
 	{
 		specialWait--;
 	}
+
 	temp = SFExecuted[playerNum-1];
 	if (temp > 0 && shotRepeat[SHOT_SPECIAL] == 0 && flareDuration == 0)
 	{
@@ -769,7 +861,9 @@ void JE_doSpecialShot(JE_byte playerNum, uint *armor, uint *shield)
 		{
 			fireButtonHeld = false;
 		}
-		else if (shotRepeat[SHOT_SPECIAL] == 0 && !fireButtonHeld && !(flareDuration > 0) && specialWait == 0)
+		else if (shotRepeat[SHOT_SPECIAL] == 0 && !fireButtonHeld &&
+		         (flareDuration == 0 || (flareFromTwiddle && !special_is_flare(player[0].items.special))) &&
+		         specialWait == 0)
 		{
 			fireButtonHeld = true;
 			JE_specialComplete(playerNum, player[0].items.special);
@@ -777,11 +871,60 @@ void JE_doSpecialShot(JE_byte playerNum, uint *armor, uint *shield)
 
 	}  /*Main End*/
 
-	if (autoFireSpecial && playerNum == 1 && player[0].items.special > 0 &&
-		shotRepeat[SHOT_SPECIAL] == 0 && specialWait == 0 && flareDuration == 0 &&
+	if ((autoFireSpecial || endlessPerkAutoFireSpecial()) && playerNum == 1 && player[0].items.special > 0 &&
+		shotRepeat[SHOT_SPECIAL] == 0 && specialWait == 0 &&
+		(flareDuration == 0 || (flareFromTwiddle && !special_is_flare(player[0].items.special))) &&
 		(button[0] || (superArcadeMode != SA_NONE && (button[1] || button[2]))))
 	{
 		JE_specialComplete(playerNum, player[0].items.special);
+	}
+
+	// Debug: force-fire the selected twiddle's special. Runs after the equipped
+	// special (which keeps priority) on its own cooldown (twiddleWait), ignores the
+	// shield/armor cost, and won't stack onto an active flare.
+	{
+		static JE_word twiddleWait = 0;
+		if (playerNum == 1)
+		{
+			if (twiddleWait > 0)
+				--twiddleWait;
+
+			const bool want = debugTwiddleTrigger
+			               || (debugAutofireTwiddle && button[0] && twiddleWait == 0);
+
+			if (want && debugTwiddleSpecial >= 1 && debugTwiddleSpecial <= SPECIAL_NUM &&
+			    flareDuration == 0)
+			{
+				debugTwiddleTrigger = false;
+
+				// JE_specialComplete reads global temp2 for its duration/effect maths;
+				// seed it like the cost path but without deducting, so it fires free.
+				temp2 = special[debugTwiddleSpecial].pwr;
+				if (temp2 == 98)        temp2 = *shield;
+				else if (temp2 == 99)   temp2 = *shield / 2;
+				else if (temp2 >= 100)  temp2 -= 100;
+				shotMultiPos[SHOT_SPECIAL] = 0;
+				shotMultiPos[SHOT_SPECIAL2] = 0;
+
+				const int savedSR = shotRepeat[SHOT_SPECIAL];
+				JE_specialComplete(playerNum, debugTwiddleSpecial);
+				if (flareDuration > 0)
+				{
+					// Flare twiddle: tag the flare as the twiddle's (equipped special keeps
+					// firing) and let the flare's own duration pace the re-fire.
+					flareFromTwiddle = true;
+					twiddleFlareShotWait = 0;
+					twiddleWait = 0;
+				}
+				else
+				{
+					twiddleWait = 14;  // instant twiddle: small cadence so it fires right off cooldown
+				}
+				// Don't let the twiddle's special disturb the EQUIPPED special's cooldown
+				// (the twiddle paces itself via twiddleWait / twiddleFlareShotWait).
+				shotRepeat[SHOT_SPECIAL] = savedSR;
+			}
+		}
 	}
 
 	if (astralDuration > 0)
@@ -825,20 +968,39 @@ void JE_doSpecialShot(JE_byte playerNum, uint *armor, uint *shield)
 			}
 		}
 
+		if (flareFromTwiddle && twiddleFlareShotWait > 0)
+			--twiddleFlareShotWait;
+
 		if ((signed)(mt_rand() % 6) < specialWeaponFreq)
 		{
 			b = MAX_PWEAPON;
 
 			if (linkToPlayer)
 			{
-				if (shotRepeat[SHOT_SPECIAL] == 0)
+				if (flareFromTwiddle)
+				{
+					// Twiddle flare: pace mines on twiddleFlareShotWait, keeping the
+					// equipped special's shotRepeat[SHOT_SPECIAL] untouched.
+					if (twiddleFlareShotWait == 0)
+					{
+						const int savedSR = shotRepeat[SHOT_SPECIAL];
+						b = player_shot_create(0, SHOT_SPECIAL, player[0].x, player[0].y, mouseX, mouseY, specialWeaponWpn, playerNum);
+						twiddleFlareShotWait = shotRepeat[SHOT_SPECIAL];  // capture the mine cadence
+						shotRepeat[SHOT_SPECIAL] = savedSR;
+					}
+				}
+				else if (shotRepeat[SHOT_SPECIAL] == 0)
 				{
 					b = player_shot_create(0, SHOT_SPECIAL, player[0].x, player[0].y, mouseX, mouseY, specialWeaponWpn, playerNum);
 				}
 			}
 			else
 			{
-				b = player_shot_create(0, SHOT_SPECIAL, mt_rand() % 280, mt_rand() % 180, mouseX, mouseY, specialWeaponWpn, playerNum);
+				// Scatter across the full visible playfield. The old constant 280 was the
+				// pre-widescreen play width, so Minefield-style specials never reached the
+				// widened right edge; PLAYFIELD_LEFT + [0,PLAYFIELD_WIDTH) is the on-screen
+				// span in game_screen coords (see composite_playfield / video.h).
+				b = player_shot_create(0, SHOT_SPECIAL, PLAYFIELD_LEFT + mt_rand() % PLAYFIELD_WIDTH, mt_rand() % 180, mouseX, mouseY, specialWeaponWpn, playerNum);
 			}
 
 			if (spraySpecial && b != MAX_PWEAPON)
@@ -861,8 +1023,11 @@ void JE_doSpecialShot(JE_byte playerNum, uint *armor, uint *shield)
 	else if (flareStart)
 	{
 		flareStart = false;
-		shotRepeat[SHOT_SPECIAL] = linkToPlayer ? 15 : 200;
+		if (!flareFromTwiddle)  // twiddle flare paces itself; leave the equipped cooldown alone
+			shotRepeat[SHOT_SPECIAL] = linkToPlayer ? 15 : 200;
 		flareDuration = 0;
+		flareFromTwiddle = false;
+		twiddleFlareShotWait = 0;
 		if (levelFilter == specialWeaponFilter)
 		{
 			levelFilter = -99;
@@ -875,8 +1040,11 @@ void JE_doSpecialShot(JE_byte playerNum, uint *armor, uint *shield)
 	{
 		temp = 25 - abs(zinglonDuration - 25);
 
-		JE_barBright(VGAScreen, player[0].x + 7 - temp,     0, player[0].x + 7 + temp,     184);
-		JE_barBright(VGAScreen, player[0].x + 7 - temp - 2, 0, player[0].x + 7 + temp + 2, 184);
+		// Record the pillar for the render layer (JE_starShowVGA) instead of drawing:
+		// into game_screen it would snap at 35Hz and freeze the scrolled background.
+		zinglonPillarActive = true;
+		zinglonPillarCX = player[0].x + 7;
+		zinglonPillarTemp = temp;
 
 		zinglonDuration--;
 		if (zinglonDuration % 5 == 0)
@@ -976,6 +1144,7 @@ void JE_setupExplosion(
 				explosions[i].followPlayer = followPlayer;
 				explosions[i].fixedPosition = fixedPosition;
 				explosions[i].deltaY = deltaY;
+				explosions[i].id_gen++;  // distinct interpolation id for this reuse of the slot
 				break;
 			}
 		}
@@ -1044,7 +1213,7 @@ void JE_wipeShieldArmorBars(void)
 	}
 	if (!twoPlayerMode || galagaMode)
 	{
-		fill_rectangle_xy(VGAScreenSeg, HUD_X(307), 137, HUD_X(315), 194 - player[0].armor * 2, 0);
+		fill_rectangle_xy(VGAScreenSeg, HUD_X(307), 137, HUD_X(315), 194 - (player[0].armor > 28 ? 28 : player[0].armor) * 2, 0);
 	}
 	else
 	{
@@ -1061,6 +1230,20 @@ JE_byte JE_playerDamage(JE_byte temp,
 
 	if (cheatInfiniteShields)
 		return 0;
+
+	// Endless Bulwark relic: soften each incoming hit by a flat amount, but always leave at
+	// least 1 damage (only the main player carries perks; a lone hit of 0 is left untouched).
+	if (endlessMode && temp > 1 && this_player == &player[0])
+	{
+		int t = (int)temp - endlessPlayerDamageReduce();
+		temp = (t < 1) ? 1 : (JE_byte)t;
+	}
+
+	// Nitro (gamble deal): the hull is stripped for raw firepower, so any hit that lands is fatal.
+	// Push the damage past every shield+armor total; a held revive can still catch the lethal blow
+	// on the death path below, which keeps the interaction honest rather than an unavoidable game-over.
+	if (endlessMode && this_player == &player[0] && (endlessActiveMods & ENDLESS_MOD_NITRO))
+		temp = 255;
 
 	/* Player Damage Routines */
 	if (this_player->shield < temp)
@@ -1080,13 +1263,26 @@ JE_byte JE_playerDamage(JE_byte temp,
 
 				if (this_player->is_alive && !youAreCheating)
 				{
-					if (!timedBattleMode)
-						levelTimer = false;
-					this_player->is_alive = false;
-					this_player->exploding_ticks = 60;
-					levelEnd = 40;
-					tempVolume = tyrMusicVolume;
-					soundQueue[1] = S_EXPLOSION_22;
+					if (endlessMode && this_player == &player[0] && endlessConsumeRevive())
+					{
+						// Held revive token: survive the lethal hit. endlessConsumeRevive already
+						// restored armor to full; clear the bullet field and grant brief i-frames so
+						// the revived ship isn't instantly re-killed by the same volley.
+						this_player->invulnerable_ticks = 100;
+						for (int es = 0; es < ENEMY_SHOT_MAX; ++es)
+							enemyShotAvail[es] = 1;
+						soundQueue[3] = S_POWERUP;
+					}
+					else
+					{
+						if (!timedBattleMode)
+							levelTimer = false;
+						this_player->is_alive = false;
+						this_player->exploding_ticks = 60;
+						levelEnd = 40;
+						tempVolume = tyrMusicVolume;
+						soundQueue[1] = S_EXPLOSION_22;
+					}
 				}
 			}
 			else
@@ -1133,11 +1329,11 @@ void JE_drawShield(void)
 	if (twoPlayerMode && !galagaMode)
 	{
 		for (uint i = 0; i < COUNTOF(player); ++i)
-			JE_dBar3(VGAScreen, HUD_X(270), 60 + 134 * i, roundf(player[i].shield * 0.8f), 144);
+			JE_dBar3(VGAScreen, HUD_X(270), 60 + 134 * i, roundf(player[i].shield * 0.8f), 144, gaugeGradShield);
 	}
 	else
 	{
-		JE_dBar3(VGAScreen, HUD_X(270), 194, player[0].shield, 144);
+		JE_dBar3(VGAScreen, HUD_X(270), 194, player[0].shield, 144, gaugeGradShield);
 		if (player[0].shield != player[0].shield_max)
 		{
 			const uint y = 193 - (player[0].shield_max * 2);
@@ -1146,32 +1342,83 @@ void JE_drawShield(void)
 	}
 }
 
+// Endless reinforced hulls can exceed the 28-unit armour bar. Draw the overflow as stacked
+// "rollover" layers: each full 28 units rolls the bar over and the next chunk fills from the
+// bottom in a different colour gradient, so a heavily-reinforced hull reads as a stacked, multi-
+// hued bar. Layer palette bases are palette-relative (endless levels vary) -- tuned by eye.
+static void endlessDrawArmorBar(int armor)
+{
+	static const int layerCol[] = { 224, 112, 80, 176, 16, 48, 96, 32 };
+	int a = armor;
+	for (int layer = 0; a > 0 && layer < (int)COUNTOF(layerCol); ++layer)
+	{
+		const int seg = (a > 28) ? 28 : a;
+		JE_dBar3(VGAScreen, HUD_X(307), 194, seg, layerCol[layer], gaugeGradArmor);
+		a -= 28;
+	}
+}
+
 void JE_drawArmor(void)
 {
-	for (uint i = 0; i < COUNTOF(player); ++i)
-		if (player[i].armor > 28)
-			player[i].armor = 28;
+	// The 28 cap is the classic bar maximum; the endless reinforced hull legitimately exceeds it
+	// (drawn as rollover layers below), so don't clobber the real value in endless mode.
+	if (!endlessMode)
+		for (uint i = 0; i < COUNTOF(player); ++i)
+			if (player[i].armor > 28)
+				player[i].armor = 28;
 
 	if (twoPlayerMode && !galagaMode)
 	{
 		for (uint i = 0; i < COUNTOF(player); ++i)
-			JE_dBar3(VGAScreen, HUD_X(307), 60 + 134 * i, roundf(player[i].armor * 0.8f), 224);
+			JE_dBar3(VGAScreen, HUD_X(307), 60 + 134 * i, roundf(player[i].armor * 0.8f), 224, gaugeGradArmor);
+	}
+	else if (endlessMode)
+	{
+		endlessDrawArmorBar(player[0].armor);
 	}
 	else
 	{
-		JE_dBar3(VGAScreen, HUD_X(307), 194, player[0].armor, 224);
+		JE_dBar3(VGAScreen, HUD_X(307), 194, player[0].armor, 224, gaugeGradArmor);
 	}
 }
 
-void JE_doSP(JE_word x, JE_word y, JE_word num, JE_byte explowidth, JE_byte color) /* superpixels */
+bool superpixelClipActive = false;
+int superpixelClipX0, superpixelClipY0, superpixelClipX1, superpixelClipY1;
+
+void JE_setSPClip(int x0, int y0, int x1, int y1)
 {
-	for (temp = 0; temp < num; temp++)
+	superpixelClipActive = true;
+	superpixelClipX0 = x0;
+	superpixelClipY0 = y0;
+	superpixelClipX1 = x1;
+	superpixelClipY1 = y1;
+}
+
+void JE_clearSPClip(void)
+{
+	superpixelClipActive = false;
+}
+
+void JE_doSP(JE_word x, JE_word y, JE_word num, JE_byte explowidth, JE_byte color, bool classic_cap) /* superpixels */
+{
+	// classic_cap keeps this shower at the classic 101 limit regardless of extraSparks (the
+	// superspark weapon trails pass superSparkCapForSprite so each can stay classic-dense while
+	// explosions keep the big buffer). The shared spawn index just wraps sooner for these calls.
+	const unsigned int cap = (extraSparks && !classic_cap) ? MAX_SUPERPIXELS : SUPERPIXELS_CLASSIC;
+
+	// Local int counter, not the global JE_byte `temp`: `num` is a JE_word and callers can request
+	// well over 255 sparks (e.g. damage/2+3 on a big hit), which a byte counter can't reach -> it
+	// would wrap at 255 and loop forever. (The spark pool grew huge for Extra Sparks; see MAX_SUPERPIXELS.)
+	for (int sp = 0; sp < num; sp++)
 	{
 		JE_real tempr = mt_rand_lt1() * (2 * M_PI);
 		signed int tempy = roundf(cosf(tempr) * mt_rand_1() * explowidth);
 		signed int tempx = roundf(sinf(tempr) * mt_rand_1() * explowidth);
 
-		if (++last_superpixel >= MAX_SUPERPIXELS)
+		// Extra Sparks toggle: cap the ring buffer at the big limit or the classic 101. Only the
+		// SPAWN wrap honors the effective cap -- JE_drawSP still sweeps the whole array, so sparks
+		// already in flight past the classic cap animate out cleanly when the toggle is turned off.
+		if (++last_superpixel >= cap)
 			last_superpixel = 0;
 		superpixels[last_superpixel].x = tempx + x;
 		superpixels[last_superpixel].y = tempy + y;
@@ -1191,8 +1438,16 @@ void JE_drawSP(void)
 			superpixels[i].x += superpixels[i].delta_x;
 			superpixels[i].y += superpixels[i].delta_y;
 
-			if (superpixels[i].x < (unsigned)VGAScreen->w && superpixels[i].y < (unsigned)VGAScreen->h)
+			if (superpixels[i].x < (unsigned)VGAScreen->w && superpixels[i].y < (unsigned)VGAScreen->h
+			    && (!superpixelClipActive
+			        || (superpixels[i].x >= (unsigned)superpixelClipX0 && superpixels[i].x < (unsigned)superpixelClipX1
+			            && superpixels[i].y >= (unsigned)superpixelClipY0 && superpixels[i].y < (unsigned)superpixelClipY1)))
 			{
+				// Record for the render list so the spark interpolates smoothly at the
+				// display rate (constant velocity -> the per-tick delta is self-contained).
+				if (render_list_recording)
+					rl_rec_superpixel(superpixels[i].x, superpixels[i].y, superpixels[i].delta_x, superpixels[i].delta_y, superpixels[i].z, superpixels[i].color);
+
 				Uint8 *s = (Uint8 *)VGAScreen->pixels; /* screen pointer, 8-bit specific */
 				s += superpixels[i].y * VGAScreen->pitch;
 				s += superpixels[i].x;

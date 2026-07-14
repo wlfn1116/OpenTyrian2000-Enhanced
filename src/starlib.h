@@ -21,7 +21,14 @@
 
 #include "opentyr.h"
 
-void JE_starlib_main(void);
+#include "SDL.h"
+
+// Render one frame of the starfield into `target` at `scale`x supersampling.
+// scale == 1 is the classic path (draws to a vga_width x vga_height 8-bit surface,
+// erasing old star positions). scale > 1 draws the stars at sub-pixel positions
+// into a (vga_width*scale) x (vga_height*scale) buffer that the caller has cleared;
+// present_hi() then downscales it, so the flying stars move smoothly and antialias.
+void JE_starlib_main(float step, SDL_Surface *target, int scale);
 void JE_wackyCol(void);
 void JE_starlib_init(void);
 void JE_resetValues(void);

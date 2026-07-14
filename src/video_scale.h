@@ -33,9 +33,19 @@ struct Scalers
 };
 
 extern uint scaler;
-extern const struct Scalers scalers[];
+// Non-const: the "Native" entry's width/height track the live output size
+// (video.c refreshes them via scaler_set_native_size before any use).
+extern struct Scalers scalers[];
 extern const uint scalers_count;
 
 void set_scaler_by_name(const char *name);
+// Nearest-neighbour ("plain") scaler queries — the only scalers allowed while
+// supersampling is enabled (the hi path bypasses scaler algorithms in-game).
+bool scaler_is_plain(uint index);
+uint scaler_plain_equivalent(uint index);
+// "Native" fit-to-output scaler: no fixed factor — it renders at the exact
+// output size (any ratio), one texel per screen pixel.
+bool scaler_is_native(uint index);
+void scaler_set_native_size(int w, int h);
 
 #endif /* VIDEO_SCALE_H */

@@ -36,8 +36,11 @@ boss_bar_t;
 
 extern boss_bar_t boss_bar[2];
 
+extern float debug_interp_alpha;  // last presented interpolation fraction
+
 extern char tempStr[31];
 extern JE_byte itemAvail[9][10], itemAvailMax[9];
+extern JE_word levelEnemyFrequency;
 
 void JE_createNewEventEnemy(JE_byte enemytypeofs, JE_word enemyoffset, Sint16 uniqueShapeTableI);
 
@@ -62,6 +65,7 @@ bool titleScreen(void);
 bool newGame(void);
 bool newSuperArcadeGame(unsigned int i);
 bool newSuperTyrianGame(void);
+bool newEndlessGame(void);
 void JE_readTextSync(void);
 void JE_displayText(void);
 
@@ -70,11 +74,17 @@ void JE_eventSystem(void);
 
 void draw_boss_bar(void);
 
+// Endless kill-fire HUD collision avoidance (see JE_inGameDisplays, mainint.c): how far a
+// bottom-right HUD element must shift to clear the currently-shown boss bar, if any.
+int  boss_bar_hud_left_shift(int hudRightX);  // px to shift LEFT for a right-side vertical bar
+bool boss_bar_hud_needs_up_shift(void);       // true while a BOTTOM horizontal bar is shown
+
 // Variable-timestep player ship (experimental; see render notes in tyrian2.c).
 extern bool vt_ship;       // runtime toggle for render-rate ship simulation
 bool vt_ship_owns(void);   // true when VT currently controls the player ship
 void vt_ship_step(float dt);  // advance the ship one displayed frame (dt in ticks)
 void vt_ship_tick(void);   // per-35Hz-tick reconcile (external forces / reposition)
 void vt_ship_shot_delta(int player_index, int *out_dx, int *out_dy);  // inter-tick ship move for tracking shots
+void vt_ship_twiddle_dir(int player_index, int *out_dx, int *out_dy);  // mouse steering dir for twiddle codes
 
 #endif /* TYRIAN2_H */

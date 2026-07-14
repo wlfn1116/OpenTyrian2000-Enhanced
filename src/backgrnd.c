@@ -27,15 +27,106 @@
 
 #include <assert.h>
 
+// Map tiles are 24x24px. Rows draw two extra tiles beyond the playfield width so
+// coverage is guaranteed at any horizontal scroll: a single extra tile left an
+// uncovered strip on the right edge (intermittent black bars) when the scroll
+// was negative.
+#define BG_TILE_W 24
+#define BG_TILE_COUNT (PLAYFIELD_WIDTH / BG_TILE_W + 2)
+
 /*Special Background 2 and Background 3*/
 
 /*Back Pos 3*/
 JE_word backPos, backPos2, backPos3;
 JE_word backMove, backMove2, backMove3;
 
+// Endless overclock/warp: number of EXTRA scroll sub-steps to apply this sim tick, on top of the
+// normal per-tick scroll. Computed once per tick in tyrian2.c from endlessExtraScrollSteps() and
+// reused by every scroll layer (bg 1 in tyrian2.c, bg 2/3 here) and by the enemy scroll-tracking
+// in JE_drawEnemy, so the whole level fast-forwards in lockstep. 0 when the modifier is inactive.
+int endlessScrollExtraThisTick = 0;
+
+// Endless SMOOTH scroll boost: the extra scroll (px) applied to each background layer this
+// tick, computed once per tick in tyrian2.c via endlessScrollExtraPx() (fractional carry, so
+// the boosted scroll advances by a near-constant px/tick instead of whole `backMove` lumps ->
+// no velocity pulse). Layers 2/3 read these in draw_background_* here; the enemy scroll-track
+// and rep_explosions read them in tyrian2.c so they ride the same smooth delta. 0 when off.
+int endlessScrollExtraPx1 = 0, endlessScrollExtraPx2 = 0, endlessScrollExtraPx3 = 0;
+
 // See backgrnd.h: true during the sim tick (advance scroll as normal), false
 // during interpolated re-draws so the layer can be re-rendered without moving.
 bool background_advance = true;
+
+// See backgrnd.h. bgScrollDeltaY holds the true per-tick vertical scroll of each layer;
+// bgMarginRows widens the interpolation's bottom margin under a speed modifier.
+int bgScrollDeltaY[4] = { 0, 0, 0, 0 };
+int bgMarginRows = 1;
+
+// See backgrnd.h. Un-floored parallax offsets captured at each layer's draw site:
+// bg_layer_dx = this tick's FLOAT scroll delta, bg_layer_frac = the floored-away fraction.
+float mapXOfs_f, mapX2Ofs_f, mapX3Ofs_f;
+// Un-floored mirrors of oldMapXOfs / oldMapX3Ofs (the previous tick's offsets, reused as
+// the parallax anchor for some enemy groups). Set beside their integer versions so
+// enemies on those anchors get the matching sub-pixel fraction (see tyrian2.c blit_enemy).
+float oldMapXOfs_f, oldMapX3Ofs_f;
+float bg_layer_dx[4]   = { 0.0f, 0.0f, 0.0f, 0.0f };  // index 1..3
+float bg_layer_frac[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static float bg_layer_ofs_prev[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+// VERTICAL counterparts of bg_layer_dx/frac: bg_layer_dy (FLOAT scroll rate) + bg_layer_yfrac
+// (sub-pixel remainder), gated by bg_smooth_y_active. See backgrnd.h.
+float bg_layer_dy[4]    = { 0.0f, 0.0f, 0.0f, 0.0f };
+float bg_layer_yfrac[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+bool  bg_smooth_y_active = false;
+
+// this-tick (non-lagged) vertical scroll sub-pixel fraction per layer [1..3]. bg_layer_yfrac
+// above is lagged one tick to match the BACKGROUND rows (recorded PRE-advance); scroll-tracked
+// ENTITIES (enemies + their HP bars) are recorded after this tick's scroll advance, so they need
+// this current fraction instead, or they jump 1px against the smooth background on the ticks the
+// integer scroll steps an extra pixel. Set in tyrian2.c beside the publish; 0 when no modifier.
+float bg_layer_yfrac_now[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+// Record layer L's float scroll delta and fractional offset for this tick's draw. `cur_f`
+// is the un-floored offset, `cur_int` the whole-pixel one the row was recorded at. A large
+// jump (level load / warp) snaps the delta to 0, like the render list's own >40px guard.
+static void bg_set_layer_dx(int layer, float cur_f, int cur_int)
+{
+	float d = cur_f - bg_layer_ofs_prev[layer];
+	if (d > 12.0f || d < -12.0f)
+		d = 0.0f;
+	bg_layer_dx[layer] = d;
+	bg_layer_frac[layer] = cur_f - (float)cur_int;
+	bg_layer_ofs_prev[layer] = cur_f;
+}
+
+// Previous draw-time (mapY, backPos) per layer, used to derive bgScrollDeltaY. The
+// absolute downward scroll between two consecutive draws is
+//   (mapY_prev - mapY_now) * 28 + (backPos_now - backPos_prev)
+// which recovers the whole-tile motion (mapY steps) that a bare screen-position diff
+// loses. Works regardless of whether a layer advances before or after it draws, because
+// it always compares the state at successive record points. mapY/backPos are unsigned
+// (JE_word); snapshot them as int. A level load / BKwrap makes the diff wild -> snapped.
+static int  bgPrevMapY[4]    = { 0, 0, 0, 0 };
+static int  bgPrevBackPos[4] = { 0, 0, 0, 0 };
+static bool bgPrevValid[4]   = { false, false, false, false };
+
+static void bg_update_scroll_delta(int layer, int mapY_now, int backPos_now)
+{
+	if (bgPrevValid[layer])
+	{
+		int d = (bgPrevMapY[layer] - mapY_now) * 28 + (backPos_now - bgPrevBackPos[layer]);
+		if (d < 0 || d > 300)  // level reset / map wrap: not a real scroll step -> snap
+			d = 0;
+		bgScrollDeltaY[layer] = d;
+	}
+	else
+	{
+		bgScrollDeltaY[layer] = 0;
+	}
+	bgPrevMapY[layer] = mapY_now;
+	bgPrevBackPos[layer] = backPos_now;
+	bgPrevValid[layer] = true;
+}
 
 /*Main Maps*/
 JE_word mapX, mapY, mapX2, mapX3, mapY2, mapY3;
@@ -52,7 +143,7 @@ void JE_darkenBackground(JE_word neat)  /* wild detail level */
 	Uint8 *s = VGAScreen->pixels; /* screen pointer, 8-bit specific */
 	int x, y;
 	
-	s += 24;
+	s += PLAYFIELD_LEFT;
 	
 	for (y = 184; y; y--)
 	{
@@ -76,12 +167,8 @@ void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map)
 	      *pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	      *pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
 	
-	// Use two extra tiles to ensure the playfield is fully covered when the
-		// horizontal scroll position is negative.  A single extra tile left a
-		// small uncovered strip on the right edge of the playfield, resulting in
-		// intermittent black bars.
-	const int tile_count = PLAYFIELD_WIDTH / 24 + 2;
-	const int row_width = tile_count * 24;
+	const int tile_count = BG_TILE_COUNT;
+	const int row_width = tile_count * BG_TILE_W;
 	for (int y = 0; y < 28; y++)
 	{
 		// not drawing on screen yet; skip y
@@ -131,10 +218,8 @@ void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map)
 	      *pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	      *pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
 	
-	// See comment in blit_background_row() above for rationale on the
-		// additional tile.
-	const int tile_count = PLAYFIELD_WIDTH / 24 + 2;
-	const int row_width = tile_count * 24;
+	const int tile_count = BG_TILE_COUNT;
+	const int row_width = tile_count * BG_TILE_W;
 	for (int y = 0; y < 28; y++)
 	{
 		// not drawing on screen yet; skip y
@@ -173,22 +258,94 @@ void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map)
 	}
 }
 
+// Supersampled tile row (render-list replay only; see backgrnd.h). One loop serves
+// both the copy and blend ops — the pixel math matches the 1x blitters above.
+void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map, int scale, bool blend)
+{
+	assert(surface->format->BitsPerPixel == 8);
+
+	const int tile_count = BG_TILE_COUNT;
+
+	for (int ty = 0; ty < 28; ++ty)
+	{
+		const int hy = y + ty * scale;
+		if (hy >= surface->h)
+			return;  // rows only grow downward
+
+		int by0 = hy < 0 ? 0 : hy;
+		int by1 = hy + scale;
+		if (by1 > surface->h)
+			by1 = surface->h;
+		if (by1 <= by0)
+			continue;  // this tile row is fully above the top edge
+
+		int hx = x;
+		for (int tile = 0; tile < tile_count; ++tile)
+		{
+			const Uint8 *data = map[tile];
+
+			if (data == NULL)  // no tile; skip
+			{
+				hx += BG_TILE_W * scale;
+				continue;
+			}
+
+			data += ty * BG_TILE_W;
+
+			for (int sx = 0; sx < BG_TILE_W; ++sx, ++data, hx += scale)
+			{
+				const Uint8 d = *data;
+				if (d == 0)
+					continue;  // transparent
+
+				int bx0 = hx < 0 ? 0 : hx;
+				int bx1 = hx + scale;
+				if (bx1 > surface->w)
+					bx1 = surface->w;
+				if (bx1 <= bx0)
+					continue;
+
+				for (int yy = by0; yy < by1; ++yy)
+				{
+					Uint8 *p = (Uint8 *)surface->pixels + yy * surface->pitch + bx0;
+					if (!blend)
+					{
+						for (int xx = bx0; xx < bx1; ++xx)
+							*p++ = d;
+					}
+					else
+					{
+						for (int xx = bx0; xx < bx1; ++xx, ++p)
+							*p = (d & 0xf0) | (((*p & 0x0f) + (d & 0x0f)) / 2);
+					}
+				}
+			}
+		}
+	}
+}
+
 void draw_background_1(SDL_Surface *surface)
 {
 	SDL_FillRect(surface, NULL, 0);
-	
-	// Two extra tiles guarantee full coverage regardless of horizontal
-		// scroll offset.
-	const int tile_count = PLAYFIELD_WIDTH / 24 + 2;
+
+	const int tile_count = BG_TILE_COUNT;
 	Uint8** map = (Uint8**)mapYPos + mapXbpPos - tile_count;
 
+	bg_update_scroll_delta(1, (int)mapY, (int)backPos);
+
 	rl_current_id = RL_ID_BG_BASE + 1;  // tag rows for cross-frame interpolation
+	bg_set_layer_dx(1, mapXOfs_f, mapXOfs);  // float delta + frac for smooth horizontal pan
 	for (int i = -1; i < 7; i++)
 	{
 		blit_background_row(surface, mapXPos + PLAYFIELD_X_SHIFT, (i * 28) + backPos, map);
 
 		map += 14;
 	}
+	// Extra off-screen row(s) so the interpolation shift (up to a full tick's scroll) can't
+	// uncover the bottom; reuses the last row's tiles (map - 14) to avoid reading past the map.
+	// bgMarginRows grows under a speed modifier (scroll can exceed one tile per tick).
+	for (int m = 0; m < bgMarginRows; ++m)
+		blit_background_row(surface, mapXPos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos, map - 14);
 	rl_current_id = 0;
 }
 
@@ -196,9 +353,7 @@ void draw_background_2(SDL_Surface *surface)
 {
 	if (background_advance && map2YDelayMax > 1 && backMove2 < 2)
 		backMove2 = (map2YDelay == 1) ? 1 : 0;
-	// Two extra tiles guarantee full coverage regardless of horizontal
-		// scroll offset.
-	const int tile_count = PLAYFIELD_WIDTH / 24 + 2;
+	const int tile_count = BG_TILE_COUNT;
 	if (background2 != 0)
 	{
 		// water effect combines background 1 and 2 by synchronizing the x coordinate
@@ -206,16 +361,23 @@ void draw_background_2(SDL_Surface *surface)
 
 		Uint8** map = (Uint8**)mapY2Pos + (smoothies[1] ? mapXbpPos : mapX2bpPos) - tile_count;
 
+		bg_update_scroll_delta(2, (int)mapY2, (int)backPos2);
+
 		rl_current_id = RL_ID_BG_BASE + 2;
+		// smoothies[1] syncs layer 2 to layer 1's X phase (see x above), so use that offset.
+		bg_set_layer_dx(2, smoothies[1] ? mapXOfs_f : mapX2Ofs_f, smoothies[1] ? mapXOfs : mapX2Ofs);
 		for (int i = -1; i < 7; i++)
 		{
 			blit_background_row(surface, x, (i * 28) + backPos2, map);
 
 			map += 14;
 		}
+		// Extra bottom margin row(s) for the interpolation (see draw_background_1).
+		for (int m = 0; m < bgMarginRows; ++m)
+			blit_background_row(surface, x, ((7 + m) * 28) + backPos2, map - 14);
 		rl_current_id = 0;
 	}
-	
+
 	/*Set Movement of background*/
 	if (background_advance && --map2YDelay == 0)
 	{
@@ -228,6 +390,20 @@ void draw_background_2(SDL_Surface *surface)
 			backPos2 -= 28;
 			mapY2--;
 			mapY2Pos -= 14;  /*Map Width*/
+		}
+	}
+
+	// Endless SMOOTH overclock: advance layer 2 by its fractional-carried extra px (computed once
+	// per tick in tyrian2.c), matching layer 1/event pace with the parallax ratio preserved but no
+	// velocity pulse. Ungated by the Y-delay to mirror layer 1; the wrap can cross several tiles.
+	if (background_advance)
+	{
+		backPos2 += endlessScrollExtraPx2;
+		while (backPos2 > 27)
+		{
+			backPos2 -= 28;
+			mapY2--;
+			mapY2Pos -= 14;
 		}
 	}
 }
@@ -237,18 +413,22 @@ void draw_background_2_blend(SDL_Surface *surface)
 	if (background_advance && map2YDelayMax > 1 && backMove2 < 2)
 		backMove2 = (map2YDelay == 1) ? 1 : 0;
 	
-	// Two extra tiles guarantee full coverage regardless of horizontal
-		// scroll offset.
-	const int tile_count = PLAYFIELD_WIDTH / 24 + 2;
+	const int tile_count = BG_TILE_COUNT;
 	Uint8** map = (Uint8**)mapY2Pos + mapX2bpPos - tile_count;
 
+	bg_update_scroll_delta(2, (int)mapY2, (int)backPos2);
+
 	rl_current_id = RL_ID_BG_BASE + 2;
+	bg_set_layer_dx(2, mapX2Ofs_f, mapX2Ofs);  // blend variant always draws at mapX2Pos
 	for (int i = -1; i < 7; i++)
 	{
 		blit_background_row_blend(surface, mapX2Pos + PLAYFIELD_X_SHIFT, (i * 28) + backPos2, map);
 
 		map += 14;
 	}
+	// Extra bottom margin row(s) for the interpolation (see draw_background_1).
+	for (int m = 0; m < bgMarginRows; ++m)
+		blit_background_row_blend(surface, mapX2Pos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos2, map - 14);
 	rl_current_id = 0;
 	
 	/*Set Movement of background*/
@@ -263,6 +443,18 @@ void draw_background_2_blend(SDL_Surface *surface)
 			backPos2 -= 28;
 			mapY2--;
 			mapY2Pos -= 14;  /*Map Width*/
+		}
+	}
+
+	// Endless SMOOTH overclock: extra px to match layer 1 and the event pointer (see draw_background_2).
+	if (background_advance)
+	{
+		backPos2 += endlessScrollExtraPx2;
+		while (backPos2 > 27)
+		{
+			backPos2 -= 28;
+			mapY2--;
+			mapY2Pos -= 14;
 		}
 	}
 }
@@ -280,31 +472,132 @@ void draw_background_3(SDL_Surface *surface)
 			mapY3--;
 			mapY3Pos -= 15;   /*Map Width*/
 		}
+
+		// Endless SMOOTH overclock: extra px to match layer 1/2 and the event pointer (see above).
+		backPos3 += endlessScrollExtraPx3;
+		while (backPos3 > 27)
+		{
+			backPos3 -= 28;
+			mapY3--;
+			mapY3Pos -= 15;
+		}
 	}
 
-	// Two extra tiles guarantee full coverage regardless of horizontal
-		// scroll offset.
-	const int tile_count = PLAYFIELD_WIDTH / 24 + 2;
+	const int tile_count = BG_TILE_COUNT;
 	Uint8** map = (Uint8**)mapY3Pos + mapX3bpPos - tile_count;
 
+	bg_update_scroll_delta(3, (int)mapY3, (int)backPos3);
+
 	rl_current_id = RL_ID_BG_BASE + 3;
+	bg_set_layer_dx(3, mapX3Ofs_f, mapX3Ofs);  // background3x1 already folds this onto mapXOfs
 	for (int i = -1; i < 7; i++)
 	{
-		// mapX3Pos already includes a 18-pixel left shift to correct the
-		// cloud layer's widescreen misalignment.
+		// Layer 3 shares PLAYFIELD_X_SHIFT with layers 1/2; no per-layer correction.
 		blit_background_row(surface, mapX3Pos + PLAYFIELD_X_SHIFT, (i * 28) + backPos3, map);
 
 		map += 15;
 	}
+	// Extra bottom margin row(s) for the interpolation (see draw_background_1; bg3 rows
+	// are 15 map entries wide).
+	for (int m = 0; m < bgMarginRows; ++m)
+		blit_background_row(surface, mapX3Pos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos3, map - 15);
 	rl_current_id = 0;
 }
 
-void JE_filterScreen(JE_shortint col, JE_shortint int_)
+// Pixel-only body of JE_filterScreen: `col` recolours each playfield pixel's palette
+// bank (high nibble), `int_` adjusts brightness (low nibble), -99 skips a component.
+// No fade side effects, so the render list can replay it on interpolated frames.
+void JE_filterScreenApply(SDL_Surface *surface, JE_shortint col, JE_shortint int_)
 {
 	Uint8 *s = NULL; /* screen pointer, 8-bit specific */
 	int x, y;
 	unsigned int temp;
-	
+
+	if (col != -99 && filtrationAvail)
+	{
+		s = surface->pixels;
+		s += PLAYFIELD_LEFT;
+
+		col <<= 4;
+
+		for (y = 184; y; y--)
+		{
+			for (x = PLAYFIELD_WIDTH; x; x--)
+			{
+				*s = col | (*s & 0x0f);
+				s++;
+			}
+			s += surface->pitch - PLAYFIELD_WIDTH;
+		}
+	}
+
+	if (int_ != -99 && explosionTransparent)
+	{
+		s = surface->pixels;
+		s += PLAYFIELD_LEFT;
+
+		for (y = 184; y; y--)
+		{
+			for (x = PLAYFIELD_WIDTH; x; x--)
+			{
+				temp = (*s & 0x0f) + int_;
+				*s = (*s & 0xf0) | (temp >= 0x1f ? 0 : (temp >= 0x0f ? 0x0f : temp));
+				s++;
+			}
+			s += surface->pitch - PLAYFIELD_WIDTH;
+		}
+	}
+}
+
+// JE_filterScreenApply for an NxN supersampled surface: identical passes over the
+// scaled playfield region.
+void filter_screen_apply_scaled(SDL_Surface *surface, JE_shortint col, JE_shortint int_, int scale)
+{
+	const int left = PLAYFIELD_LEFT * scale;
+	const int width = PLAYFIELD_WIDTH * scale;
+	const int rows = 184 * scale;
+	Uint8 *s = NULL;
+	int x, y;
+	unsigned int temp;
+
+	if (col != -99 && filtrationAvail)
+	{
+		s = (Uint8 *)surface->pixels + left;
+
+		col <<= 4;
+
+		for (y = rows; y; y--)
+		{
+			for (x = width; x; x--)
+			{
+				*s = col | (*s & 0x0f);
+				s++;
+			}
+			s += surface->pitch - width;
+		}
+	}
+
+	if (int_ != -99 && explosionTransparent)
+	{
+		s = (Uint8 *)surface->pixels + left;
+
+		for (y = rows; y; y--)
+		{
+			for (x = width; x; x--)
+			{
+				temp = (*s & 0x0f) + int_;
+				*s = (*s & 0xf0) | (temp >= 0x1f ? 0 : (temp >= 0x0f ? 0x0f : temp));
+				s++;
+			}
+			s += surface->pitch - width;
+		}
+	}
+}
+
+void JE_filterScreen(JE_shortint col, JE_shortint int_)
+{
+	// Advance the fade animation exactly once per sim tick; must not run on the
+	// render list's replay path (see JE_filterScreenApply).
 	if (filterFade)
 	{
 		levelBrightness += levelBrightnessChg;
@@ -320,41 +613,8 @@ void JE_filterScreen(JE_shortint col, JE_shortint int_)
 			levelBrightness = -99;
 		}
 	}
-	
-	if (col != -99 && filtrationAvail)
-	{
-		s = VGAScreen->pixels;
-		s += 24;
-		
-		col <<= 4;
-		
-		for (y = 184; y; y--)
-		{
-			for (x = PLAYFIELD_WIDTH; x; x--)
-			{
-				*s = col | (*s & 0x0f);
-				s++;
-			}
-			s += VGAScreen->pitch - PLAYFIELD_WIDTH;
-		}
-	}
-	
-	if (int_ != -99 && explosionTransparent)
-	{
-		s = VGAScreen->pixels;
-		s += 24;
-		
-		for (y = 184; y; y--)
-		{
-			for (x = PLAYFIELD_WIDTH; x; x--)
-			{
-				temp = (*s & 0x0f) + int_;
-				*s = (*s & 0xf0) | (temp >= 0x1f ? 0 : (temp >= 0x0f ? 0x0f : temp));
-				s++;
-			}
-			s += VGAScreen->pitch - PLAYFIELD_WIDTH;
-		}
-	}
+
+	JE_filterScreenApply(VGAScreen, col, int_);
 }
 
 void JE_checkSmoothies(void)
@@ -516,13 +776,159 @@ void blur_filter(SDL_Surface *dst, SDL_Surface *src)
 	}
 }
 
-/* Background Starfield.
- *
- * Each star is an independent (x column, y row) point. y is a float so the field
- * can drift smoothly at any speed, and ONLY y is advanced/interpolated — x is
- * fixed — so stars never bleed sideways. (The old model packed both into one
- * linear byte offset and interpolated it, which dragged a fraction of a row into
- * the column and made stars streak diagonally.) */
+/*
+ * Supersampled smoothie filters — same pixel math as the 1x filters on an NxN
+ * buffer; see backgrnd.h for the spatial-scale and stability notes. The 1x lava
+ * and water filters scan bottom-up, so the "row below" read sees this frame's
+ * value while the "row above" read sees the previous frame's — the scaled
+ * versions keep that scan order (and therefore those dynamics) exactly.
+ */
+void lava_filter_scaled(SDL_Surface *dst, SDL_Surface *src, int scale)
+{
+	assert(src->format->BitsPerPixel == 8 && dst->format->BitsPerPixel == 8);
+
+	const int W = vga_width * scale;
+	const int H = 185 * scale;
+	const int dst_pitch = dst->pitch;
+	const int src_pitch = src->pitch;
+	const int row_step = dst_pitch * scale;  // one 1x row's distance in the hi buffer
+	Uint8 *const dst_px = (Uint8 *)dst->pixels;
+	const Uint8 *const src_px = (const Uint8 *)src->pixels;
+
+	for (int y = H - 1; y >= 0; --y)
+	{
+		Uint8 *const dp = dst_px + y * dst_pitch;
+		const Uint8 *const sp = src_px + y * src_pitch;
+		const int row1 = (y / scale) * vga_width;  // 1x linear index of this row
+
+		for (int x = W - 1; x >= 0; --x)
+		{
+			// Waver from the 1x linear index, so the wobble pattern has the same
+			// spatial frequency as the original.
+			const int w1 = row1 + x / scale;
+			const int waver = (abs(((w1 >> 9) & 0x0f) - 8) - 1) * scale;
+
+			int xs = x + waver;
+			if (xs < 0)
+				xs = 0;
+			else if (xs >= W)
+				xs = W - 1;
+
+			// Average of source (2x), the current frame's row below, and the
+			// previous frame's row above (all wavered); hue forced red.
+			int value = (sp[xs] & 0x0f) * 2;
+			value += dp[xs + row_step] & 0x0f;
+			if (y - scale >= 0)
+				value += dp[xs - row_step] & 0x0f;
+
+			dp[x] = (Uint8)((value / 4) | 0x70);
+		}
+	}
+}
+
+void water_filter_scaled(SDL_Surface *dst, SDL_Surface *src, int scale)
+{
+	assert(src->format->BitsPerPixel == 8 && dst->format->BitsPerPixel == 8);
+
+	const Uint8 hue = smoothie_data[1] << 4;
+
+	const int W = vga_width * scale;
+	const int H = 185 * scale;
+	const int dst_pitch = dst->pitch;
+	const int src_pitch = src->pitch;
+	const int row_step = dst_pitch * scale;  // one 1x row's distance in the hi buffer
+	Uint8 *const dst_px = (Uint8 *)dst->pixels;
+	const Uint8 *const src_px = (const Uint8 *)src->pixels;
+
+	for (int y = H - 1; y >= 0; --y)
+	{
+		Uint8 *const dp = dst_px + y * dst_pitch;
+		const Uint8 *const sp = src_px + y * src_pitch;
+		const int row1 = (y / scale) * vga_width;
+
+		for (int x = W - 1; x >= 0; --x)
+		{
+			// Pixel is copied from source if not blue; otherwise averaged with the
+			// current frame's row below (wavered), recoloured to the level's hue.
+			if ((sp[x] & 0x30) == 0)
+			{
+				dp[x] = sp[x];
+			}
+			else
+			{
+				const int w1 = row1 + x / scale;
+				const int waver = (abs(((w1 >> 10) & 0x07) - 4) - 1) * scale;
+
+				int xs = x + waver;
+				if (xs < 0)
+					xs = 0;
+				else if (xs >= W)
+					xs = W - 1;
+
+				Uint8 value = sp[x] & 0x0f;
+				value += dp[xs + row_step] & 0x0f;
+				dp[x] = (Uint8)((value / 2) | hue);
+			}
+		}
+	}
+}
+
+void iced_blur_filter_scaled(SDL_Surface *dst, SDL_Surface *src, int scale)
+{
+	assert(src->format->BitsPerPixel == 8 && dst->format->BitsPerPixel == 8);
+
+	const int W = vga_width * scale;
+	const int H = 184 * scale;
+
+	Uint8 *dst_pixel = dst->pixels;
+	const Uint8 *src_pixel = src->pixels;
+
+	for (int y = 0; y < H; ++y)
+	{
+		for (int x = 0; x < W; ++x)
+		{
+			// Average of source and previous-frame destination; hue icy blue.
+			const Uint8 value = (*src_pixel & 0x0f) + (*dst_pixel & 0x0f);
+			*dst_pixel = (value / 2) | 0x80;
+
+			++dst_pixel;
+			++src_pixel;
+		}
+
+		dst_pixel += (dst->pitch - W);
+		src_pixel += (src->pitch - W);
+	}
+}
+
+void blur_filter_scaled(SDL_Surface *dst, SDL_Surface *src, int scale)
+{
+	assert(src->format->BitsPerPixel == 8 && dst->format->BitsPerPixel == 8);
+
+	const int W = vga_width * scale;
+	const int H = 184 * scale;
+
+	Uint8 *dst_pixel = dst->pixels;
+	const Uint8 *src_pixel = src->pixels;
+
+	for (int y = 0; y < H; ++y)
+	{
+		for (int x = 0; x < W; ++x)
+		{
+			// Average of source and previous-frame destination; source hue kept.
+			const Uint8 value = (*src_pixel & 0x0f) + (*dst_pixel & 0x0f);
+			*dst_pixel = (value / 2) | (*src_pixel & 0xf0);
+
+			++dst_pixel;
+			++src_pixel;
+		}
+
+		dst_pixel += (dst->pitch - W);
+		src_pixel += (src->pitch - W);
+	}
+}
+
+/* Background Starfield. Each star is an (x column, float y row) point; only y is
+ * advanced/interpolated — x stays fixed — so stars can never smear sideways. */
 typedef struct
 {
 	int x;        // column (constant for a star's lifetime)
@@ -531,20 +937,31 @@ typedef struct
 	Uint8 color;
 } StarfieldStar;
 
-#define MAX_STARS 100
+#define MAX_STARS 330  // sized so on-screen density stays constant with stars respawning above the top edge
 #define STARFIELD_HUE 0x90
-#define STARFIELD_WRAP    184  // rows; star wraps back to the top past this
-#define STARFIELD_VISIBLE 177  // rows; star is only drawn above this (keeps it out of the HUD)
+#define STARFIELD_WRAP    184  // rows; star recycles once it drifts past this (the playfield bottom edge)
+#define STARFIELD_VISIBLE 184  // rows; stars draw above this. Matches the 184-row playfield so they
+                               // fill it to the bottom (a shorter value leaves a black stripe on space levels).
 
-// rows/tick per unit of (speed + move_speed). The speed knob: lower = slower.
-// 1.0 == the original game's speed (which the rewrite now renders smoothly,
-// without the old diagonal-streak bug that made it look far faster than it was).
+// Recycled stars respawn in a band just ABOVE the visible top edge (negative rows)
+// so they scroll smoothly into view instead of popping in at row 0. Respawn row is
+// -(MIN + a rotating offset in [0, SPREAD)).
+#define STARFIELD_SPAWN_MIN    4
+#define STARFIELD_SPAWN_SPREAD 32
+
+// rows/tick per unit of (speed + move_speed); 1.0 == the original game's speed.
 #define STARFIELD_SPEED_SCALE 1.0f
 static StarfieldStar starfield_stars[MAX_STARS];
 int starfield_speed;
+// Rotates the above-screen respawn height so consecutive recycles stagger across the
+// spawn band instead of clustering at one height. Deterministic / RNG-free -- the
+// per-tick starfield must never touch mt_rand (that would perturb the gameplay RNG
+// stream the demos depend on).
+static int starfield_spawn_phase;
 
 void initialize_starfield(void)
 {
+	starfield_spawn_phase = 0;
 	for (int i = MAX_STARS - 1; i >= 0; --i)
 	{
 		starfield_stars[i].x = mt_rand() % vga_width;
@@ -554,9 +971,8 @@ void initialize_starfield(void)
 	}
 }
 
-// Draw a single star (center pixel plus a dimmer halo) at column x, row y.
-// Factored out so the render list can re-draw stars during replay. Bounds are
-// checked per axis so a star can't wrap a pixel into the neighbouring row.
+// Draw one star (center pixel plus dimmer halo); factored out for render-list replay.
+// Bounds are checked per axis so halo pixels can't wrap into the neighbouring row.
 void draw_starfield_star(SDL_Surface* surface, int x, int y, Uint8 color)
 {
 	if (x < 0 || x >= surface->w || y < 0 || y >= STARFIELD_VISIBLE)
@@ -583,6 +999,48 @@ void draw_starfield_star(SDL_Surface* surface, int x, int y, Uint8 color)
 	}
 }
 
+// One scale x scale block of star light: written only over black pixels, like the
+// per-pixel check in draw_starfield_star.
+static void star_block(SDL_Surface *surface, int x, int y, Uint8 color, int scale)
+{
+	int x0 = x < 0 ? 0 : x;
+	int y0 = y < 0 ? 0 : y;
+	int x1 = x + scale, y1 = y + scale;
+	if (x1 > surface->w)
+		x1 = surface->w;
+	if (y1 > surface->h)
+		y1 = surface->h;
+
+	for (int yy = y0; yy < y1; ++yy)
+	{
+		Uint8 *p = (Uint8 *)surface->pixels + yy * surface->pitch + x0;
+		for (int xx = x0; xx < x1; ++xx, ++p)
+		{
+			if (*p == 0)
+				*p = color;
+		}
+	}
+}
+
+void draw_starfield_star_scaled(SDL_Surface* surface, int x, int y, Uint8 color, int scale)
+{
+	// Same visibility rule as the 1x draw, in HI coordinates. The interpolated row
+	// lands on the 1/scale-pixel grid, which is the whole point: slow stars glide.
+	if (x < 0 || x >= surface->w || y < 0 || y >= STARFIELD_VISIBLE * scale)
+		return;
+
+	star_block(surface, x, y, color, scale);
+
+	// If star is bright enough, draw the surrounding halo blocks
+	if (color - 4 >= STARFIELD_HUE)
+	{
+		star_block(surface, x + scale, y, color - 4, scale);
+		star_block(surface, x - scale, y, color - 4, scale);
+		star_block(surface, x, y + scale, color - 4, scale);
+		star_block(surface, x, y - scale, color - 4, scale);
+	}
+}
+
 void update_and_draw_starfield(SDL_Surface* surface, int move_speed)
 {
 	for (int i = MAX_STARS-1; i >= 0; --i)
@@ -593,14 +1051,19 @@ void update_and_draw_starfield(SDL_Surface* surface, int move_speed)
 		const float dy = (star->speed + move_speed) * STARFIELD_SPEED_SCALE;
 		star->y += dy;
 
-		// dy passed to the render list is this tick's row motion, for smooth
-		// interpolation. On a wrap, pass 0 so the replay snaps to the new
-		// position instead of streaking across the whole screen.
+		// Record this tick's row motion for interpolation; on a wrap pass 0 so the
+		// replay snaps to the new position instead of streaking across the screen.
 		float rec_dy = dy;
 		if (star->y >= STARFIELD_WRAP)
 		{
-			star->y -= STARFIELD_WRAP;
-			rec_dy = 0.0f;
+			// Respawn a little ABOVE the visible top edge (negative row) rather than at
+			// row 0, so the star drifts smoothly into view instead of popping in and
+			// holding there for the wrap tick. It stays invisible (y < 0) through the
+			// snap and only crosses the top edge on a normal moving tick, so the
+			// interpolator slides it in mid-motion -- no "frozen at the top" blip.
+			star->y = -(float)(STARFIELD_SPAWN_MIN + (starfield_spawn_phase % STARFIELD_SPAWN_SPREAD));
+			starfield_spawn_phase += 13;  // step coprime with SPREAD -> even coverage of the band
+			rec_dy = 0.0f;                // snap on the wrap; the star is off-screen so nothing streaks
 		}
 
 		draw_starfield_star(surface, star->x, (int)(star->y + 0.5f), star->color);

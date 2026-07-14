@@ -39,15 +39,12 @@ JE_word tyrMusicVolume, fxVolume;
 const JE_word fxPlayVol = 4;
 JE_word tempVolume;
 
-// Render-rate cap: maximum frames *presented* per second.
-//   0 = uncapped (or paced by vsync when that is enabled)
-// This no longer affects the simulation, which always advances at the fixed
-// canonical rate below regardless of how fast we present.
+// Render cap: max frames *presented* per second; 0 = uncapped (or vsync-paced).
+// Does not affect the simulation, which always advances at SIM_FPS below.
 int fps_cap = 0;
 
-// Canonical simulation rate. The original game timed everything against a
-// ~35Hz logic tick (further subdivided by frameCountMax); keeping this fixed
-// is what makes gameplay speed independent of the display/render rate.
+// Canonical simulation rate: the original ~35Hz logic tick (subdivided by
+// frameCountMax). Kept fixed so gameplay speed is independent of render rate.
 #define SIM_FPS 35
 static float delayPeriod = 1000.0f / (SIM_FPS * 2);
 
@@ -98,30 +95,42 @@ void wait_delay(void)
 		SDL_Delay(delay);
 }
 
-// When vsync is disabled, space out presents so we don't exceed the configured
-// render cap (fps_cap). With vsync enabled this is unused — the display paces us.
-// A render cap of 0 means uncapped (present as fast as possible).
+// With vsync off, space out presents to the fps_cap render cap (0 = uncapped);
+// with vsync on this is unused — the display paces us.
 void limit_render_fps(void)
 {
-	static Uint32 last_present = 0;
+	// Use the high-res performance counter, not ms: integer `1000 / fps_cap` truncates
+	// (a 144 cap paces to 166fps) and SDL_Delay over-sleeps. So coarse-sleep most of the
+	// wait, then spin the final ~1ms for even cadence.
+	static Uint64 last_present = 0;
+	static Uint64 freq = 0;
+
+	if (freq == 0)
+		freq = SDL_GetPerformanceFrequency();
 
 	if (fps_cap <= 0)
 	{
-		last_present = SDL_GetTicks();
+		last_present = SDL_GetPerformanceCounter();
 		return;
 	}
 
-	const Uint32 frame_ms = 1000 / fps_cap;
-	Uint32 now = SDL_GetTicks();
-	Uint32 elapsed = now - last_present;
+	const Uint64 frame_ticks = freq / (Uint64)fps_cap;  // counter ticks per frame
+	const Uint64 ms_ticks = freq / 1000;                // counter ticks per millisecond
+	const Uint64 target = last_present + frame_ticks;
 
-	if (elapsed < frame_ms)
+	Uint64 now = SDL_GetPerformanceCounter();
+	if (now < target)
 	{
-		SDL_Delay(frame_ms - elapsed);
-		now = SDL_GetTicks();
+		const Uint64 remaining = target - now;
+		if (remaining > ms_ticks)
+			SDL_Delay((Uint32)((remaining - ms_ticks) * 1000 / freq));  // coarse sleep, leave ~1ms margin
+		while ((now = SDL_GetPerformanceCounter()) < target)
+			;  // brief spin to the exact target for even spacing
 	}
 
-	last_present = now;
+	// Advance the baseline by exactly one frame to keep cadence even; resync to now
+	// if more than a frame behind (e.g. after a stall) so we don't burst to catch up.
+	last_present = (now - target > frame_ticks) ? now : target;
 }
 
 void service_wait_delay(void)

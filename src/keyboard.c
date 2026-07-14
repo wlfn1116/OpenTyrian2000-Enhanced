@@ -19,16 +19,29 @@
 #include "keyboard.h"
 
 #include "config.h"
+#include "crashlog.h"
 #include "joystick.h"
 #include "mouse.h"
 #include "network.h"
 #include "opentyr.h"
+#include "console_platform.h"
 #include "video.h"
 #include "video_scale.h"
 
 #include "SDL.h"
 
 #include <stdio.h>
+
+#if defined(__SWITCH__) || defined(__vita__)
+// Touch-drag -> ship travel multiplier. The base 4.0 cancels VT_MOUSE_SENS (0.25) so at the
+// slider's middle the ship tracks the finger 1:1; the Touch Sensitivity slider scales it
+// linearly around TOUCH_SENS_DEFAULT. notes.md §Console ports.
+#define SWITCH_TOUCH_SHIP_SENS_BASE 4.0f
+#endif
+
+// Defined on every platform so the shared menu code (opentyr.c setup, mainint.c pause) links;
+// only the Switch touch handler below reads it. See keyboard.h.
+int touch_sensitivity = TOUCH_SENS_DEFAULT;
 
 JE_boolean ESCPressed;
 
@@ -39,6 +52,7 @@ Uint8 lastmouse_but;
 Sint32 lastmouse_x, lastmouse_y;
 JE_boolean mouse_pressed[4] = {false, false, false, false};
 Sint32 mouse_x, mouse_y;
+Sint32 mouse_scroll;  // accumulated wheel delta since the last clear_new poll
 
 bool windowHasFocus;
 
@@ -104,6 +118,17 @@ void init_keyboard(void)
 #if SDL_VERSION_ATLEAST(2, 26, 0)
 	SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "1");
 #endif
+
+#if defined(__SWITCH__) || defined(__vita__)
+	// Handle touch explicitly (see service_SDL_events); don't also let SDL synthesise
+	// mouse events from it, which would double-count and teleport on each re-touch.
+	SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+#endif
+}
+
+bool mouseGetRelative(void)
+{
+	return mouseRelativeEnabled;
 }
 
 void mouseSetRelative(bool enable)
@@ -136,9 +161,8 @@ void mouseGetRelativePosition(Sint32 *const out_x, Sint32 *const out_y)
 	mouseWindowYRelative = 0;
 }
 
-// Like mouseGetRelativePosition but returns float screen-space motion with no
-// rounding, so it can be sampled every render frame (e.g. by the variable-
-// timestep ship) without losing sub-pixel / diagonal motion.
+// Float variant of mouseGetRelativePosition: no rounding, so it can be sampled per
+// render frame (e.g. the variable-timestep ship) without losing sub-pixel/diagonal motion.
 void mouseGetRelativeMotionF(float *const out_x, float *const out_y)
 {
 	service_SDL_events(false);
@@ -157,11 +181,21 @@ void service_SDL_events(JE_boolean clear_new)
 {
 	SDL_Event ev;
 
+	watchdog_heartbeat();  // main-loop progress marker; a stall here trips the hang watchdog
+
+	// Recover from a resolution change (fullscreen toggle, scaler resize, Switch
+	// dock/undock) that the current game state won't redraw for on its own: every
+	// input-wait loop pumps events through here, so re-presenting the frame when the
+	// window size changed stops those screens sitting frozen/black until a keypress.
+	// A no-op (one size query) unless the size actually changed.
+	video_repaint_if_stale(false);
+
 	if (clear_new)
 	{
 		newkey = false;
 		newmouse = false;
 		new_text = false;
+		mouse_scroll = 0;
 	}
 
 	while (SDL_PollEvent(&ev))
@@ -186,7 +220,22 @@ void service_SDL_events(JE_boolean clear_new)
 				case SDL_WINDOWEVENT_RESIZED:
 					video_on_win_resize();
 					break;
+
+				case SDL_WINDOWEVENT_EXPOSED:
+				case SDL_WINDOWEVENT_RESTORED:
+					// Window uncovered or un-minimised: contents may be lost even
+					// though the size is unchanged, so force a re-present.
+					video_repaint_if_stale(true);
+					break;
 				}
+				break;
+
+			// The renderer's backbuffer / all textures were reset (GPU context loss,
+			// which some drivers do during a fullscreen transition). Re-present so the
+			// window isn't left black on a state that won't redraw itself.
+			case SDL_RENDER_TARGETS_RESET:
+			case SDL_RENDER_DEVICE_RESET:
+				video_repaint_if_stale(true);
 				break;
 
 			case SDL_KEYDOWN:
@@ -223,9 +272,14 @@ void service_SDL_events(JE_boolean clear_new)
 					mouseWindowYRelative += ev.motion.yrel;
 				}
 
-				// Show system mouse pointer if outside screen.
-				SDL_ShowCursor(mouse_x < 0 || mouse_x >= vga_width ||
-				               mouse_y < 0 || mouse_y >= vga_height ? SDL_TRUE : SDL_FALSE);
+				// Show the OS cursor only outside the rendered frame. A pillarboxed menu
+				// spans mouse_x in [-offset, vga_width - offset), so widen the bounds by the
+				// centering offset, else the OS cursor reappears over the side gradients.
+				{
+					const int menuXOffset = video_get_menu_x_offset();
+					SDL_ShowCursor(mouse_x < -menuXOffset || mouse_x >= vga_width - menuXOffset ||
+					               mouse_y < 0 || mouse_y >= vga_height ? SDL_TRUE : SDL_FALSE);
+				}
 
 				if (ev.motion.xrel != 0 || ev.motion.yrel != 0)
 					mouseInactive = false;
@@ -280,6 +334,82 @@ void service_SDL_events(JE_boolean clear_new)
 						break;
 				}
 				break;
+
+#if defined(__SWITCH__) || defined(__vita__)
+			// Touchscreen. In menus (absolute mouse mode) a touch is a tap-to-click at the
+			// touched point. During gameplay (relative mouse mode, set by mouseSetRelative)
+			// a drag steers the ship RELATIVELY -- fed through the same relative-motion
+			// channel the render-rate ship reads -- so circling a thumb anywhere circles
+			// the ship, like a trackpad. tfinger coords are normalised [0,1] to the window.
+			case SDL_FINGERDOWN:
+			case SDL_FINGERMOTION:
+			case SDL_FINGERUP:
+			{
+#ifdef __vita__
+				// The Vita has two touch panels: front (touch device 0) and rear (device 1).
+				// Ignore the rear panel entirely -- it's very easy to brush accidentally while
+				// holding the console. Only the front screen drives the pointer / ship.
+				if (SDL_GetNumTouchDevices() >= 2 && ev.tfinger.touchId == SDL_GetTouchDevice(1))
+					break;
+#endif
+				int ww = 0, wh = 0;
+				SDL_GetWindowSize(main_window, &ww, &wh);
+				if (ww <= 0 || wh <= 0)
+					break;
+
+				if (mouseRelativeEnabled)
+				{
+					// Gameplay: relative "trackpad" motion. Only the drag matters; a fresh
+					// touch (down) or lift (up) must not jump the ship.
+					if (ev.type == SDL_FINGERMOTION && windowHasFocus)
+					{
+						// Scale the 1:1 base by the slider; TOUCH_SENS_DEFAULT reproduces 1:1.
+						const float sens = SWITCH_TOUCH_SHIP_SENS_BASE * (float)touch_sensitivity / (float)TOUCH_SENS_DEFAULT;
+						mouseWindowXRelative += (Sint32)(ev.tfinger.dx * (float)ww * sens);
+						mouseWindowYRelative += (Sint32)(ev.tfinger.dy * (float)wh * sens);
+					}
+
+					// Auto-fire the main weapon while a finger is controlling the ship.
+					if (ev.type == SDL_FINGERDOWN)
+						mouse_pressed[0] = true;
+					else if (ev.type == SDL_FINGERUP)
+						mouse_pressed[0] = false;
+				}
+				else
+				{
+					// Menus: absolute tap-to-click at the touched point.
+					mouse_x = (Sint32)(ev.tfinger.x * (float)ww);
+					mouse_y = (Sint32)(ev.tfinger.y * (float)wh);
+					mapWindowPointToScreen(&mouse_x, &mouse_y);
+					mouseInactive = false;
+
+					if (ev.type == SDL_FINGERDOWN)
+					{
+						newmouse = true;
+						lastmouse_but = SDL_BUTTON_LEFT;
+						lastmouse_x = mouse_x;
+						lastmouse_y = mouse_y;
+						mousedown = true;
+					}
+					else if (ev.type == SDL_FINGERUP)
+					{
+						mousedown = false;
+					}
+				}
+				break;
+			}
+#endif
+
+			case SDL_MOUSEWHEEL:
+			{
+				int dy = ev.wheel.y;
+				if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+					dy = -dy;
+				mouse_scroll += dy;
+				if (dy != 0)
+					mouseInactive = false;
+				break;
+			}
 
 			case SDL_TEXTINPUT:
 				SDL_strlcpy(last_text, ev.text.text, COUNTOF(last_text));

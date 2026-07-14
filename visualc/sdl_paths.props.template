@@ -3,5 +3,9 @@
   <PropertyGroup>
     <SDL2BaseDir Condition="$(SDL2BaseDir)==''">$(SolutionDir)..\..\SDL2</SDL2BaseDir>
     <SDL2netBaseDir Condition="$(SDL2netBaseDir)==''">$(SolutionDir)..\..\SDL2_net</SDL2netBaseDir>
+    <!-- FluidSynth SDK, only needed when WITH_MIDI=true (x64): include\ plus
+         lib\x64\ with libfluidsynth-3.lib and the runtime DLLs. The repo ships
+         a staged copy in stuff\fluidsynth. -->
+    <FluidSynthBaseDir Condition="$(FluidSynthBaseDir)==''">$(SolutionDir)..\stuff\fluidsynth</FluidSynthBaseDir>
   </PropertyGroup>
 </Project>

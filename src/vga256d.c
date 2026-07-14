@@ -34,8 +34,9 @@
 
 void JE_pix(SDL_Surface *surface, int x, int y, JE_byte c)
 {
-	/* Bad things happen if we don't clip */
-	if (x <  surface->pitch && y <  surface->h)
+	/* Bad things happen if we don't clip. Negative coords write BEFORE the surface
+	   buffer, corrupting whatever is allocated there (e.g. another surface's pixels). */
+	if (x >= 0 && y >= 0 && x <  surface->pitch && y <  surface->h)
 	{
 		Uint8 *vga = surface->pixels;
 		vga[y * surface->pitch + x] = c;
