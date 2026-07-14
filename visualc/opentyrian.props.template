@@ -2,6 +2,8 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
     <WITH_NETWORK Condition="$(WITH_NETWORK)==''">true</WITH_NETWORK>
+    <!-- SoundFont/MIDI music via FluidSynth or the OS synth (x64 only; needs FluidSynthBaseDir). -->
+    <WITH_MIDI Condition="$(WITH_MIDI)==''">true</WITH_MIDI>
     <TYRIAN_DIR Condition="$(TYRIAN_DIR)==''">"C:\\TYRIAN"</TYRIAN_DIR>
   </PropertyGroup>
 </Project>

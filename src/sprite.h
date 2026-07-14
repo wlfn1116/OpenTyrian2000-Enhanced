@@ -125,6 +125,31 @@ void blit_sprite2_darken(SDL_Surface *, int x, int y, Sprite2_array, unsigned in
 void blit_sprite2_filter(SDL_Surface *, int x, int y, Sprite2_array, unsigned int index, Uint8 filter);
 void blit_sprite2_filter_clip(SDL_Surface *, int x, int y, Sprite2_array, unsigned int index, Uint8 filter);
 
+// Supersampled (render-list replay) variants: x,y are HI-buffer coordinates; every
+// source pixel is drawn as a scale x scale block, fully clipped on all edges. These
+// never record into the render list. The op selects the pixel math, matching the
+// corresponding 1x blitter exactly.
+typedef enum
+{
+	BLIT2_COPY = 0,   // blit_sprite2
+	BLIT2_BLEND,      // blit_sprite2_blend
+	BLIT2_DARKEN,     // blit_sprite2_darken
+	BLIT2_FILTER,     // blit_sprite2_filter (uses the filter arg)
+} Blit2Op;
+
+typedef enum
+{
+	BLITT_COPY = 0,   // blit_sprite
+	BLITT_BLEND,      // blit_sprite_blend
+	BLITT_HV_UNSAFE,  // blit_sprite_hv_unsafe
+	BLITT_HV,         // blit_sprite_hv
+	BLITT_HV_BLEND,   // blit_sprite_hv_blend
+	BLITT_DARK,       // blit_sprite_dark
+} BlitTableOp;
+
+void blit_sprite2_scaled(SDL_Surface *, int x, int y, Sprite2_array, unsigned int index, int scale, Blit2Op op, Uint8 filter);
+void blit_sprite_table_scaled(SDL_Surface *, int x, int y, unsigned int table, unsigned int index, int scale, BlitTableOp op, Uint8 hue, Sint8 value, bool black);
+
 void blit_sprite2x2(SDL_Surface *, int x, int y, Sprite2_array, unsigned int index);
 void blit_sprite2x2_clip(SDL_Surface *, int x, int y, Sprite2_array, unsigned int index);
 void blit_sprite2x2_blend(SDL_Surface *, int x, int y, Sprite2_array, unsigned int index);

@@ -42,6 +42,10 @@ extern JE_byte warningCol;
 extern JE_shortint warningColChange;
 
 void JE_dString(SDL_Surface * screen, int x, int y, const char *s, unsigned int font);
+// Dim an already-drawn shape-font string in place (halves each glyph's shade), following the same
+// glyph advance as JE_dString. Greys out disabled shape-font rows without darkening the background
+// behind them -- it only touches the glyph-shaped pixels. Draw the row with JE_dString first.
+void JE_dStringDarken(SDL_Surface * screen, int x, int y, const char *s, unsigned int font);
 
 int JE_fontCenter(const char *s, unsigned int font);
 int JE_textWidth(const char *s, unsigned int font);
@@ -49,7 +53,7 @@ void JE_textShade(SDL_Surface * screen, int x, int y, const char *s, unsigned in
 void JE_outText(SDL_Surface * screen, int x, int y, const char *s, unsigned int colorbank, int brightness);
 void JE_outTextModify(SDL_Surface * screen, int x, int y, const char *s, unsigned int filter, unsigned int brightness, unsigned int font);
 void JE_outTextAdjust(SDL_Surface * screen, int x, int y, const char *s, unsigned int filter, int brightness, unsigned int font, bool shadow);
-void JE_outTextAndDarken(SDL_Surface * screen, int x, int y, const char *s, unsigned int colorbank, unsigned int brightness, unsigned int font);
+void JE_outTextAndDarken(SDL_Surface * screen, int x, int y, const char *s, unsigned int colorbank, int brightness, unsigned int font);
 
 void JE_updateWarning(SDL_Surface * screen);
 void JE_outTextGlow(SDL_Surface * screen, int x, int y, const char *s);

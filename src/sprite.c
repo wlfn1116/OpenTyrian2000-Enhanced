@@ -20,6 +20,7 @@
 
 #include "file.h"
 #include "opentyr.h"
+#include "render_list.h"
 #include "video.h"
 
 #include <assert.h>
@@ -105,6 +106,9 @@ void free_sprites(unsigned int table)
 // does not clip on left or right edges of surface
 void blit_sprite(SDL_Surface *surface, int x, int y, unsigned int table, unsigned int index)
 {
+	if (render_list_recording)
+		rl_rec_sprite(x, y, table, index, RC_SPRITE, 0, 0, false);
+
 	if (index >= sprite_table[table].count || !sprite_exists(table, index))
 	{
 		assert(false);
@@ -165,6 +169,9 @@ void blit_sprite(SDL_Surface *surface, int x, int y, unsigned int table, unsigne
 // does not clip on left or right edges of surface
 void blit_sprite_blend(SDL_Surface *surface, int x, int y, unsigned int table, unsigned int index)
 {
+	if (render_list_recording)
+		rl_rec_sprite(x, y, table, index, RC_SPRITE_BLEND, 0, 0, false);
+
 	if (index >= sprite_table[table].count || !sprite_exists(table, index))
 	{
 		assert(false);
@@ -227,6 +234,9 @@ void blit_sprite_blend(SDL_Surface *surface, int x, int y, unsigned int table, u
 // we can replace it when we know that we don't rely on that 'feature'
 void blit_sprite_hv_unsafe(SDL_Surface *surface, int x, int y, unsigned int table, unsigned int index, Uint8 hue, Sint8 value)
 {
+	if (render_list_recording)
+		rl_rec_sprite(x, y, table, index, RC_SPRITE_HV_UNSAFE, hue, value, false);
+
 	if (index >= sprite_table[table].count || !sprite_exists(table, index))
 	{
 		assert(false);
@@ -289,6 +299,9 @@ void blit_sprite_hv_unsafe(SDL_Surface *surface, int x, int y, unsigned int tabl
 // does not clip on left or right edges of surface
 void blit_sprite_hv(SDL_Surface *surface, int x, int y, unsigned int table, unsigned int index, Uint8 hue, Sint8 value)
 {
+	if (render_list_recording)
+		rl_rec_sprite(x, y, table, index, RC_SPRITE_HV, hue, value, false);
+
 	if (index >= sprite_table[table].count || !sprite_exists(table, index))
 	{
 		assert(false);
@@ -357,6 +370,9 @@ void blit_sprite_hv(SDL_Surface *surface, int x, int y, unsigned int table, unsi
 // does not clip on left or right edges of surface
 void blit_sprite_hv_blend(SDL_Surface *surface, int x, int y, unsigned int table, unsigned int index, Uint8 hue, Sint8 value)
 {
+	if (render_list_recording)
+		rl_rec_sprite(x, y, table, index, RC_SPRITE_HV_BLEND, hue, value, false);
+
 	if (index >= sprite_table[table].count || !sprite_exists(table, index))
 	{
 		assert(false);
@@ -425,6 +441,9 @@ void blit_sprite_hv_blend(SDL_Surface *surface, int x, int y, unsigned int table
 // does not clip on left or right edges of surface
 void blit_sprite_dark(SDL_Surface *surface, int x, int y, unsigned int table, unsigned int index, bool black)
 {
+	if (render_list_recording)
+		rl_rec_sprite(x, y, table, index, RC_SPRITE_DARK, 0, 0, black);
+
 	if (index >= sprite_table[table].count || !sprite_exists(table, index))
 	{
 		assert(false);
@@ -518,6 +537,8 @@ void free_sprite2s(Sprite2_array *sprite2s)
 void blit_sprite2(SDL_Surface *surface, int x, int y, Sprite2_array sprite2s, unsigned int index)
 {
 	assert(surface->format->BitsPerPixel == 8);
+	if (render_list_recording)
+		rl_rec_sprite2(x, y, sprite2s, index, RC_SPRITE2);
 	Uint8 *             pixels =    (Uint8 *)surface->pixels + (y * surface->pitch) + x;
 	const Uint8 * const pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	            * const pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
@@ -553,6 +574,8 @@ void blit_sprite2(SDL_Surface *surface, int x, int y, Sprite2_array sprite2s, un
 void blit_sprite2_clip(SDL_Surface *surface, int x, int y, Sprite2_array sprite2s, unsigned int index)
 {
 	assert(surface->format->BitsPerPixel == 8);
+	if (render_list_recording)
+		rl_rec_sprite2(x, y, sprite2s, index, RC_SPRITE2_CLIP);
 
 	const Uint8 *data = sprite2s.data + SDL_SwapLE16(((Uint16 *)sprite2s.data)[index - 1]);
 
@@ -595,6 +618,8 @@ void blit_sprite2_clip(SDL_Surface *surface, int x, int y, Sprite2_array sprite2
 void blit_sprite2_blend(SDL_Surface *surface,  int x, int y, Sprite2_array sprite2s, unsigned int index)
 {
 	assert(surface->format->BitsPerPixel == 8);
+	if (render_list_recording)
+		rl_rec_sprite2(x, y, sprite2s, index, RC_SPRITE2_BLEND);
 	Uint8 *             pixels =    (Uint8 *)surface->pixels + (y * surface->pitch) + x;
 	const Uint8 * const pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	            * const pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
@@ -631,6 +656,8 @@ void blit_sprite2_blend(SDL_Surface *surface,  int x, int y, Sprite2_array sprit
 void blit_sprite2_darken(SDL_Surface *surface, int x, int y, Sprite2_array sprite2s, unsigned int index)
 {
 	assert(surface->format->BitsPerPixel == 8);
+	if (render_list_recording)
+		rl_rec_sprite2(x, y, sprite2s, index, RC_SPRITE2_DARKEN);
 	Uint8 *             pixels =    (Uint8 *)surface->pixels + (y * surface->pitch) + x;
 	const Uint8 * const pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	            * const pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
@@ -667,6 +694,8 @@ void blit_sprite2_darken(SDL_Surface *surface, int x, int y, Sprite2_array sprit
 void blit_sprite2_filter(SDL_Surface *surface, int x, int y, Sprite2_array sprite2s, unsigned int index, Uint8 filter)
 {
 	assert(surface->format->BitsPerPixel == 8);
+	if (render_list_recording)
+		rl_rec_sprite2_filter(x, y, sprite2s, index, filter, false);
 	Uint8 *             pixels =    (Uint8 *)surface->pixels + (y * surface->pitch) + x;
 	const Uint8 * const pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	            * const pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
@@ -702,6 +731,8 @@ void blit_sprite2_filter(SDL_Surface *surface, int x, int y, Sprite2_array sprit
 void blit_sprite2_filter_clip(SDL_Surface *surface, int x, int y, Sprite2_array sprite2s, unsigned int index, Uint8 filter)
 {
 	assert(surface->format->BitsPerPixel == 8);
+	if (render_list_recording)
+		rl_rec_sprite2_filter(x, y, sprite2s, index, filter, true);
 
 	const Uint8 *data = sprite2s.data + SDL_SwapLE16(((Uint16 *)sprite2s.data)[index - 1]);
 
@@ -792,6 +823,200 @@ void blit_sprite2x2_filter_clip(SDL_Surface *surface, int x, int y, Sprite2_arra
 	blit_sprite2_filter_clip(surface, x + 12, y + 14, sprite2s, index + 20, filter);
 }
 
+// --- Supersampled blit variants (render-list replay only; see sprite.h) ---
+
+// Draw one source pixel as a scale x scale block, clipped on all edges.
+static inline void blit2_block(SDL_Surface *surface, int x, int y, int scale, Uint8 d, Blit2Op op, Uint8 filter)
+{
+	int x0 = x < 0 ? 0 : x;
+	int y0 = y < 0 ? 0 : y;
+	int x1 = x + scale, y1 = y + scale;
+	if (x1 > surface->w)
+		x1 = surface->w;
+	if (y1 > surface->h)
+		y1 = surface->h;
+
+	for (int yy = y0; yy < y1; ++yy)
+	{
+		Uint8 *p = (Uint8 *)surface->pixels + yy * surface->pitch + x0;
+		for (int xx = x0; xx < x1; ++xx, ++p)
+		{
+			switch (op)
+			{
+			case BLIT2_COPY:   *p = d; break;
+			case BLIT2_BLEND:  *p = (((d & 0x0f) + (*p & 0x0f)) / 2) | (d & 0xf0); break;
+			case BLIT2_DARKEN: *p = ((*p & 0x0f) / 2) + (*p & 0xf0); break;
+			case BLIT2_FILTER: *p = filter | (d & 0x0f); break;
+			}
+		}
+	}
+}
+
+void blit_sprite2_scaled(SDL_Surface *surface, int x, int y, Sprite2_array sprite2s, unsigned int index, int scale, Blit2Op op, Uint8 filter)
+{
+	assert(surface->format->BitsPerPixel == 8);
+
+	const Uint8 *data = sprite2s.data + SDL_SwapLE16(((Uint16 *)sprite2s.data)[index - 1]);
+
+	for (; *data != 0x0f; ++data)
+	{
+		x += (*data & 0x0f) * scale;              // second nibble: transparent pixel count
+		unsigned int count = (*data & 0xf0) >> 4; // first nibble: opaque pixel count
+
+		if (count == 0) // move to next pixel row
+		{
+			y += scale;
+			x -= 12 * scale;
+		}
+		else
+		{
+			if (y >= surface->h)
+				return;  // rows only grow; nothing further can be visible
+			while (count--)
+			{
+				++data;
+				blit2_block(surface, x, y, scale, *data, op, filter);
+				x += scale;
+			}
+		}
+	}
+}
+
+void blit_sprite_table_scaled(SDL_Surface *surface, int x, int y, unsigned int table, unsigned int index, int scale, BlitTableOp op, Uint8 hue, Sint8 value, bool black)
+{
+	assert(surface->format->BitsPerPixel == 8);
+
+	if (index >= sprite_table[table].count || !sprite_exists(table, index))
+	{
+		assert(false);
+		return;
+	}
+
+	const Sprite * const cur_sprite = sprite(table, index);
+
+	const Uint8 *data = cur_sprite->data;
+	const Uint8 * const data_ul = data + cur_sprite->size;
+
+	const unsigned int width = cur_sprite->width;
+	unsigned int x_offset = 0;
+
+	hue <<= 4;
+
+	int cx = x, cy = y;
+
+	for (; data < data_ul; ++data)
+	{
+		switch (*data)
+		{
+		case 255:  // transparent pixels
+			data++;  // next byte tells how many
+			cx += *data * scale;
+			x_offset += *data;
+			break;
+
+		case 254:  // next pixel row
+			cx += (width - x_offset) * scale;
+			x_offset = width;
+			break;
+
+		case 253:  // 1 transparent pixel
+			cx += scale;
+			x_offset++;
+			break;
+
+		default:  // set a pixel
+			if (cy >= surface->h)
+				return;  // rows only grow
+
+			{
+				int x0 = cx < 0 ? 0 : cx;
+				int y0 = cy < 0 ? 0 : cy;
+				int x1 = cx + scale, y1 = cy + scale;
+				if (x1 > surface->w)
+					x1 = surface->w;
+				if (y1 > surface->h)
+					y1 = surface->h;
+
+				// Pixel math identical to the corresponding 1x blitter; values that
+				// don't depend on the destination are computed once per block.
+				Uint8 flat = 0;
+				bool have_flat = false;
+				switch (op)
+				{
+				case BLITT_COPY:
+					flat = *data;
+					have_flat = true;
+					break;
+				case BLITT_HV_UNSAFE:
+					flat = hue | (Uint8)((*data & 0x0f) + value);
+					have_flat = true;
+					break;
+				case BLITT_HV:
+				{
+					Uint8 temp_value = (*data & 0x0f) + value;
+					if (temp_value > 0xf)
+						temp_value = (temp_value >= 0x1f) ? 0x0 : 0xf;
+					flat = hue | temp_value;
+					have_flat = true;
+					break;
+				}
+				case BLITT_DARK:
+					if (black)
+					{
+						flat = 0x00;
+						have_flat = true;
+					}
+					break;
+				default:
+					break;
+				}
+
+				for (int yy = y0; yy < y1; ++yy)
+				{
+					Uint8 *p = (Uint8 *)surface->pixels + yy * surface->pitch + x0;
+					for (int xx = x0; xx < x1; ++xx, ++p)
+					{
+						if (have_flat)
+						{
+							*p = flat;
+							continue;
+						}
+						switch (op)
+						{
+						case BLITT_BLEND:
+							*p = (*data & 0xf0) | (((*p & 0x0f) + (*data & 0x0f)) / 2);
+							break;
+						case BLITT_HV_BLEND:
+						{
+							Uint8 temp_value = (*data & 0x0f) + value;
+							if (temp_value > 0xf)
+								temp_value = (temp_value >= 0x1f) ? 0x0 : 0xf;
+							*p = hue | (((*p & 0x0f) + temp_value) / 2);
+							break;
+						}
+						case BLITT_DARK:  // black == false
+							*p = (*p & 0xf0) | ((*p & 0x0f) / 2);
+							break;
+						default:
+							break;
+						}
+					}
+				}
+			}
+
+			cx += scale;
+			x_offset++;
+			break;
+		}
+		if (x_offset >= width)
+		{
+			cy += scale;
+			cx = x;
+			x_offset = 0;
+		}
+	}
+}
+
 void JE_loadMainShapeTables(const char *shpfile)
 {
 	enum { SHP_NUM = 13 };
@@ -860,4 +1085,6 @@ void free_main_shape_tables(void)
 	free_sprite2s(&spriteSheet10);
 	free_sprite2s(&spriteSheet11);
 	free_sprite2s(&spriteSheet12);
+	free_sprite2s(&spriteSheetT2000);  // JE_loadMainShapeTables loads this too; must be freed
+	                                   // or JE_loadCompShapesB's assert(data==NULL) aborts on reload
 }

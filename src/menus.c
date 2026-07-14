@@ -39,15 +39,40 @@ char difficulty_name[7][21];
 char gameplay_name[GAMEPLAY_NAME_COUNT][26];
 char timed_battle_name[4][23];
 
+// Wait for menu input (key, mouse button, or motion); returns true if the mouse moved.
+// Polls at 1 ms so the caller's redraw loop — and thus the cursor — can run at the
+// display refresh rate.
+static bool menuWaitForInput(void)
+{
+	const Uint16 startMouseX = mouse_x;
+	const Uint16 startMouseY = mouse_y;
+
+	for (;;)
+	{
+		push_joysticks_as_keyboard();
+		service_SDL_events(false);
+
+		NETWORK_KEEP_ALIVE();
+
+		const bool mouseMoved = mouse_x != startMouseX || mouse_y != startMouseY;
+		if (newkey || newmouse || mouseMoved)
+			return mouseMoved;
+
+		SDL_Delay(1);  // brief idle poll; a still cursor doesn't need redrawing
+	}
+}
+
 bool gameplaySelect(void)
 {
 	enum MenuItemIndex
 	{
 		MENU_ITEM_1_PLAYER_FULL_GAME = 0,
+		MENU_ITEM_ENDLESS,             // inserted just below the full game
 		MENU_ITEM_1_PLAYER_ARCADE,
 		MENU_ITEM_1_PLAYER_TIMED_BATTLE,
 		MENU_ITEM_2_PLAYER_ARCADE,
 		MENU_ITEM_NETWORK,
+		MENU_ITEM_COUNT,
 	};
 
 	if (shopSpriteSheet.data == NULL)
@@ -55,23 +80,17 @@ bool gameplaySelect(void)
 
 	bool restart = true;
 
-	const size_t menuItemsCount = COUNTOF(gameplay_name) - 1;
+	const size_t menuItemsCount = MENU_ITEM_COUNT;
 	size_t selectedIndex = MENU_ITEM_1_PLAYER_FULL_GAME;
 
-	/*
-		 * Menus are rendered on a 320px wide virtual screen which is centered
-		 * within the wider VGA buffer.  Using vga_width / 2 centers text within
-		 * the entire buffer which causes a visual offset when the menu is
-		 * blitted to the virtual screen.  Instead, base the center position on
-		 * the virtual screen width to keep headers and labels visually centered
-		 * regardless of the actual buffer width.
-		 */
+	/* Menus render on a 320px virtual screen centered in the wider VGA buffer; center on
+	 * the virtual width, not vga_width, or text drifts when the menu is blitted over. */
 	const int xCenter = 320 / 2;
 	const int yMenuHeader = 20;
 	const int yMenuItems = 54;
 	const int dyMenuItems = 24;
 	const int hMenuItem = 13;
-	int wMenuItem[COUNTOF(gameplay_name) - 1] = { 0 };
+	int wMenuItem[MENU_ITEM_COUNT] = { 0 };
 
 	for (; ; )
 	{
@@ -89,7 +108,12 @@ bool gameplaySelect(void)
 		// Draw menu items.
 		for (size_t i = 0; i < menuItemsCount; ++i)
 		{
-			const char *const text = gameplay_name[i + 1];
+			// "Endless" is inserted after the full-game entry; every other label still comes
+			// from gameplay_name[] (full game = [1], the rest map straight across after the
+			// insert: Arcade = [2], Timed = [3], 2P = [4], Network = [5]).
+			const char *const text = (i == MENU_ITEM_ENDLESS)             ? "1 Player Endless"
+			                       : (i == MENU_ITEM_1_PLAYER_FULL_GAME)  ? gameplay_name[1]
+			                       :                                        gameplay_name[i];
 
 			wMenuItem[i] = JE_textWidth(text, normal_font);
 			const int x = xCenter - wMenuItem[i] / 2;
@@ -115,20 +139,10 @@ bool gameplaySelect(void)
 		JE_mouseStart();
 		JE_showVGA();
 		JE_mouseReplace();
+		if (!output_vsync)
+			limit_render_fps();  // pace the cursor redraw to the render-fps cap
 
-		bool mouseMoved = false;
-		do
-		{
-			SDL_Delay(16);
-
-			Uint16 oldMouseX = mouse_x;
-			Uint16 oldMouseY = mouse_y;
-
-			push_joysticks_as_keyboard();
-			service_SDL_events(false);
-
-			mouseMoved = mouse_x != oldMouseX || mouse_y != oldMouseY;
-		} while (!(newkey || newmouse || mouseMoved));
+		const bool mouseMoved = menuWaitForInput();
 
 		// Handle interaction.
 
@@ -231,6 +245,19 @@ bool gameplaySelect(void)
 				onePlayerAction = selectedIndex == MENU_ITEM_1_PLAYER_ARCADE;
 				timedBattleMode = selectedIndex == MENU_ITEM_1_PLAYER_TIMED_BATTLE;
 				twoPlayerMode = selectedIndex == MENU_ITEM_2_PLAYER_ARCADE;
+				endlessMode = false;
+				return true;
+			}
+			case MENU_ITEM_ENDLESS:
+			{
+				JE_playSampleNum(S_SELECT);
+
+				fade_black(10);
+
+				onePlayerAction = false;
+				timedBattleMode = false;
+				twoPlayerMode = false;
+				endlessMode = true;  // newGame() runs the endless setup (difficulty + first shop)
 				return true;
 			}
 			case MENU_ITEM_NETWORK:
@@ -311,22 +338,10 @@ bool episodeSelect(void)
 		JE_mouseStart();
 		JE_showVGA();
 		JE_mouseReplace();
+		if (!output_vsync)
+			limit_render_fps();  // pace the cursor redraw to the render-fps cap
 
-		bool mouseMoved = false;
-		do
-		{
-			SDL_Delay(16);
-
-			Uint16 oldMouseX = mouse_x;
-			Uint16 oldMouseY = mouse_y;
-
-			push_joysticks_as_keyboard();
-			service_SDL_events(false);
-
-			NETWORK_KEEP_ALIVE();
-
-			mouseMoved = mouse_x != oldMouseX || mouse_y != oldMouseY;
-		} while (!(newkey || newmouse || mouseMoved));
+		const bool mouseMoved = menuWaitForInput();
 
 		// Handle interaction.
 
@@ -448,9 +463,11 @@ bool difficultySelect(void)
 	bool restart = true;
 
 	const size_t menuItemsCount = COUNTOF(difficulty_name) - 1;
-	size_t menuItemsVisibleCount = menuItemsCount - 3;
+	// All difficulties are shown up front; the classic hidden-difficulty unlock codes
+	// (Shift+G for Impossible, Shift+] for Suicide, and typing L-O-R-D for Zinglon) are
+	// no longer required.
+	size_t menuItemsVisibleCount = menuItemsCount;
 	size_t selectedIndex = 1;
-	size_t lordProgress = 0;
 
 	/* See gameplaySelect() for rationale behind using a fixed 320px center. */
 	const int xCenter = 320 / 2;
@@ -501,66 +518,12 @@ bool difficultySelect(void)
 		JE_mouseStart();
 		JE_showVGA();
 		JE_mouseReplace();
+		if (!output_vsync)
+			limit_render_fps();  // pace the cursor redraw to the render-fps cap
 
-		bool mouseMoved = false;
-		do
-		{
-			SDL_Delay(16);
-
-			Uint16 oldMouseX = mouse_x;
-			Uint16 oldMouseY = mouse_y;
-
-			push_joysticks_as_keyboard();
-			service_SDL_events(false);
-
-			NETWORK_KEEP_ALIVE();
-
-			mouseMoved = mouse_x != oldMouseX || mouse_y != oldMouseY;
-		} while (!(newkey || newmouse || mouseMoved));
+		const bool mouseMoved = menuWaitForInput();
 
 		// Handle interaction.
-
-		if (menuItemsVisibleCount == 5)
-		{
-			const SDL_Scancode lordKeys[] = { SDL_SCANCODE_L, SDL_SCANCODE_O, SDL_SCANCODE_R, SDL_SCANCODE_D };
-
-			for (size_t i = 0; ; ++i)
-			{
-				if (i == COUNTOF(lordKeys))
-				{
-					menuItemsVisibleCount = 6;
-					break;
-				}
-
-				if (!keysactive[lordKeys[i]])
-					break;
-			}
-
-			if (newkey)
-			{
-				// Due to key jamming, holding down 4 keys simultaneous may not be possible, so an
-				// alternate input method is also provided.
-				if (lordProgress < COUNTOF(lordKeys) &&
-					lastkey_scan == lordKeys[lordProgress])
-				{
-					lordProgress += 1;
-
-					if (lordProgress == COUNTOF(lordKeys))
-						menuItemsVisibleCount = 6;
-				}
-				else
-				{
-					lordProgress = 0;
-				}
-			}
-		}
-		if (SDL_GetModState() & KMOD_SHIFT)
-		{
-			if (menuItemsVisibleCount == 4 && keysactive[SDL_SCANCODE_RIGHTBRACKET])
-				menuItemsVisibleCount = 5;
-			if (menuItemsVisibleCount == 3 && keysactive[SDL_SCANCODE_G])
-				menuItemsVisibleCount = 4;
-		}
 
 		bool action = false;
 		bool cancel = false;
@@ -744,22 +707,10 @@ bool timedBattleSelect(void)
 		JE_mouseStart();
 		JE_showVGA();
 		JE_mouseReplace();
+		if (!output_vsync)
+			limit_render_fps();  // pace the cursor redraw to the render-fps cap
 
-		bool mouseMoved = false;
-		do
-		{
-			SDL_Delay(16);
-
-			Uint16 oldMouseX = mouse_x;
-			Uint16 oldMouseY = mouse_y;
-
-			push_joysticks_as_keyboard();
-			service_SDL_events(false);
-
-			NETWORK_KEEP_ALIVE();
-
-			mouseMoved = mouse_x != oldMouseX || mouse_y != oldMouseY;
-		} while (!(newkey || newmouse || mouseMoved));
+		const bool mouseMoved = menuWaitForInput();
 
 		// Handle interaction.
 

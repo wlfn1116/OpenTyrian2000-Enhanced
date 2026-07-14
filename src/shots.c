@@ -18,7 +18,10 @@
  */
 #include "shots.h"
 
+#include "config.h"
+#include "endless.h"
 #include "player.h"
+#include "render_list.h"
 #include "sprite.h"
 #include "video.h"
 #include "varz.h"
@@ -38,6 +41,10 @@ void simulate_player_shots(void)
 			if (z != MAX_PWEAPON - 1)
 			{
 				PlayerShotDataType* shot = &playerShotData[z];
+
+				// Entry position: the tick's delta becomes the render-list extrapolation
+				// velocity (as in player_shot_move_and_draw), for the smooth shop preview.
+				const int rl_shot_old_x = shot->shotX, rl_shot_old_y = shot->shotY;
 
 				shot->shotXM += shot->shotXC;
 
@@ -97,12 +104,46 @@ void simulate_player_shots(void)
 
 				if (anim_frame < 60000)
 				{
+					rl_current_id = RL_ID_PSHOT_BASE + z;
+					rl_current_vel_x = tempShotX - rl_shot_old_x;
+					rl_current_vel_y = tempShotY - rl_shot_old_y;
+					rl_current_acc_x = shot->shotXC;
+					rl_current_acc_y = shot->shotYC;
 					if (anim_frame > 1000)
+					{
+						// Match the in-game shot draw (player_shot_move_and_draw): a shot graphic
+						// > 1000 leaves a superspark trail (colour bank = the thousands digit; see
+						// JE_doSP). Without this the weapon-sim previews (shop + custom weapon
+						// creator) silently dropped the superspark / sparky custom-bullet trail.
+						JE_doSP(tempShotX+1 + 6, tempShotY + 6, 5, 3, (anim_frame / 1000) << 4, superSparkCapForSprite(anim_frame % 1000));
 						anim_frame = anim_frame % 1000;
+					}
 					if (anim_frame > 500)
 						blit_sprite2(VGAScreen, tempShotX+1, tempShotY, spriteSheet12, anim_frame - 500);
 					else
 						blit_sprite2(VGAScreen, tempShotX+1, tempShotY, spriteSheet8, anim_frame);
+					rl_current_id = 0;
+					rl_current_vel_x = 0;
+					rl_current_vel_y = 0;
+					rl_current_acc_x = 0;
+					rl_current_acc_y = 0;
+				}
+				else if (anim_frame > 60000)
+				{
+					// Blended "special" sprite (e.g. the Plasma Storm cloud tiles). Mirror
+					// player_shot_move_and_draw so the weapon-simulator preview (custom
+					// weapon creator) shows these looks instead of silently skipping them.
+					rl_current_id = RL_ID_PSHOT_BASE + z;
+					rl_current_vel_x = tempShotX - rl_shot_old_x;
+					rl_current_vel_y = tempShotY - rl_shot_old_y;
+					rl_current_acc_x = shot->shotXC;
+					rl_current_acc_y = shot->shotYC;
+					blit_sprite_blend(VGAScreen, tempShotX+1, tempShotY, OPTION_SHAPES, anim_frame - 60001);
+					rl_current_id = 0;
+					rl_current_vel_x = 0;
+					rl_current_vel_y = 0;
+					rl_current_acc_x = 0;
+					rl_current_acc_y = 0;
 				}
 			}
 
@@ -171,6 +212,10 @@ bool player_shot_move_and_draw(
 	shotAvail[shot_id]--;
 	if (shot_id != MAX_PWEAPON - 1)
 	{
+		// Entry position: the tick's delta becomes the render-list extrapolation
+		// velocity (rl_current_vel_*, set at the blit below).
+		const int rl_shot_old_x = shot->shotX, rl_shot_old_y = shot->shotY;
+
 		shot->shotXM += shot->shotXC;
 		shot->shotX += shot->shotXM;
 		JE_integer tmp_shotXM = shot->shotXM;
@@ -219,8 +264,14 @@ bool player_shot_move_and_draw(
 		*out_shotx = shot->shotX;
 		*out_shoty = shot->shotY;
 
+		// Top cull margin widened -15 -> -40, so interpolation still gets recorded ticks
+		// past the edge and a fast shot's exit animates off-screen instead of popping.
+		// Ascending shots only: a decelerating shot (e.g. Vulcan Cannon) apexing between
+		// -15 and -40 would fall back on-screen, so past -15 cull once it stops ascending
+		// (shotYM >= 0).
 		if (shot->shotX < -34 || shot->shotX > PLAYFIELD_WIDTH + 34 ||
-			shot->shotY < -15 || shot->shotY > 190)
+			shot->shotY < -40 || shot->shotY > 190 ||
+			(shot->shotY < -15 && shot->shotYM >= 0))
 		{
 			shotAvail[shot_id] = 0;
 			return false;
@@ -273,6 +324,23 @@ bool player_shot_move_and_draw(
 
 		*out_is_special = sprite_frame > 60000;
 
+		// Ship-tracking shots (shotXM/shotYM > 100 sentinels) draw at the ship's render-
+		// rate position on the attached axis so the beam base stays on the gun; the
+		// travelling axis extrapolates (see ship_attach in render_list.c). Velocity is
+		// this tick's real on-screen delta (post-accel, post-circle, post ship-lock), so
+		// the exact motion extrapolates — fast shots exit the top cleanly, recycled slots
+		// never streak.
+		rl_current_id = RL_ID_PSHOT_BASE + shot_id;
+		rl_current_vel_x = shot->shotX - rl_shot_old_x;
+		rl_current_vel_y = shot->shotY - rl_shot_old_y;
+		// Acceleration lets the travelling axis extrapolate a decelerating shot
+		// (e.g. Vulcan Cannon) without overshooting and snapping back; the attached
+		// axis ignores it (orbit math uses pure velocity).
+		rl_current_acc_x = shot->shotXC;
+		rl_current_acc_y = shot->shotYC;
+		rl_shot_attach = (shot->shotXM > 100 ? 1 : 0)
+		               | (shot->shotYM > 100 ? 2 : 0)
+		               | ((shot->playerNumber - 1) << 2);
 		if (*out_is_special)
 		{
 			blit_sprite_blend(VGAScreen, *out_shotx+1, *out_shoty, OPTION_SHAPES, sprite_frame - 60001);
@@ -284,7 +352,7 @@ bool player_shot_move_and_draw(
 		{
 			if (sprite_frame > 1000)
 			{
-				JE_doSP(*out_shotx+1 + 6, *out_shoty + 6, 5, 3, (sprite_frame / 1000) << 4);
+				JE_doSP(*out_shotx+1 + 6, *out_shoty + 6, 5, 3, (sprite_frame / 1000) << 4, superSparkCapForSprite(sprite_frame % 1000));
 				sprite_frame = sprite_frame % 1000;
 			}
 			if (sprite_frame > 500)
@@ -300,6 +368,12 @@ bool player_shot_move_and_draw(
 				blit_sprite2(VGAScreen, *out_shotx+1, *out_shoty, spriteSheet8, sprite_frame);
 			}
 		}
+		rl_current_id = 0;
+		rl_current_vel_x = 0;
+		rl_current_vel_y = 0;
+		rl_current_acc_x = 0;
+		rl_current_acc_y = 0;
+		rl_shot_attach = 0;
 	}
 
 	return true;
@@ -317,9 +391,26 @@ JE_integer player_shot_create(JE_word portNum, uint bay_i, JE_word PX, JE_word P
 
 	uint power_use = weaponPort[portNum].poweruse;
 	if (expertMode)
-		power_use = power_use * 3 / 2;
+		power_use = power_use * expertEnergyPct / 100;
 
-	if (!(cheatInfiniteShields && cheatInfiniteArmor))
+	// Endless "Efficient Coils" perk: trim the generator draw per main-weapon shot (100 = normal),
+	// so a given generator sustains heavier fire. Scales the base cost before the special/boost zeroing.
+	if (endlessMode)
+		power_use = power_use * endlessPerkPowerUsePercent() / 100;
+
+	// Special-weapon shots are paid for upfront in shield/armor; they must not also
+	// drain the generator, or a sustained special (e.g. an active Minefield) starves
+	// the main weapon of power.
+	if (bay_i == SHOT_SPECIAL || bay_i == SHOT_SPECIAL2)
+		power_use = 0;
+
+	// Endless kill-fire BOON (Turbodrive / Overdrive): the boosted fire rate must not drain the
+	// generator faster, so shots fired during the window are power-free. An evil curse fires SLOWER,
+	// so it gets no such break -- normal power cost applies.
+	if (endlessMode && endlessTurbodriveActive() && !endlessKillFireIsEvil())
+		power_use = 0;
+
+	if (!cheatInfiniteGenerator)
 	{
 		if (power < power_use)
 			return MAX_PWEAPON;
@@ -339,7 +430,11 @@ JE_integer player_shot_create(JE_word portNum, uint bay_i, JE_word PX, JE_word P
 		if (shot_id == MAX_PWEAPON)
 			return MAX_PWEAPON;
 
-		if (shotMultiPos[bay_i] == weapon->max || shotMultiPos[bay_i] > 8)
+		// Fire-cursor wrap must test >=, not ==: the cursor is a persistent per-bay global, so a
+		// weapon swap mid-cycle can leave it above the new max, silently killing the gun. notes.md §Weapons.
+		if ((weapon->max != 0 && shotMultiPos[bay_i] >= weapon->max) ||
+		    shotMultiPos[bay_i] >= WEAPON_MULTI_MAX ||
+		    (weapon->max == 0 && shotMultiPos[bay_i] > 8))
 			shotMultiPos[bay_i] = 1;
 		else
 			shotMultiPos[bay_i]++;
@@ -509,6 +604,18 @@ JE_integer player_shot_create(JE_word portNum, uint bay_i, JE_word PX, JE_word P
 		}
 
 		shotRepeat[bay_i] = weapon->shotrepeat;
+		// Endless Evil Turbodrive/Overdrive curse: JAM the guns by lengthening the cooldown as the
+		// kill combo climbs (0 unless an evil kill-fire window is up). Main/sidekick guns only -- the
+		// special bays run their own cadence (see varz.c). shotRepeat is a byte, so clamp.
+		if (endlessMode && bay_i != SHOT_SPECIAL && bay_i != SHOT_SPECIAL2)
+		{
+			const int jam = endlessKillFireJamTicks();
+			if (jam > 0)
+			{
+				const int v = shotRepeat[bay_i] + jam;
+				shotRepeat[bay_i] = (v > 250) ? 250 : (JE_byte)v;
+			}
+		}
 	}
 
 	return shot_id;

@@ -29,6 +29,12 @@
 #define EPISODE_MAX 5
 #define EPISODE_AVAILABLE 5
 
+// Width of a weapon's per-bullet arrays -- raised from the original 8 so the Custom Weapon
+// Creator can build wider weapons (stock data still loads exactly 8 per array; only custom
+// weapons touch the extra slots; the shots.c wrap guard and editor clamps key off this).
+// MUST stay in 8..255: multi/max and the fire cursor shotMultiPos are all bytes.
+#define WEAPON_MULTI_MAX 255
+
 typedef struct
 {
 	JE_word     drain;
@@ -37,10 +43,10 @@ typedef struct
 	JE_word     weapani;
 	JE_byte     max;
 	JE_byte     tx, ty, aim;
-	JE_byte     attack[8], del[8]; /* [1..8] */
-	JE_shortint sx[8], sy[8]; /* [1..8] */
-	JE_shortint bx[8], by[8]; /* [1..8] */
-	JE_word     sg[8]; /* [1..8] */
+	JE_byte     attack[WEAPON_MULTI_MAX], del[WEAPON_MULTI_MAX]; /* [1..WEAPON_MULTI_MAX]; on-disk data fills [1..8] */
+	JE_shortint sx[WEAPON_MULTI_MAX], sy[WEAPON_MULTI_MAX];
+	JE_shortint bx[WEAPON_MULTI_MAX], by[WEAPON_MULTI_MAX];
+	JE_word     sg[WEAPON_MULTI_MAX];
 	JE_shortint acceleration, accelerationx;
 	JE_byte     circlesize;
 	JE_byte     sound;
@@ -162,6 +168,13 @@ extern char episode_file[13], cube_file[13];
 extern JE_longint episode1DataLoc;
 extern JE_boolean bonusLevel;
 extern JE_boolean jumpBackToEpisode1;
+extern JE_byte chargeLaserSlot;  // option slot of the re-added Charge-Laser Cannon (0 = none)
+
+// Two scratch weapon slots (in the unused WEAP_END1(818)..WEAP_START2(1000) gap, after
+// the Charge-Laser's 900-905) holding the LV10-length Zica Lv11 side beams the "Long"
+// length option fires. Built by JE_applyZicaLaserConfig; fired in mainint.c / game_menu.c.
+#define ZICA_LONG_WEAP_LEFT  906
+#define ZICA_LONG_WEAP_RIGHT 907
 
 void JE_loadItemDat(void);
 void JE_initEpisode(JE_byte newEpisode);

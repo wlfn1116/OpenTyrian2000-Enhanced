@@ -57,5 +57,6 @@ extern const char *opentyrian_str;
 extern const char *opentyrian_version;
 
 void setupMenu(void);
+bool extraMenu(void);  // title-screen Extra menu; returns true if a game was launched
 
 #endif /* OPENTYR_H */

@@ -149,7 +149,7 @@ bool xmas_prompt(void)
 			JE_showVGA();
 			JE_mouseReplace();
 
-			SDL_Delay(16);
+			SDL_Delay(1);  // fine poll so the cursor redraws at display rate on motion
 
 			Uint16 oldMouseX = mouse_x;
 			Uint16 oldMouseY = mouse_y;

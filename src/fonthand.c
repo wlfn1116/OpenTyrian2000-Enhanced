@@ -95,6 +95,35 @@ void JE_dString(SDL_Surface * screen, int x, int y, const char *s, unsigned int 
 	}
 }
 
+void JE_dStringDarken(SDL_Surface * screen, int x, int y, const char *s, unsigned int font)
+{
+	// Mirror JE_dString's glyph advance exactly (so positions line up with the already-drawn row),
+	// but darken each glyph in place with blit_sprite_dark -- which only touches the glyph-shaped
+	// pixels, so no box is painted over the background. '~' toggles nothing here and never advances.
+	for (int i = 0; s[i] != '\0'; ++i)
+	{
+		const int sprite_id = font_ascii[(unsigned char)s[i]];
+
+		switch (s[i])
+		{
+		case ' ':
+			x += 6;
+			break;
+
+		case '~':
+			break;
+
+		default:
+			if (sprite_id != -1)
+			{
+				blit_sprite_dark(screen, x, y, font, sprite_id, false);
+				x += sprite(font, sprite_id)->width + 1;
+			}
+			break;
+		}
+	}
+}
+
 int JE_fontCenter(const char *s, unsigned int font)
 {
 	return 160 - (JE_textWidth(s, font) / 2);
@@ -225,7 +254,11 @@ void JE_outTextAdjust(SDL_Surface * screen, int x, int y, const char *s, unsigne
 	}
 }
 
-void JE_outTextAndDarken(SDL_Surface * screen, int x, int y, const char *s, unsigned int colorbank, unsigned int brightness, unsigned int font)
+// brightness is SIGNED: a negative value slides the glyph shades DOWN a palette bank's ramp
+// (TINY_FONT bodies sit at shade 7, edges at 3 -- see the Chart-a-Course threat tints), and
+// the blit's value parameter is Sint8 anyway. Keep it >= -2 so the shade-2 edge pixels can't
+// underflow the bank.
+void JE_outTextAndDarken(SDL_Surface * screen, int x, int y, const char *s, unsigned int colorbank, int brightness, unsigned int font)
 {
 	int bright = 0;
 

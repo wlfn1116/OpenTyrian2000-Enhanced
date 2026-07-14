@@ -48,9 +48,11 @@
 #include "destruct.h"
 
 #include "config.h"
+#include "crashlog.h"
 #include "config_file.h"
 #include "fonthand.h"
 #include "helptext.h"
+#include "joystick.h"
 #include "keyboard.h"
 #include "loudness.h"
 #include "mtrand.h"
@@ -68,6 +70,17 @@
 /*** Defines ***/
 #define UNIT_HEIGHT 12
 #define MAX_KEY_OPTIONS 4
+
+/* Widescreen Destruct HUD layout.  Each player's readout is a HUD_FRAME_W-wide
+ * frame lifted from pic #11 with the drawn box sitting 1px inside it, so the
+ * frame's left edge is HUD_BOX_OFFSET px right of DrawHUD's startX anchor.  The
+ * two frames are pinned flush against the screen edges, symmetric about center. */
+#define HUD_FRAME_W        144
+#define HUD_FRAME_LEFT_X   0
+#define HUD_FRAME_RIGHT_X  (vga_width - HUD_FRAME_W)
+#define HUD_BOX_OFFSET     2
+#define HUD_ROWS           12   /* rows 0..HUD_ROWS-1 are the HUD strip; the playfield is below */
+#define HUD_GAP_LEFT       (HUD_FRAME_LEFT_X + HUD_FRAME_W)  /* first column of the playfield gap between the boxes */
 
 /*** Enums ***/
 enum de_state_t
@@ -230,6 +243,10 @@ struct destruct_unit_s
 	float        unitYMov;
 	bool         isYInAir;
 
+	/* Position at the start of the current tick, for the smooth present's
+	 * interpolation (see DE_SmoothPresent). */
+	float        prev_x, prev_y;
+
 	/* What it is and what it fires */
 	enum de_unit_t unitType;
 	enum de_shot_t shotType;
@@ -250,6 +267,7 @@ struct destruct_shot_s
 
 	float x;
 	float y;
+	float prev_x, prev_y;  /* position at the start of the tick, for smooth interpolation */
 	float xmov;
 	float ymov;
 	bool gravity;
@@ -340,12 +358,14 @@ static unsigned int JE_placementPosition(unsigned int, unsigned int, unsigned in
 //drawing functions
 static void JE_aliasDirt(SDL_Surface*);
 static void DE_RunTickDrawCrosshairs(void);
-static void DE_extendHUDColumn(SDL_Surface*);
+static void DE_widenHUDBackdrop(SDL_Surface*);
 static void DE_RunTickDrawHUD(void);
 static void DE_GravityDrawUnit(enum de_player_t, struct destruct_unit_s*);
+static unsigned int DE_unitAnimIndex(enum de_player_t, const struct destruct_unit_s*);
 static void DE_RunTickAnimate(void);
 static void DE_RunTickDrawWalls(void);
 static void DE_DrawTrails(struct destruct_shot_s*, unsigned int, unsigned int, unsigned int);
+static void DE_blendTempPixel(int, int);
 static void JE_tempScreenChecking(void);
 static void JE_superPixel(unsigned int, unsigned int);
 static void JE_pixCool(unsigned int, unsigned int, Uint8);
@@ -379,6 +399,18 @@ static void DE_RunTickExplosions(void);
 static void DE_TestExplosionCollision(unsigned int, unsigned int);
 static void JE_makeExplosion(unsigned int, unsigned int, enum de_shot_t);
 static void DE_MakeShot(enum de_player_t, const struct destruct_unit_s*, int);
+
+//smooth (interpolated + supersampled) present
+static void DE_pixScaled(SDL_Surface*, int, int, Uint8, int);
+static void DE_pixCoolScaled(SDL_Surface*, int, int, Uint8, int);
+static void DE_ExpandBackgroundHi(int);
+static void DE_ExpandHUD(SDL_Surface*, int);
+static void DE_DrawWallsScaled(SDL_Surface*, int);
+static void DE_DrawUnitsScaled(SDL_Surface*, int, float);
+static void DE_DrawShotsScaled(SDL_Surface*, int, float);
+static void DE_DrawCrosshairsScaled(SDL_Surface*, int, float);
+static void DE_ComposeFrame(SDL_Surface*, int, float);
+static void DE_SmoothPresent(int);
 
 //gameplay functions
 static enum de_state_t DE_RunTick(void);
@@ -495,11 +527,49 @@ static SDL_Scancode defaultKeyConfig[MAX_PLAYERS][MAX_KEY][MAX_KEY_OPTIONS] =
 static SDL_Surface* destructTempScreen;
 static JE_boolean destructFirstTime;
 
+/* Clean copy of the HUD strip (rows 0..HUD_ROWS-1), captured by
+ * DE_widenHUDBackdrop and repainted every tick by DE_RunTickDrawHUD so gameplay
+ * pixels can't accumulate on the HUD art. */
+static Uint8 hudBackdrop[HUD_ROWS * vga_width];
+
 static struct destruct_config_s config = { 40, 20, 20, 40, 10, false, false, {true, false}, {true, false} };
 static struct destruct_player_s destruct_player[MAX_PLAYERS];
 static struct destruct_world_s  world;
 static struct destruct_shot_s* shotRec;
 static struct destruct_explo_s* exploRec;
+
+/* Smooth (interpolated + supersampled) present: when Smooth Motion + supersampling are on,
+ * present several interpolated NxN frames per tick instead of one. notes.md §Smooth motion. */
+static SDL_Surface* destruct_hi = NULL;     /* NxN compose + present buffer */
+static SDL_Surface* destruct_bg_hi = NULL;  /* NxN static terrain, rebuilt once per tick */
+
+static bool   destruct_sim_timing_init = false;
+static Uint64 destruct_sim_freq = 0, destruct_sim_last = 0;
+static float  destruct_sim_accum = 0.0f;
+
+static int de_round(float v)
+{
+	return (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+}
+
+static SDL_Surface* de_ensure_surface(SDL_Surface** surf, int scale)
+{
+	const int w = vga_width * scale, h = vga_height * scale;
+	if (*surf != NULL && ((*surf)->w != w || (*surf)->h != h))
+	{
+		SDL_FreeSurface(*surf);
+		*surf = NULL;
+	}
+	if (*surf == NULL)
+		*surf = SDL_CreateRGBSurface(0, w, h, 8, 0, 0, 0, 0);
+	return *surf;
+}
+
+static bool DE_ensureSmoothBuffers(int scale)
+{
+	return de_ensure_surface(&destruct_hi, scale) != NULL
+	    && de_ensure_surface(&destruct_bg_hi, scale) != NULL;
+}
 
 static const char* const player_names[] =
 {
@@ -670,6 +740,7 @@ void JE_destructGame(void)
 
 	/* This is the entry function.  Any one-time actions we need to
 	 * perform can go in here. */
+	crashlog_set_phase("Destruct minigame");
 	set_menu_centered(false);
 	JE_clr256(VGAScreen);
 	JE_showVGA();
@@ -694,6 +765,8 @@ void JE_destructGame(void)
 
 	fade_black(1);
 
+	destruct_sim_timing_init = false;   /* start the smooth-present clock fresh */
+
 	JE_destructMain();
 
 	free_sprite2s(&destructSpriteSheet);
@@ -704,6 +777,9 @@ void JE_destructGame(void)
 	free(world.mapWalls);
 	free(destruct_player[PLAYER_LEFT].unit);
 	free(destruct_player[PLAYER_RIGHT].unit);
+
+	if (destruct_hi != NULL)    { SDL_FreeSurface(destruct_hi);    destruct_hi = NULL; }
+	if (destruct_bg_hi != NULL) { SDL_FreeSurface(destruct_bg_hi); destruct_bg_hi = NULL; }
 }
 
 static void JE_destructMain(void)
@@ -711,7 +787,7 @@ static void JE_destructMain(void)
 	enum de_state_t curState;
 
 	JE_loadPic(VGAScreen, 11, false);
-	DE_extendHUDColumn(VGAScreen);
+	DE_widenHUDBackdrop(VGAScreen);
 	JE_introScreen();
 
 	DE_ResetPlayers();
@@ -731,7 +807,7 @@ static void JE_destructMain(void)
 
 			destructFirstTime = true;
 			JE_loadPic(VGAScreen, 11, false);
-			DE_extendHUDColumn(VGAScreen);
+			DE_widenHUDBackdrop(VGAScreen);
 
 			DE_ResetUnits();
 			DE_ResetLevel();
@@ -758,6 +834,7 @@ static void JE_introScreen(void)
 	newkey = false;
 	while (!newkey)
 	{
+		push_joysticks_as_keyboard();  // let a controller dismiss the title (no keyboard on Switch)
 		service_SDL_events(false);
 		SDL_Delay(16);
 	}
@@ -808,6 +885,7 @@ static enum de_mode_t JE_modeSelect(void)
 		newkey = false;
 		do
 		{
+			push_joysticks_as_keyboard();  // controller -> arrows/Return/Escape (no keyboard on Switch)
 			service_SDL_events(false);
 			SDL_Delay(16);
 		} while (!newkey);
@@ -892,6 +970,12 @@ static void JE_generateTerrain(void)
 	}
 
 	play_song(goodsel[mt_rand() % 14] - 1);
+
+	/* JE_loadPic only fills the original 320px; the widescreen strip past it is
+	 * never written, so clear that sky (rows below the HUD) to black or it shows
+	 * stale pixels from the previous game that pile up across restarts.  Rows
+	 * 0..HUD_ROWS-1 there belong to the right HUD frame, so leave them alone. */
+	fill_rectangle_xy(VGAScreen, LEGACY_WIDTH, HUD_ROWS, vga_width - 1, vga_height - 1, PIXEL_BLACK);
 
 	DE_generateBaseTerrain(world.mapFlags, world.baseMap);
 	DE_generateUnits(world.baseMap);
@@ -1021,6 +1105,8 @@ static void DE_generateUnits(unsigned int* baseWorld)
 			destruct_player[i].unit[j].shotType = defaultWeapon[destruct_player[i].unit[j].unitType];
 			destruct_player[i].unit[j].health = baseDamage[destruct_player[i].unit[j].unitType];
 			destruct_player[i].unit[j].ani_frame = 0;
+			destruct_player[i].unit[j].prev_x = destruct_player[i].unit[j].unitX;
+			destruct_player[i].unit[j].prev_y = destruct_player[i].unit[j].unitY;
 		}
 	}
 }
@@ -1169,22 +1255,30 @@ static void JE_aliasDirt(SDL_Surface* screen)
 	}
 }
 
-static void DE_extendHUDColumn(SDL_Surface* surface)
+static void DE_widenHUDBackdrop(SDL_Surface* surface)
 {
-	const int src_x = 171;
-	const int src_y = 0;
-	const int height = 12;
-	const int extend = 36;
-
-	if (surface->w <= 320)
-		return;
-
-	for (int y = 0; y < height; ++y)
+	/* HUD backdrop = top 12 rows of pic #11: two 320px box frames pinned flush to each screen
+	 * edge with the widened middle blacked out. Finished strip stashed in hudBackdrop for per-tick
+	 * repaints. notes.md §Widescreen. */
+	enum
 	{
-		Uint8* row = (Uint8*)surface->pixels + (src_y + y) * surface->pitch;
-		Uint8 pixel = row[src_x];
-		memmove(row + src_x + extend, row + src_x, surface->w - src_x - extend);
-		memset(row + src_x, pixel, extend);
+		LEFT_SRC_X  = 2,    /* left frame's authored x in pic #11 */
+		RIGHT_SRC_X = 172   /* right frame's authored x in pic #11 */
+	};
+
+	if (surface->w < 2 * HUD_FRAME_W)
+		return;  /* too narrow to seat both frames without overlap */
+
+	for (int y = 0; y < HUD_ROWS; ++y)
+	{
+		Uint8* row = (Uint8*)surface->pixels + y * surface->pitch;
+
+		memmove(row + HUD_FRAME_LEFT_X,  row + LEFT_SRC_X,  HUD_FRAME_W);  /* left frame  -> flush left  */
+		memmove(row + HUD_FRAME_RIGHT_X, row + RIGHT_SRC_X, HUD_FRAME_W);  /* right frame -> flush right */
+		memset(row + HUD_FRAME_LEFT_X + HUD_FRAME_W, PIXEL_BLACK,
+		       HUD_FRAME_RIGHT_X - (HUD_FRAME_LEFT_X + HUD_FRAME_W));      /* clear the middle */
+
+		memcpy(hudBackdrop + y * vga_width, row, vga_width);              /* keep a clean copy */
 	}
 }
 
@@ -1236,40 +1330,35 @@ static bool JE_stabilityCheck(unsigned int x, unsigned int y)
 	return (numDirtPixels < 10);
 }
 
+static void DE_blendTempPixel(int x, int y)
+{
+	/* Fade any explosion pixel (palette 241..255 fades dark-red -> bright-yellow),
+	 * optionally alias dirt, then copy the temp-screen pixel to VGAScreen.  Shared
+	 * by the playfield and HUD-gap passes of JE_tempScreenChecking. */
+	Uint8* temps = (Uint8*)destructTempScreen->pixels + y * destructTempScreen->pitch + x;
+
+	if (*temps >= 241)
+		*temps = (*temps == 241) ? PIXEL_BLACK : *temps - 1;
+
+	if (config.alwaysalias == true && *temps == PIXEL_BLACK)
+		*temps = aliasDirtPixel(VGAScreen, x, y, temps);
+
+	((Uint8*)VGAScreen->pixels)[y * VGAScreen->pitch + x] = *temps;
+}
+
 static void JE_tempScreenChecking(void) /*and copy to vgascreen*/
 {
-	Uint8* s = VGAScreen->pixels;
-	s += 12 * VGAScreen->pitch;
-
-	Uint8* temps = destructTempScreen->pixels;
-	temps += 12 * destructTempScreen->pitch;
-
-	for (int y = 12; y < VGAScreen->h; y++)
-	{
+	/* The playfield is everything from row HUD_ROWS down (full width). */
+	for (int y = HUD_ROWS; y < VGAScreen->h; y++)
 		for (int x = 0; x < VGAScreen->pitch; x++)
-		{
-			// This block is what fades out explosions. The palette from 241
-			// to 255 fades from a very dark red to a very bright yellow.
-			if (*temps >= 241)
-			{
-				if (*temps == 241)
-					*temps = PIXEL_BLACK;
-				else
-					(*temps)--;
-			}
+			DE_blendTempPixel(x, y);
 
-			// This block is for aliasing dirt.  Computers are fast these days,
-			// and it's fun.
-			if (config.alwaysalias == true && *temps == PIXEL_BLACK)
-				*temps = aliasDirtPixel(VGAScreen, x, y, temps);
-
-			/* This is copying from our temp screen to VGAScreen */
-			*s = *temps;
-
-			s++;
-			temps++;
-		}
-	}
+	/* The gap between the two HUD boxes is live playfield as well, all the way to
+	 * the top of the screen, so gameplay passing through it isn't clipped against
+	 * the black HUD strip. */
+	for (int y = 0; y < HUD_ROWS; y++)
+		for (int x = HUD_GAP_LEFT; x < HUD_FRAME_RIGHT_X; x++)
+			DE_blendTempPixel(x, y);
 }
 
 static void JE_makeExplosion(unsigned int tempPosX, unsigned int tempPosY, enum de_shot_t shottype)
@@ -1411,6 +1500,7 @@ static void JE_helpScreen(void)
 
 	do  /* wait until user hits a key */
 	{
+		push_joysticks_as_keyboard();  // controller counts as a keypress (no keyboard on Switch)
 		service_SDL_events(true);
 		SDL_Delay(16);
 	} while (!newkey);
@@ -1432,6 +1522,7 @@ static void JE_pauseScreen(void)
 
 	do  /* wait until user hits a key */
 	{
+		push_joysticks_as_keyboard();  // controller counts as a keypress (no keyboard on Switch)
 		service_SDL_events(true);
 		SDL_Delay(16);
 	} while (!newkey);
@@ -1536,6 +1627,239 @@ static void DE_ResetActions(void)
 	}
 }
 
+/* Smooth present helpers: build a supersampled (NxN) frame from the same game state as the
+ * classic per-tick draw, with moving objects at interpolated sub-pixel positions. The static
+ * terrain expands once per tick into destruct_bg_hi; each frame copies it, then draws the
+ * interpolated foreground and HUD on top. */
+
+/* Fill a scale x scale block at hi-surface pixel (hx, hy), clipped to the surface. */
+static void DE_pixScaled(SDL_Surface* hi, int hx, int hy, Uint8 c, int scale)
+{
+	int x0 = hx < 0 ? 0 : hx, y0 = hy < 0 ? 0 : hy;
+	int x1 = hx + scale, y1 = hy + scale;
+	if (x1 > hi->w) x1 = hi->w;
+	if (y1 > hi->h) y1 = hi->h;
+
+	for (int y = y0; y < y1; ++y)
+	{
+		Uint8* p = (Uint8*)hi->pixels + y * hi->pitch + x0;
+		for (int x = x0; x < x1; ++x)
+			*p++ = c;
+	}
+}
+
+/* Supersampled equivalent of JE_pixCool: a bright centre with four dimmer
+ * neighbours, each a scale x scale block one logical pixel (= scale) apart. */
+static void DE_pixCoolScaled(SDL_Surface* hi, int hx, int hy, Uint8 c, int scale)
+{
+	DE_pixScaled(hi, hx,         hy,         c,     scale);
+	DE_pixScaled(hi, hx - scale, hy,         c - 2, scale);
+	DE_pixScaled(hi, hx + scale, hy,         c - 2, scale);
+	DE_pixScaled(hi, hx,         hy - scale, c - 2, scale);
+	DE_pixScaled(hi, hx,         hy + scale, c - 2, scale);
+}
+
+/* Block-expand the clean terrain (VGAScreen right after JE_tempScreenChecking)
+ * into destruct_bg_hi.  Runs once per tick; the terrain is static within a tick.
+ * The HUD box rows are stale here but get repainted on top per frame (DE_ExpandHUD). */
+static void DE_ExpandBackgroundHi(int scale)
+{
+	for (int y = 0; y < vga_height; ++y)
+	{
+		const Uint8* src = (const Uint8*)VGAScreen->pixels + y * VGAScreen->pitch;
+		Uint8* hrow = (Uint8*)destruct_bg_hi->pixels + (y * scale) * destruct_bg_hi->pitch;
+
+		for (int x = 0; x < vga_width; ++x)
+		{
+			Uint8 c = src[x];
+			Uint8* p = hrow + x * scale;
+			for (int xx = 0; xx < scale; ++xx)
+				p[xx] = c;
+		}
+		for (int yy = 1; yy < scale; ++yy)
+			memcpy(hrow + yy * destruct_bg_hi->pitch, hrow, (size_t)vga_width * scale);
+	}
+}
+
+/* Repaint the two HUD boxes (rows 0..HUD_ROWS-1, the flush-mounted left/right
+ * frames) on top of the composed frame, block-expanded from the 1x HUD that
+ * DE_RunTickDrawHUD drew into VGAScreen this tick.  The gap between the boxes is
+ * live playfield and is left untouched, matching the classic path. */
+static void DE_ExpandHUD(SDL_Surface* hi, int scale)
+{
+	static const int spans[2][2] = { { 0, HUD_GAP_LEFT }, { HUD_FRAME_RIGHT_X, vga_width } };
+
+	for (int y = 0; y < HUD_ROWS; ++y)
+	{
+		const Uint8* src = (const Uint8*)VGAScreen->pixels + y * VGAScreen->pitch;
+		Uint8* hrow = (Uint8*)hi->pixels + (y * scale) * hi->pitch;
+
+		for (int s = 0; s < 2; ++s)
+			for (int x = spans[s][0]; x < spans[s][1]; ++x)
+			{
+				Uint8 c = src[x];
+				Uint8* p = hrow + x * scale;
+				for (int xx = 0; xx < scale; ++xx)
+					p[xx] = c;
+			}
+
+		for (int yy = 1; yy < scale; ++yy)
+			for (int s = 0; s < 2; ++s)
+				memcpy(hrow + yy * hi->pitch + spans[s][0] * scale,
+				       hrow + spans[s][0] * scale,
+				       (size_t)(spans[s][1] - spans[s][0]) * scale);
+	}
+}
+
+static void DE_DrawWallsScaled(SDL_Surface* hi, int scale)
+{
+	for (unsigned int i = 0; i < config.max_walls; ++i)
+		if (world.mapWalls[i].wallExist)
+			blit_sprite2_scaled(hi, world.mapWalls[i].wallX * scale, world.mapWalls[i].wallY * scale,
+			                    destructSpriteSheet, 42, scale, BLIT2_COPY, 0);
+}
+
+static void DE_DrawUnitsScaled(SDL_Surface* hi, int scale, float alpha)
+{
+	for (unsigned int p = 0; p < MAX_PLAYERS; ++p)
+	{
+		struct destruct_unit_s* unit = destruct_player[p].unit;
+		for (unsigned int u = 0; u < config.max_installations; ++u, ++unit)
+		{
+			if (DE_isValidUnit(unit) == false)
+				continue;
+
+			float ix = unit->prev_x + ((float)unit->unitX - unit->prev_x) * alpha;
+			float iy = unit->prev_y + (unit->unitY - unit->prev_y) * alpha;
+
+			blit_sprite2_scaled(hi, de_round(ix * scale), de_round(iy * scale) - 13 * scale,
+			                    destructSpriteSheet, DE_unitAnimIndex(p, unit), scale, BLIT2_COPY, 0);
+		}
+	}
+}
+
+static void DE_DrawShotsScaled(SDL_Surface* hi, int scale, float alpha)
+{
+	for (unsigned int i = 0; i < config.max_shots; ++i)
+	{
+		if (shotRec[i].isAvailable)
+			continue;
+
+		Uint8 headColor = (shotColor[shotRec[i].shottype] << 4) - 3;
+
+		/* Trail: historical positions, drawn where the sim left them (no interpolation). */
+		for (int t = 0; t < 4; ++t)
+			if (shotRec[i].trailc[t] > 0 && shotRec[i].traily[t] > 0)
+				DE_pixCoolScaled(hi, shotRec[i].trailx[t] * scale, shotRec[i].traily[t] * scale,
+				                 shotRec[i].trailc[t], scale);
+
+		/* Head: interpolated from last tick's position to this tick's. */
+		float ix = shotRec[i].prev_x + (shotRec[i].x - shotRec[i].prev_x) * alpha;
+		float iy = shotRec[i].prev_y + (shotRec[i].y - shotRec[i].prev_y) * alpha;
+		if (iy >= 0 && iy < vga_height)
+			DE_pixCoolScaled(hi, de_round(ix * scale), de_round(iy * scale), headColor, scale);
+	}
+}
+
+static void DE_DrawCrosshairsScaled(SDL_Surface* hi, int scale, float alpha)
+{
+	/* Mirrors DE_RunTickDrawCrosshairs, but off the interpolated unit position and
+	 * drawn as scaled blocks. */
+	for (unsigned int i = 0; i < MAX_PLAYERS; ++i)
+	{
+		int direction = (i == PLAYER_LEFT) ? -1 : 1;
+		struct destruct_unit_s* curUnit = &destruct_player[i].unit[destruct_player[i].unitSelected];
+
+		float ux = curUnit->prev_x + ((float)curUnit->unitX - curUnit->prev_x) * alpha;
+		float uy = curUnit->prev_y + (curUnit->unitY - curUnit->prev_y) * alpha;
+
+		float fx, fy;
+		if (curUnit->unitType == UNIT_HELI)
+		{
+			fx = ux + 0.1f * curUnit->lastMove * curUnit->lastMove * curUnit->lastMove + 5;
+			fy = uy + 1;
+		}
+		else
+		{
+			fx = ux + 6 - cosf(curUnit->angle) * (curUnit->power * 8 + 7) * direction;
+			fy = uy - 7 - sinf(curUnit->angle) * (curUnit->power * 8 + 7);
+		}
+
+		int tempPosY = de_round(fy);   /* logical Y, for the HUD-clip gates below */
+		int hx = de_round(fx * scale);
+		int hy = de_round(fy * scale);
+
+		if (tempPosY > 9)
+		{
+			if (tempPosY > 11)
+			{
+				if (tempPosY > 13)
+					DE_pixScaled(hi, hx, hy - 2 * scale, 3, scale);   /* top pixel */
+				DE_pixScaled(hi, hx + 3 * scale, hy, 3, scale);
+				DE_pixScaled(hi, hx,             hy, 14, scale);
+				DE_pixScaled(hi, hx - 3 * scale, hy, 3, scale);
+			}
+			DE_pixScaled(hi, hx, hy + 2 * scale, 3, scale);           /* bottom pixel */
+		}
+	}
+}
+
+static void DE_ComposeFrame(SDL_Surface* hi, int scale, float alpha)
+{
+	memcpy(hi->pixels, destruct_bg_hi->pixels, (size_t)hi->h * hi->pitch);
+	DE_DrawWallsScaled(hi, scale);
+	DE_DrawUnitsScaled(hi, scale, alpha);
+	DE_DrawShotsScaled(hi, scale, alpha);
+	DE_DrawCrosshairsScaled(hi, scale, alpha);
+	DE_ExpandHUD(hi, scale);   /* HUD last, on top, matching the classic draw order */
+}
+
+/* Present interpolated, supersampled frames until a full tick period has elapsed,
+ * then return so the caller runs the next simulation tick.  Modeled on the main
+ * game's present loop (JE_starShowVGA): a real-time accumulator keeps the sim rate
+ * exact regardless of how many frames we manage to draw. */
+static void DE_SmoothPresent(int scale)
+{
+	const float period = get_delay_period();   /* destruct paces one tick per setDelay(1) unit */
+
+	if (!destruct_sim_timing_init)
+	{
+		destruct_sim_freq = SDL_GetPerformanceFrequency();
+		destruct_sim_last = SDL_GetPerformanceCounter();
+		destruct_sim_accum = 0.0f;
+		destruct_sim_timing_init = true;
+	}
+
+	const float counter_to_ms = 1000.0f / (float)destruct_sim_freq;
+
+	for (;;)
+	{
+		const Uint64 now = SDL_GetPerformanceCounter();
+		float elapsed = (float)(now - destruct_sim_last) * counter_to_ms;
+		destruct_sim_last = now;
+		if (elapsed > period * 4.0f)
+			elapsed = period;   /* spiral guard (lag spike / resume from pause) */
+		destruct_sim_accum += elapsed;
+
+		if (destruct_sim_accum >= period)
+		{
+			destruct_sim_accum -= period;
+			if (destruct_sim_accum > period)
+				destruct_sim_accum = period;   /* at most one tick behind */
+			break;
+		}
+
+		DE_ComposeFrame(destruct_hi, scale, destruct_sim_accum / period);
+		present_hi(destruct_hi);
+
+		if (!output_vsync)
+			limit_render_fps();
+		service_SDL_events(false);
+	}
+
+	setDelay(1);   /* keep `target` current for other timing readers */
+}
+
 /* DE_RunTick
  *
  * Runs one tick.  One tick involves handling physics, drawing crap,
@@ -1552,6 +1876,15 @@ static enum de_state_t DE_RunTick(void)
 	memset(soundQueue, 0, sizeof(soundQueue));
 	JE_tempScreenChecking();
 
+	/* The smooth present kicks in once we're past the first (fade-in) tick, when the
+	 * user has Smooth Motion on and supersampling is running.  When it does, capture
+	 * the clean terrain now -- before this tick draws units/shots over it -- so the
+	 * interpolated frames can be rebuilt from a static background. */
+	const int de_ss = effective_supersample();
+	const bool smooth = smoothMotion && de_ss > 1 && !destructFirstTime && DE_ensureSmoothBuffers(de_ss);
+	if (smooth)
+		DE_ExpandBackgroundHi(de_ss);
+
 	DE_ResetActions();
 	DE_RunTickCycleDeadUnits();
 
@@ -1563,7 +1896,8 @@ static enum de_state_t DE_RunTick(void)
 	DE_RunTickAI();
 	DE_RunTickDrawCrosshairs();
 	DE_RunTickDrawHUD();
-	JE_showVGA();
+	if (!smooth)
+		JE_showVGA();   /* smooth path presents in DE_SmoothPresent below */
 
 	if (destructFirstTime)
 	{
@@ -1610,7 +1944,12 @@ static enum de_state_t DE_RunTick(void)
 		keysactive[lastkey_scan] = false;
 	}
 
-	wait_delay();
+	/* Present the tick.  In smooth mode this loop spans the tick period, drawing
+	 * interpolated supersampled frames; otherwise just wait out the period. */
+	if (smooth)
+		DE_SmoothPresent(de_ss);
+	else
+		wait_delay();
 
 	if (keysactive[SDL_SCANCODE_ESCAPE])
 	{
@@ -1672,6 +2011,11 @@ static void DE_RunTickGravity(void)
 			if (DE_isValidUnit(unit) == false) /* invalid unit */
 				continue;
 
+			/* Remember the pre-tick position so the smooth present can interpolate
+			 * from here to wherever this tick's gravity (and later input) leaves it. */
+			unit->prev_x = unit->unitX;
+			unit->prev_y = unit->unitY;
+
 			switch (unit->unitType)
 			{
 			case UNIT_SATELLITE: /* satellites don't fall down */
@@ -1696,11 +2040,9 @@ static void DE_RunTickGravity(void)
 	}
 }
 
-static void DE_GravityDrawUnit(enum de_player_t team, struct destruct_unit_s* unit)
+static unsigned int DE_unitAnimIndex(enum de_player_t team, const struct destruct_unit_s* unit)
 {
-	unsigned int anim_index;
-
-	anim_index = GraphicBase[team][unit->unitType] + unit->ani_frame;
+	unsigned int anim_index = GraphicBase[team][unit->unitType] + unit->ani_frame;
 	if (unit->unitType == UNIT_HELI)
 	{
 		/* Adjust animation index if we are traveling right or left. */
@@ -1713,8 +2055,12 @@ static void DE_GravityDrawUnit(enum de_player_t team, struct destruct_unit_s* un
 	{
 		anim_index += floorf(unit->angle * 9.99f / M_PI);
 	}
+	return anim_index;
+}
 
-	blit_sprite2(VGAScreen, unit->unitX, roundf(unit->unitY) - 13, destructSpriteSheet, anim_index);
+static void DE_GravityDrawUnit(enum de_player_t team, struct destruct_unit_s* unit)
+{
+	blit_sprite2(VGAScreen, unit->unitX, roundf(unit->unitY) - 13, destructSpriteSheet, DE_unitAnimIndex(team, unit));
 }
 
 static void DE_GravityLowerUnit(struct destruct_unit_s* unit)
@@ -1839,9 +2185,14 @@ static void DE_RunTickExplosions(void)
 			while (tempPosX >= vga_width)
 				tempPosX -= vga_width;
 
-			/* We don't draw our explosion if it's out of bounds vertically */
-			if (tempPosY >= 200 || tempPosY <= 15)
-				continue;
+			/* We don't draw our explosion if it's out of bounds vertically.  In
+			 * the gap between the HUD boxes the playfield runs to the top of the
+			 * screen, so allow flares up there; elsewhere keep them below the HUD. */
+			{
+				bool inGap = (tempPosX >= HUD_GAP_LEFT && tempPosX < HUD_FRAME_RIGHT_X);
+				if (tempPosY >= 200 || tempPosY <= (inGap ? 0 : 15))
+					continue;
+			}
 
 			/* And now the drawing.  There are only two types of explosions
 			 * right now; dirt and flares.  Dirt simply draws a brown pixel;
@@ -1920,6 +2271,10 @@ static void DE_RunTickShots(void)
 		if (shotRec[i].isAvailable == true)
 			continue;  /* Nothing to do */
 
+		/* Remember the pre-move position so the smooth present can interpolate. */
+		shotRec[i].prev_x = shotRec[i].x;
+		shotRec[i].prev_y = shotRec[i].y;
+
 		/* Move the shot.  Simple displacement */
 		shotRec[i].x += shotRec[i].xmov;
 		shotRec[i].y += shotRec[i].ymov;
@@ -1960,13 +2315,35 @@ static void DE_RunTickShots(void)
 			continue;
 		}
 
-		/* Now check for collisions. */
+		/* Draw the shot (and its trail) first -- even above the map, so it shows
+		 * in the playfield gap between the HUD boxes.  Only while it's actually
+		 * on-screen; collisions are gated separately below. */
+		tempPosX = roundf(shotRec[i].x);
+		tempTrails = (shotColor[shotRec[i].shottype] << 4) - 3;
+
+		if (shotRec[i].y >= 0 && shotRec[i].y < vga_height)
+		{
+			tempPosY = roundf(shotRec[i].y);
+			JE_pixCool(tempPosX, tempPosY, tempTrails);
+
+			/*Draw the shot trail (if applicable) */
+			switch (shotTrail[shotRec[i].shottype])
+			{
+			case TRAILS_NONE:
+				break;
+			case TRAILS_NORMAL:
+				DE_DrawTrails(&(shotRec[i]), 2, 4, tempTrails - 3);
+				break;
+			case TRAILS_FULL:
+				DE_DrawTrails(&(shotRec[i]), 4, 3, tempTrails - 1);
+				break;
+			}
+		}
 
 		/* Don't bother checking for collisions above the map :) */
 		if (shotRec[i].y <= 14)
 			continue;
 
-		tempPosX = roundf(shotRec[i].x);
 		tempPosY = roundf(shotRec[i].y);
 
 		/*Check building hits*/
@@ -1985,22 +2362,6 @@ static void DE_RunTickShots(void)
 					JE_makeExplosion(tempPosX, tempPosY, shotRec[i].shottype);
 				}
 			}
-		}
-
-		tempTrails = (shotColor[shotRec[i].shottype] << 4) - 3;
-		JE_pixCool(tempPosX, tempPosY, tempTrails);
-
-		/*Draw the shot trail (if applicable) */
-		switch (shotTrail[shotRec[i].shottype])
-		{
-		case TRAILS_NONE:
-			break;
-		case TRAILS_NORMAL:
-			DE_DrawTrails(&(shotRec[i]), 2, 4, tempTrails - 3);
-			break;
-		case TRAILS_FULL:
-			DE_DrawTrails(&(shotRec[i]), 4, 3, tempTrails - 1);
-			break;
 		}
 
 		/* Bounce off of or destroy walls */
@@ -2057,7 +2418,7 @@ static void DE_DrawTrails(struct destruct_shot_s* shot, unsigned int count, unsi
 
 	for (i = count - 1; i >= 0; i--) /* going in reverse is important as it affects how we draw */
 	{
-		if (shot->trailc[i] > 0 && shot->traily[i] > 12) /* If it exists and if it's not out of bounds, draw it. */
+		if (shot->trailc[i] > 0 && shot->traily[i] > 0) /* exists and on-screen (HUD boxes are repainted over) -> draw it */
 		{
 			JE_pixCool(shot->trailx[i], shot->traily[i], shot->trailc[i]);
 		}
@@ -2322,14 +2683,27 @@ static void DE_RunTickDrawCrosshairs(void)
 static void DE_RunTickDrawHUD(void)
 {
 	unsigned int i;
-	unsigned int startX;
+	int startX;
 	char tempstr[16]; /* Max size needed: 16 assuming 10 digit int max. */
 	struct destruct_unit_s* curUnit;
+
+	/* Repaint the clean HUD backdrop under the two boxes first, so units or walls
+	 * that poke into the top rows can't scribble on the HUD art.  Only the box
+	 * columns are repainted -- the gap between them (HUD_GAP_LEFT..HUD_FRAME_RIGHT_X)
+	 * is left as live playfield, restored each tick by JE_tempScreenChecking. */
+	for (unsigned int y = 0; y < HUD_ROWS; ++y)
+	{
+		Uint8* dst = (Uint8*)VGAScreen->pixels + y * VGAScreen->pitch;
+		const Uint8* src = hudBackdrop + y * vga_width;
+		memcpy(dst, src, HUD_GAP_LEFT);                                                            /* left box columns  */
+		memcpy(dst + HUD_FRAME_RIGHT_X, src + HUD_FRAME_RIGHT_X, vga_width - HUD_FRAME_RIGHT_X);    /* right box columns */
+	}
 
 	for (i = 0; i < MAX_PLAYERS; i++)
 	{
 		curUnit = &(destruct_player[i].unit[destruct_player[i].unitSelected]);
-		startX = ((i == PLAYER_LEFT) ? 0 : vga_width - 150);
+		/* Anchor each box 1px inside its flush-mounted frame (see HUD defines). */
+		startX = ((i == PLAYER_LEFT) ? HUD_FRAME_LEFT_X : HUD_FRAME_RIGHT_X) - HUD_BOX_OFFSET;
 
 		fill_rectangle_xy(VGAScreen, startX + 5, 3, startX + 14, 8, 241);
 		JE_rectangle(VGAScreen, startX + 4, 2, startX + 15, 9, 242);
@@ -2384,6 +2758,39 @@ static void DE_RunTickGetInput(void)
 					break;
 				}
 			}
+		}
+	}
+
+	// Controller support: map the pad to each human player's destruct moves. Destruct is
+	// otherwise keyboard-only, so this is the only way to play it on the Switch (no keyboard).
+	// One controller drives every human player (a 2-player match would need two pads).
+	if (joysticks > 0)
+	{
+		poll_joystick(0);
+
+		// Pause quits the minigame -- there is no keyboard Escape on the Switch.
+		if (joystick[0].action_pressed[5])
+			keysactive[SDL_SCANCODE_ESCAPE] = true;
+
+		for (player_index = 0; player_index < MAX_PLAYERS; player_index++)
+		{
+			if (destruct_player[player_index].is_cpu)
+				continue;
+
+			bool *act = destruct_player[player_index].moves.actions;
+			if (joystick[0].direction[3])      act[KEY_LEFT]   = true;  // aim left  / move left
+			if (joystick[0].direction[1])      act[KEY_RIGHT]  = true;  // aim right / move right
+			if (joystick[0].direction[0])      act[KEY_UP]     = true;  // more power
+			if (joystick[0].direction[2])      act[KEY_DOWN]   = true;  // less power
+			// A controller bound to fire AND weapon-cycle on one physical button (e.g. the R
+			// shoulder set to both "fire" and "right sidekick") would otherwise shoot the tower
+			// every time you cycle. Ignore fire while a weapon-cycle button is held so cycling
+			// never fires; firing is done with its own, non-cycle button.
+			bool cycling = joystick[0].action[2] || joystick[0].action[3];
+			if (joystick[0].action[0] && !cycling) act[KEY_FIRE] = true;  // fire (held)
+			if (joystick[0].action_pressed[1]) act[KEY_CHANGE] = true;  // change unit (tap)
+			if (joystick[0].action_pressed[2]) act[KEY_CYDN]   = true;  // previous weapon (tap)
+			if (joystick[0].action_pressed[3]) act[KEY_CYUP]   = true;  // next weapon (tap)
 		}
 	}
 }
@@ -2640,6 +3047,11 @@ static void DE_MakeShot(enum de_player_t curPlayer, const struct destruct_unit_s
 
 	/* Now set/clear out a few last details. */
 	shotRec[shotIndex].isAvailable = false;
+
+	/* A freshly-fired shot has no previous position; anchor it where it spawned so
+	 * the smooth present holds it still until it actually moves next tick. */
+	shotRec[shotIndex].prev_x = shotRec[shotIndex].x;
+	shotRec[shotIndex].prev_y = shotRec[shotIndex].y;
 
 	shotRec[shotIndex].shottype = curUnit->shotType;
 	//shotRec[shotIndex].shotdur = shotFuse[shotRec[shotIndex].shottype];

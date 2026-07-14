@@ -43,13 +43,21 @@ enum
 	SA_ARCADE = 255
 };
 
-#define ENEMY_SHOT_MAX  60 /* 60*/
+// Enemy-shot pool. ENEMY_SHOT_MAX sizes the enemyShot[]/enemyShotAvail[] arrays AND is the pool
+// cap used in ENDLESS mode, where the "rising tide" fans out many extra enemy bullets. Normal
+// (non-endless) play stays capped at ENEMY_SHOT_NORMAL (the original 60), so those levels fire
+// exactly as before -- the enemy-shot creation loop (tyrian2.c) picks the cap by mode. The pool
+// must stay below the render-list id headroom: RL_ID_ESHOT_BASE + slot < RL_ID_EXPL_BASE, i.e.
+// ENEMY_SHOT_MAX <= 1000 (see render_list.h).
+#define ENEMY_SHOT_NORMAL  60   // non-endless cap (= original behaviour)
+#define ENEMY_SHOT_MAX     500  // array size + endless cap
 
 #define CURRENT_KEY_SPEED 1  /*Keyboard/Joystick movement rate*/
 
 #define MAX_EXPLOSIONS           200
 #define MAX_REPEATING_EXPLOSIONS 20
-#define MAX_SUPERPIXELS          101
+#define MAX_SUPERPIXELS          50000  // was 101; global spark ring buffer -- bigger = denser/longer explosion showers
+#define SUPERPIXELS_CLASSIC      101  // the original DOS spark cap; the "Extra Sparks" toggle (extraSparks, config.c) picks between the two
 
 struct JE_SingleEnemyType
 {
@@ -60,6 +68,9 @@ struct JE_SingleEnemyType
 	JE_shortint excc, eycc; /* FIXED ACCELERATION WAITTIME */
 	JE_shortint exccw, eyccw;
 	JE_byte     armorleft;
+	int         damageAccum; /* expert-mode boss HP: accumulates damage, expertBossHpMult pts = 1 armor */
+	JE_byte     healthbar_max;  /* armor at the moment of the first hit = denominator for the enemy HP bar */
+	JE_boolean  healthbar_seen; /* set once this enemy has taken player damage (gates the enemy HP bar) */
 	JE_byte     eshotwait[3], eshotmultipos[3]; /* [1..3] */
 	JE_byte     enemycycle;
 	JE_byte     ani;
@@ -80,7 +91,7 @@ struct JE_SingleEnemyType
 	JE_word     edgr;
 	JE_shortint edlevel;
 	JE_shortint edani;
-	JE_byte     fill1;
+	JE_byte     eliteState; /* endless: 0=undecided, 1=normal, 2=elite, 3=champion (endless.c) */
 	JE_byte     filter;
 	JE_integer  evalue;
 	JE_integer  fixedmovey;
@@ -95,6 +106,8 @@ struct JE_SingleEnemyType
 	JE_boolean  enemyground;
 	JE_byte     explonum;
 	JE_integer  mapoffset;
+	float       mapoffset_frac;  // sub-pixel part of the parallax anchor, for the smooth-H health bar
+	float       scroll_yfrac;    // sub-pixel part of the vertical scroll anchor, for the smooth-V health bar
 	JE_boolean  scoreitem;
 
 	JE_boolean  special;
@@ -190,6 +203,8 @@ typedef struct {
 	bool followPlayer;
 	bool fixedPosition;
 	JE_integer deltaY;
+	Uint8 id_gen;  // bumped each time this slot is reused, to disambiguate the render-
+	               // list interpolation id so a recycled slot isn't mis-paired
 } Explosion;
 
 typedef struct {
@@ -225,7 +240,10 @@ extern const JE_byte shipCombos[19][3];
 extern JE_byte SFCurrentCode[2][21];
 extern JE_byte SFExecuted[2];
 extern JE_byte lvlFileNum;
+extern JE_byte forcedLvlFileNum;  // one-shot: force the next load's lvlFileNum past JE_loadMap's rescan (0 = section default)
 extern JE_word maxEvent, eventLoc;
+extern struct JE_EventRecType eventRec[];
+extern JE_word levelEnemy[40], levelEnemyMax;
 extern JE_word tempBackMove, explodeMove;
 extern JE_byte levelEnd;
 extern JE_word levelEndFxWait;
@@ -283,6 +301,8 @@ extern JE_MultiEnemyType enemy;
 extern JE_EnemyAvailType enemyAvail;
 extern JE_word enemyOffset;
 extern JE_word enemyOnScreen;
+extern JE_word enemyParkedAbove;
+extern JE_word mapStopStallTicks;
 extern JE_word superEnemy254Jump;
 extern Explosion explosions[MAX_EXPLOSIONS];
 extern JE_integer explosionFollowAmountX, explosionFollowAmountY;
@@ -290,6 +310,9 @@ extern JE_boolean fireButtonHeld;
 extern JE_boolean enemyShotAvail[ENEMY_SHOT_MAX];
 extern EnemyShotType enemyShot[ENEMY_SHOT_MAX];
 extern JE_byte zinglonDuration;
+extern bool zinglonPillarActive;
+extern int zinglonPillarCX;
+extern int zinglonPillarTemp;
 extern JE_byte astralDuration;
 extern JE_word flareDuration;
 extern JE_boolean flareStart;
@@ -302,20 +325,99 @@ extern JE_boolean infiniteShot;
 extern JE_boolean cheatInfiniteSidekickAmmo;
 extern JE_boolean cheatInfiniteShields;
 extern JE_boolean cheatInfiniteArmor;
+extern JE_boolean cheatInfiniteGenerator;  /* debug: weapons don't drain generator power */
+extern JE_boolean cheatNoEnemyFire;  /* debug: suppress enemy projectiles */
+extern JE_boolean cheatInstantCharge;  /* debug: charge sidekicks reach full charge instantly */
+
+// Noclip debug mode (cycled in the debug menu): pass through enemies without
+// collision. The transparent state additionally draws the ship semi-transparent.
+enum
+{
+	NOCLIP_OFF         = 0,  // normal collision
+	NOCLIP_ON          = 1,  // pass through enemies, ship drawn normally
+	NOCLIP_TRANSPARENT = 2,  // pass through enemies, ship drawn semi-transparent
+	NOCLIP_NUM         = 3,
+};
+extern JE_byte noclipMode;
+
+extern JE_boolean debugHitboxOverlay;  /* debug: draw collision boxes */
+extern JE_boolean debugPerfOverlay;    /* debug: draw FPS/timing/counts overlay */
 extern JE_boolean autoFireSpecial;
-extern JE_boolean chargeSidekickAutofire;
+extern JE_byte    debugTwiddleSpecial;      /* debug: selected twiddle's special index (0 = none) */
+extern JE_boolean debugAutofireTwiddle;     /* debug: auto-fire the selected twiddle while fire is held */
+extern JE_boolean debugTwiddleTrigger;      /* debug: one-shot fire request from the debug menu */
+extern JE_boolean debugToggleFire;          /* debug: fire button toggles auto-fire on/off */
+extern JE_boolean debugToggleFireActive;    /* debug: Toggle Fire latch -- currently auto-firing */
+
+// "Autofire Charge Sidekicks" mode (cycled in the debug menu). Governs whether a
+// charge sidekick (pwr > 0) fires while the main fire button is held.
+enum
+{
+	CHARGE_AUTOFIRE_OFF  = 0,  // only fires on its own dedicated sidekick button
+	CHARGE_AUTOFIRE_ON   = 1,  // autofires while the main fire button is held
+	CHARGE_AUTOFIRE_FULL = 2,  // autofires on the main button only when fully charged
+	CHARGE_AUTOFIRE_FAST = 3,  // like ON, but reloads at the fastest charge stage's shotrepeat;
+	                           // paired with Instant Charge this fires full-power shots at top speed
+	CHARGE_AUTOFIRE_NUM  = 4,  // (append new modes; the value is saved per slot -- don't renumber)
+};
+extern JE_byte    chargeSidekickAutofire;
 extern JE_boolean difficultyAdjust;
 extern JE_boolean expertMode;
+
+/* Expert-mode tunables (adjustable via the Expert Settings debug submenu).
+ * Defaults are deliberately mild so expert mode is "harder but fair". */
+#define EXPERT_DEF_BOSS_HP      3    /* boss HP multiplier (x)            */
+#define EXPERT_DEF_ENEMY_ARMOR  125  /* regular enemy armor scaling (%)   */
+#define EXPERT_DEF_ENERGY       150  /* weapon energy use (%)             */
+#define EXPERT_DEF_SHOP_COST    2    /* shop purchase cost multiplier (x) */
+#define EXPERT_DEF_UPGRADE_COST 2    /* weapon upgrade cost multiplier (x)*/
+#define EXPERT_DEF_CASH         150  /* cash earned from enemies (%)      */
+
+extern int expertBossHpMult;     /* divisor: bosses take 1/N damage -> Nx HP */
+extern int expertEnemyArmorPct;  /* >=100; scales non-boss enemy armor       */
+extern int expertEnergyPct;      /* >=100; scales weapon energy use          */
+extern int expertShopCostMult;   /* >=1; scales shop purchase prices         */
+extern int expertUpgradeCostMult;/* >=1; scales weapon power upgrade prices  */
+extern int expertScorePct;       /* >=100; scales cash earned from enemies   */
+
+/* Shared descriptor for the expert tunables: one source of truth driving the
+ * debug submenu, the config load/save, and reset-to-defaults. */
+typedef struct
+{
+	const char* label;   /* submenu label                  */
+	const char* cfgKey;  /* opentyrian.cfg option key      */
+	int*        value;   /* the live global                */
+	int         lo, hi;  /* inclusive adjustable range     */
+	int         step;    /* adjust increment               */
+	int         def;     /* default value                  */
+	char        fmt;     /* 'x' multiplier or '%' percent  */
+}
+ExpertSetting;
+
+extern ExpertSetting expertSettings[];
+extern const int expertSettingsCount;
+
+void clamp_expert_settings(void);  /* clamp each tunable into [lo, hi] */
+
 extern JE_boolean allPlayersGone;
 extern const uint shadowYDist;
 extern JE_real optionSatelliteRotate;
-extern JE_integer optionAttachmentMove;
-extern JE_boolean optionAttachmentLinked, optionAttachmentReturn;
+extern JE_integer optionAttachmentMove[2];                               // per sidekick slot (LEFT/RIGHT)
+extern JE_boolean optionAttachmentLinked[2], optionAttachmentReturn[2];  // so both front options can launch
 extern JE_byte chargeWait, chargeLevel, chargeMax, chargeGr, chargeGrWait;
 extern JE_word neat;
 extern rep_explosion_type rep_explosions[MAX_REPEATING_EXPLOSIONS];
 extern superpixel_type superpixels[MAX_SUPERPIXELS];
 extern unsigned int last_superpixel;
+
+// Optional clip window for JE_drawSP. While active, superpixels are only plotted (and
+// recorded for smooth replay) inside [x0,x1) x [y0,y1). The shop weapon preview sets this
+// to the preview box so spark trails can't spill out into the item list on the right;
+// gameplay leaves it inactive (sparks clip to the full screen).
+extern bool superpixelClipActive;
+extern int superpixelClipX0, superpixelClipY0, superpixelClipX1, superpixelClipY1;
+void JE_setSPClip(int x0, int y0, int x1, int y1);
+void JE_clearSPClip(void);
 extern JE_byte temp, temp2, temp3;
 extern JE_word tempW;
 extern JE_boolean doNotSaveBackup;
@@ -355,7 +457,9 @@ void JE_drawArmor(void);
 JE_word JE_portConfigs(void);
 
 /*SuperPixels*/
-void JE_doSP(JE_word x, JE_word y, JE_word num, JE_byte explowidth, JE_byte color);
+// classic_cap forces the classic 101-spark limit for this call even when extraSparks is on
+// (used by the superspark weapon trails); pass false to honor the extraSparks setting.
+void JE_doSP(JE_word x, JE_word y, JE_word num, JE_byte explowidth, JE_byte color, bool classic_cap);
 void JE_drawSP(void);
 
 void JE_drawOptionLevel(void);

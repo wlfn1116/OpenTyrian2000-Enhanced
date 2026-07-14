@@ -34,6 +34,11 @@ enum
 	RIGHT_SIDEKICK = 1
 };
 
+// Horizontal offset each way when BOTH sidekick slots hold a front-mounted (tr==2) option,
+// so the two pods sit side by side instead of overlapping. Shared by gameplay (mainint.c)
+// and the shop weapon preview (game_menu.c) so the two stay in sync.
+#define FRONT_OPTION_SPREAD 10
+
 typedef struct
 {
 	Uint8 ship;

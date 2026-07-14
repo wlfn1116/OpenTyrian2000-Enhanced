@@ -40,10 +40,12 @@ void set_fps(int fps);
 
 void setDelay(int delay);
 void setDelay2(int delay);
+float get_delay_period(void);
 Uint32 getDelayTicks(void);
 Uint32 getDelayTicks2(void);
 
 void wait_delay(void);
+void limit_render_fps(void);
 void service_wait_delay(void);
 void wait_delayorinput(void);
 

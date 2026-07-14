@@ -18,9 +18,12 @@
  */
 #include "config.h"
 
+#include "crashlog.h"
+#include "custom_weapon.h"
 #include "episodes.h"
 #include "file.h"
 #include "joystick.h"
+#include "keyboard.h"
 #include "loudness.h"
 #include "mtrand.h"
 #include "nortsong.h"
@@ -31,6 +34,7 @@
 #include "video.h"
 #include "video_scale.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <sys/stat.h>
 
@@ -167,6 +171,7 @@ JE_boolean galagaMode;
 JE_boolean extraGame;
 
 JE_boolean twoPlayerMode, twoPlayerLinked, onePlayerAction, timedBattleMode, superTyrian;
+JE_boolean endlessMode;  // Endless roguelite mode (see endless.c)
 JE_boolean trentWin = false;
 JE_byte    superArcadeMode;
 
@@ -197,7 +202,7 @@ JE_boolean pentiumMode;
 
 /* Savegame files */
 JE_byte    gameSpeed;
-JE_byte    processorType;  /* 1=386 2=486 3=Pentium Hyper */
+JE_byte    processorType;  /* detail level: 1=Low 2=Normal 3=High 4=Pentium 5=Laptop VGA 6=Wild */
 
 JE_SaveFilesType saveFiles; /*array[1..saveLevelnum] of savefiletype;*/
 JE_SaveGameTemp saveTemp;
@@ -206,13 +211,100 @@ T2KHighScoreType t2kHighScores[20][3];
 
 JE_word editorLevel;   /*Initial value 800*/
 
+/* Enhancement settings (persisted in the [enhancements] config section). */
+int bossBarStyle   = BOSS_BAR_ENHANCED;
+int bossBarLayout  = BOSS_BAR_RIGHT;
+int bossBarTwoMode = BOSS_BAR_TWO_STACKED;
+/* When off: debug menu and debug level select hidden; buy/sell and pause menus
+   keep their stock layout. */
+bool debugMode     = true;
+/* Thin health bar near an enemy once damaged (draw_enemy_health_bars in tyrian2.c). */
+bool enemyBars       = true;
+int enemyBarLayout   = ENEMY_BAR_HORIZONTAL;
+int enemyBarPosition = ENEMY_BAR_POS_BOTTOM;
+int enemyBarOpacity  = 75;
+/* Interpolate motion between the fixed ~35Hz logic ticks for high-refresh play;
+   off = classic one present per tick. Gates vt_ship_owns() and the JE_starShowVGA
+   interpolation loop (tyrian2.c). */
+bool smoothMotion  = true;
+/* Bigger explosion "superspark" ring buffer (MAX_SUPERPIXELS) vs the classic 101-spark cap;
+   off = the original sparser DOS spark showers. Read by JE_doSP (varz.c). */
+bool extraSparks = true;
+/* Where each superspark weapon leaves its ep4/5 projectile trail (JE_applySuperSparks,
+   episodes.c): SUPER_SPARKS_AUTO (vanilla per-episode), _ON (every episode), _OFF (no episode).
+   Default On so the trails show in ep1-3 as well (matches the original Mega Pulse request). */
+int superSparkMode[SSW_COUNT] = { SUPER_SPARKS_ON, SUPER_SPARKS_ON, SUPER_SPARKS_ON, SUPER_SPARKS_ON };
+/* Cap a weapon's projectile trail at the classic 101-spark limit even when extraSparks is
+   on, so the trail keeps its classic density (JE_doSP calls in shots.c). On by default. */
+bool superSparkClassicCap[SSW_COUNT] = { true, true, true, true };
+/* The ep4/5 Wallop Beam's second bolt (JE_applySuperSparks, episodes.c). Unlike the spark
+   trails this changes firepower (two bolts per volley), so it defaults to Auto = each
+   episode's shipped pattern rather than On. */
+int wallopSecondBolt = SUPER_SPARKS_AUTO;
+
+/* Config keys for the per-weapon trail settings; indexed by SuperSparkWeapon. */
+static const char *const superSparkKeys[SSW_COUNT]    = { "superspark_mega_pulse", "superspark_wallop_beam", "superspark_protron_b", "superspark_ice" };
+static const char *const superSparkCapKeys[SSW_COUNT] = { "superspark_mega_pulse_cap", "superspark_wallop_beam_cap", "superspark_protron_b_cap", "superspark_ice_cap" };
+
+/* Which episode's data each non-spark difference weapon uses (JE_applyEpDiffs, episodes.c):
+   EPDIFF_AUTO (per-episode, vanilla), _EP13, or _EP45. Default Auto so vanilla is unchanged. */
+int epDiffMode[EDW_COUNT] = { EPDIFF_AUTO, EPDIFF_AUTO, EPDIFF_AUTO, EPDIFF_AUTO, EPDIFF_AUTO, EPDIFF_AUTO, EPDIFF_AUTO, EPDIFF_AUTO };
+/* Config keys for the per-weapon episode-difference settings; indexed by EpDiffWeapon. */
+static const char *const epDiffKeys[EDW_COUNT] = {
+	"epdiff_xega_ball", "epdiff_microsol_opt5", "epdiff_flare", "epdiff_needle_laser",
+	"epdiff_bubble_gum", "epdiff_flying_punch", "epdiff_pretzel_missile", "epdiff_dragon_frost"
+};
+
+/* Map a trail-tagged shot's sprite back to its weapon's cap setting, for the JE_doSP calls
+   in shots.c (a flying shot only knows its graphic). Unknown sprites (e.g. sparky custom
+   weapon bullets) honor extraSparks uncapped. */
+bool superSparkCapForSprite(JE_word sprite)
+{
+	switch (sprite)
+	{
+	case 35:           return superSparkClassicCap[SSW_MEGA_PULSE];
+	case 30: case 29:  return superSparkClassicCap[SSW_WALLOP_BEAM];
+	case 28:           return superSparkClassicCap[SSW_PROTRON_B];
+	case 634:          return superSparkClassicCap[SSW_ICE];
+	default:           return false;
+	}
+}
+/* HUD gauge gradient direction (Enhancements -> Gauge Gradients). GAUGE_GRAD_UP
+   reproduces the classic vertical gauges; other values run the gradient down the column or
+   across its width. Read by draw_power_gauge (tyrian2.c) and JE_dBar3 (nortvars.c). */
+int gaugeGradGenerator = GAUGE_GRAD_UP;
+int gaugeGradShield    = GAUGE_GRAD_RIGHT;
+int gaugeGradArmor     = GAUGE_GRAD_LEFT;
+/* Zica Laser Lv11 tweaks (JE_applyZicaLaserConfig in episodes.c; front-weapon fire
+   loop in mainint.c). */
+int zicaLaserBase = ZICA_BASE_EP4;      /* ZICA_BASE_*: Lv11 shot pattern */
+int zicaLaserLength = ZICA_LEN_SHORT;   /* ZICA_LEN_* : Lv11 shot length */
+bool zicaLaserLock = false;             /* Length=Long: ship-lock the side beams (default = free) */
+bool zicaLaserBuff = true;              /* also fire the Lv10 beam alongside the Lv11 shots */
+/* Re-add the cut DOS "Charge-Laser Cannon" sidekick to its original shops + the debug
+   menu (JE_addChargeLaserCannon in episodes.c). */
+bool chargeLaserCannon = true;
+/* Christmas mode override: -1 = auto-detect by date (original), 0 = force off, 1 = force
+   on. Set to 0/1 by the Enhancements toggle so the choice persists. */
+int xmasMode = 0;
+
 Config opentyrian_config;  // implicitly initialized
+
+// The custom weapon is persisted as a raw JE_WeaponType per power level (a compact
+// comma-separated integer blob built by customWeaponSerializeLevel), plus the shared
+// weapon-wide identity keys. See custom_weapon.c for the blob layout.
 
 bool load_opentyrian_config(void)
 {
 	// defaults
 	fullscreen_display = -1;
-	set_scaler_by_name("Scale2x");
+#ifdef __vita__
+	// Vita's SGX GPU + A9 CPU can't afford a software-upscaled present every frame; present at
+	// native size and let the GPU scale to the 960x544 panel. notes.md §Console ports.
+	set_scaler_by_name("None");
+#else
+	set_scaler_by_name("4x");  // first-boot default: plain nearest-neighbour 4x (crisp pixels)
+#endif
 	memcpy(keySettings, defaultKeySettings, sizeof(keySettings));
 	memcpy(mouseSettings, defaultMouseSettings, sizeof(mouseSettings));
 	
@@ -236,9 +328,15 @@ bool load_opentyrian_config(void)
 	{
 		config_get_int_option(section, "fullscreen", &fullscreen_display);
 
-		const char* scaler;
-		if (config_get_string_option(section, "scaler", &scaler))
-			set_scaler_by_name(scaler);
+		const char* scaler_name;
+		if (config_get_string_option(section, "scaler", &scaler_name))
+			set_scaler_by_name(scaler_name);
+#ifdef __vita__
+		// Ignore any saved scaler on Vita: software upscaling every frame is too slow for the
+		// hardware regardless of what a prior session wrote. Native + GPU upscale only. The
+		// in-session Graphics menu can still change it to experiment, but each boot resets here.
+		set_scaler_by_name("None");
+#endif
 
 		const char* scaling_mode;
 		if (config_get_string_option(section, "scaling_mode", &scaling_mode))
@@ -246,6 +344,37 @@ bool load_opentyrian_config(void)
 
 		config_get_int_option(section, "fps", &fps_cap);
 		set_fps(fps_cap);
+
+		int vsync_enabled = output_vsync ? 1 : 0;
+		config_get_int_option(section, "vsync", &vsync_enabled);
+		set_vsync(vsync_enabled != 0);
+
+		int show_fps_enabled = show_fps ? 1 : 0;
+		config_get_int_option(section, "show_fps", &show_fps_enabled);
+		show_fps = (show_fps_enabled != 0);
+
+#if defined(__SWITCH__) || defined(__vita__)
+		// Touchscreen ship-control sensitivity slider (Setup > Sound and the pause menu).
+		config_get_int_option(section, "touch_sensitivity", &touch_sensitivity);
+		if (touch_sensitivity < 0 || touch_sensitivity > TOUCH_SENS_MAX)
+			touch_sensitivity = TOUCH_SENS_DEFAULT;
+#endif
+
+		// Sub-pixel supersampling: 0 = Auto (follow the scaler), 1 = off, 2..8 fixed.
+		config_get_int_option(section, "render_supersample", &render_supersample);
+		if (render_supersample < 0 || render_supersample > RENDER_SUPERSAMPLE_MAX)
+			render_supersample = 0;
+
+		// Sub-pixel filter: 0 = Sharp (crisp pixels), 1 = Smooth (antialiased edges),
+		// 2 = None (raw, unfiltered nearest at every ratio).
+		config_get_int_option(section, "render_supersample_filter", &render_supersample_filter);
+		if (render_supersample_filter < SS_FILTER_SHARP || render_supersample_filter > SS_FILTER_NONE)
+			render_supersample_filter = SS_FILTER_NONE;
+
+		// Supersampling bypasses scaler algorithms (Scale2x/hqNx) in-game, so force
+		// the same-size plain scaler; the Graphics menu enforces the same rule.
+		if (render_supersample != 1)
+			scaler = scaler_plain_equivalent(scaler);
 	}
 
 	section = config_find_section(config, "keyboard", NULL);
@@ -283,8 +412,191 @@ bool load_opentyrian_config(void)
 		}
 	}
 
+	section = config_find_section(config, "enhancements", NULL);
+	if (section != NULL)
+	{
+		config_get_int_option(section, "boss_bar_style", &bossBarStyle);
+		config_get_int_option(section, "boss_bar_layout", &bossBarLayout);
+		config_get_int_option(section, "boss_bar_two_mode", &bossBarTwoMode);
+
+		int debug_mode_enabled = debugMode ? 1 : 0;
+		config_get_int_option(section, "debug_mode", &debug_mode_enabled);
+		debugMode = (debug_mode_enabled != 0);
+
+		int hang_timeout = crashlog_get_hang_timeout();
+		config_get_int_option(section, "hang_timeout", &hang_timeout);
+		crashlog_set_hang_timeout(hang_timeout);  // clamps into range
+
+		int enemy_bars_enabled = enemyBars ? 1 : 0;
+		config_get_int_option(section, "enemy_bars", &enemy_bars_enabled);
+		enemyBars = (enemy_bars_enabled != 0);
+
+		config_get_int_option(section, "enemy_bar_layout", &enemyBarLayout);
+		config_get_int_option(section, "enemy_bar_position", &enemyBarPosition);
+		config_get_int_option(section, "enemy_bar_opacity", &enemyBarOpacity);
+
+		int smooth_motion_enabled = smoothMotion ? 1 : 0;
+		config_get_int_option(section, "smooth_motion", &smooth_motion_enabled);
+		smoothMotion = (smooth_motion_enabled != 0);
+
+		int extra_sparks_enabled = extraSparks ? 1 : 0;
+		config_get_int_option(section, "extra_sparks", &extra_sparks_enabled);
+		extraSparks = (extra_sparks_enabled != 0);
+
+		// Music device (OPL3 / FluidSynth / Native MIDI) + SoundFont path. The
+		// MIDI devices only take effect in a WITH_MIDI build; otherwise init_audio()
+		// falls back to OPL (see loudness.c).
+		const char *music_device_name;
+		if (config_get_string_option(section, "music_device", &music_device_name))
+		{
+			for (int i = 0; i < MUSIC_DEVICE_MAX; ++i)
+			{
+				if (strcmp(music_device_name, music_device_names[i]) == 0)
+				{
+					music_device = (MusicDevice)i;
+					break;
+				}
+			}
+		}
+
+		const char *soundfont_name;
+		if (config_get_string_option(section, "soundfont", &soundfont_name))
+			SDL_strlcpy(soundfont, soundfont_name, sizeof(soundfont));
+
+		// Legacy keys from when only the Mega Pulse had these settings; the new per-weapon
+		// keys below override them when present.
+		config_get_int_option(section, "mega_pulse_sparks", &superSparkMode[SSW_MEGA_PULSE]);
+		int legacy_cap = superSparkClassicCap[SSW_MEGA_PULSE] ? 1 : 0;
+		config_get_int_option(section, "mega_pulse_classic_cap", &legacy_cap);
+		superSparkClassicCap[SSW_MEGA_PULSE] = (legacy_cap != 0);
+
+		for (int i = 0; i < SSW_COUNT; ++i)
+		{
+			config_get_int_option(section, superSparkKeys[i], &superSparkMode[i]);
+			if (superSparkMode[i] < 0 || superSparkMode[i] >= SUPER_SPARKS_COUNT)
+				superSparkMode[i] = SUPER_SPARKS_ON;
+
+			int spark_cap = superSparkClassicCap[i] ? 1 : 0;
+			config_get_int_option(section, superSparkCapKeys[i], &spark_cap);
+			superSparkClassicCap[i] = (spark_cap != 0);
+		}
+
+		config_get_int_option(section, "superspark_wallop_second_bolt", &wallopSecondBolt);
+		if (wallopSecondBolt < 0 || wallopSecondBolt >= SUPER_SPARKS_COUNT)
+			wallopSecondBolt = SUPER_SPARKS_AUTO;
+
+		for (int i = 0; i < EDW_COUNT; ++i)
+		{
+			config_get_int_option(section, epDiffKeys[i], &epDiffMode[i]);
+			if (epDiffMode[i] < 0 || epDiffMode[i] >= EPDIFF_MODE_COUNT)
+				epDiffMode[i] = EPDIFF_AUTO;
+		}
+
+		config_get_int_option(section, "gauge_grad_generator", &gaugeGradGenerator);
+		config_get_int_option(section, "gauge_grad_shield", &gaugeGradShield);
+		config_get_int_option(section, "gauge_grad_armor", &gaugeGradArmor);
+
+		config_get_int_option(section, "zica_l11_base", &zicaLaserBase);
+		if (zicaLaserBase < 0 || zicaLaserBase >= ZICA_BASE_COUNT)
+			zicaLaserBase = ZICA_BASE_EP4;
+
+		config_get_int_option(section, "zica_l11_length", &zicaLaserLength);
+		if (zicaLaserLength < 0 || zicaLaserLength >= ZICA_LEN_COUNT)
+			zicaLaserLength = ZICA_LEN_SHORT;
+
+		int zica_l11_lock = zicaLaserLock ? 1 : 0;
+		config_get_int_option(section, "zica_l11_lock", &zica_l11_lock);
+		zicaLaserLock = (zica_l11_lock != 0);
+
+		// Back-compat: earlier builds saved this as 0/1 (bool) or 0-4 (mode); any non-zero = on.
+		int zica_laser_buff = zicaLaserBuff ? 1 : 0;
+		config_get_int_option(section, "zica_laser_buff", &zica_laser_buff);
+		zicaLaserBuff = (zica_laser_buff != 0);
+
+		int charge_laser_cannon = chargeLaserCannon ? 1 : 0;
+		config_get_int_option(section, "charge_laser_cannon", &charge_laser_cannon);
+		chargeLaserCannon = (charge_laser_cannon != 0);
+
+		config_get_int_option(section, "xmas", &xmasMode);
+		if (xmasMode < -1 || xmasMode > 1)
+			xmasMode = 0;
+
+		// Clamp to valid ranges in case of a hand-edited or stale config.
+		if (bossBarStyle < BOSS_BAR_CLASSIC || bossBarStyle > BOSS_BAR_ENHANCED)
+			bossBarStyle = BOSS_BAR_ENHANCED;
+		if (bossBarLayout < BOSS_BAR_TOP || bossBarLayout > BOSS_BAR_RIGHT)
+			bossBarLayout = BOSS_BAR_RIGHT;
+		if (bossBarTwoMode < BOSS_BAR_TWO_TOGETHER || bossBarTwoMode > BOSS_BAR_TWO_STACKED)
+			bossBarTwoMode = BOSS_BAR_TWO_STACKED;
+		if (enemyBarLayout < ENEMY_BAR_HORIZONTAL || enemyBarLayout > ENEMY_BAR_VERTICAL)
+			enemyBarLayout = ENEMY_BAR_HORIZONTAL;
+		if (enemyBarPosition < ENEMY_BAR_POS_BOTTOM || enemyBarPosition > ENEMY_BAR_POS_CENTER)
+			enemyBarPosition = ENEMY_BAR_POS_BOTTOM;
+		if (enemyBarOpacity < 0)
+			enemyBarOpacity = 0;
+		else if (enemyBarOpacity > 100)
+			enemyBarOpacity = 100;
+		if (gaugeGradGenerator < 0 || gaugeGradGenerator >= GAUGE_GRAD_COUNT)
+			gaugeGradGenerator = GAUGE_GRAD_UP;
+		if (gaugeGradShield < 0 || gaugeGradShield >= GAUGE_GRAD_COUNT)
+			gaugeGradShield = GAUGE_GRAD_RIGHT;
+		if (gaugeGradArmor < 0 || gaugeGradArmor >= GAUGE_GRAD_COUNT)
+			gaugeGradArmor = GAUGE_GRAD_LEFT;
+
+		for (int i = 0; i < expertSettingsCount; ++i)
+			config_get_int_option(section, expertSettings[i].cfgKey, expertSettings[i].value);
+		clamp_expert_settings();  // guard against a hand-edited or stale config
+
+		// Custom Weapon Creator: master toggle + the saved per-power-level raw designs.
+		// Each level is a compact comma-separated integer blob (see custom_weapon.c);
+		// customWeaponInit() fills in a default design when none is present, and clamps.
+		int custom_weapon_enabled = customWeaponEnabled ? 1 : 0;
+		config_get_int_option(section, "custom_weapon_enabled", &custom_weapon_enabled);
+		customWeaponEnabled = (custom_weapon_enabled != 0);
+
+		// Weapon-wide identity (maps to the single port; shared across all levels).
+		const char *custom_weapon_name;
+		if (config_get_string_option(section, "custom_weapon_name", &custom_weapon_name))
+		{
+			strncpy(customWeaponName, custom_weapon_name, sizeof(customWeaponName) - 1);
+			customWeaponName[sizeof(customWeaponName) - 1] = '\0';
+		}
+		config_get_int_option(section, "custom_weapon_cost",          &customWeaponCost);
+		config_get_int_option(section, "custom_weapon_power_use",     &customWeaponPowerUse);
+		config_get_int_option(section, "custom_weapon_equip_slot",    &customWeaponEquipSlot);
+		config_get_int_option(section, "custom_weapon_item_graphic",  &customWeaponItemGraphic);
+		config_get_int_option(section, "custom_weapon_charge_stages", &customWeaponChargeStages);
+		config_get_int_option(section, "custom_weapon_modes",         &customWeaponModes);
+		config_get_int_option(section, "custom_weapon_sk_mount",      &customSidekickMount);
+		config_get_int_option(section, "custom_weapon_sk_sprite",     &customSidekickSprite);
+		config_get_int_option(section, "custom_weapon_sk_frames",     &customSidekickFrames);
+		config_get_int_option(section, "custom_weapon_sk_frame_step", &customSidekickFrameStep);
+		config_get_int_option(section, "custom_weapon_sk_animate",    &customSidekickAnimate);
+
+		// Each (mode, power level)'s raw weapon: custom_weapon_m<M>_l<N>_raw. Mode 0 also
+		// accepts the pre-modes key custom_weapon_l<N>_raw so an older config migrates.
+		for (int m = 0; m < CUSTOM_WEAPON_MODES; ++m)
+			for (int p = 0; p < CUSTOM_POWER_LEVELS; ++p)
+			{
+				char key[64];
+				const char *blob;
+				if (m == 0)
+				{
+					snprintf(key, sizeof(key), "custom_weapon_l%d_raw", p + 1);
+					if (config_get_string_option(section, key, &blob))
+						customWeaponDeserializeLevel(0, p, blob);
+				}
+				snprintf(key, sizeof(key), "custom_weapon_m%d_l%d_raw", m + 1, p + 1);
+				if (config_get_string_option(section, key, &blob))
+					customWeaponDeserializeLevel(m, p, blob);
+			}
+
+		customWeaponEditLevel = 0;
+		customWeaponEditMode = 0;
+	}
+
 	fclose(file);
-	
+
 	return true;
 }
 
@@ -305,6 +617,18 @@ bool save_opentyrian_config(void)
 	config_set_string_option(section, "scaling_mode", scaling_mode_names[scaling_mode]);
 
 	config_set_int_option(section, "fps", fps_cap);
+
+	config_set_int_option(section, "vsync", output_vsync ? 1 : 0);
+
+	config_set_int_option(section, "show_fps", show_fps ? 1 : 0);
+
+#if defined(__SWITCH__) || defined(__vita__)
+	config_set_int_option(section, "touch_sensitivity", touch_sensitivity);
+#endif
+
+	config_set_int_option(section, "render_supersample", render_supersample);
+
+	config_set_int_option(section, "render_supersample_filter", render_supersample_filter);
 
 	section = config_find_or_add_section(config, "keyboard", NULL);
 	if (section == NULL)
@@ -331,6 +655,68 @@ bool save_opentyrian_config(void)
 	
 	for (size_t i = 0; i < COUNTOF(mouseSettings); ++i)
 		config_set_string_option(section, mouseSettingNames[i], mouseSettingValues[mouseSettings[i] - 1]);
+
+	section = config_find_or_add_section(config, "enhancements", NULL);
+	if (section == NULL)
+		exit(EXIT_FAILURE);  // out of memory
+
+	config_set_int_option(section, "boss_bar_style", bossBarStyle);
+	config_set_int_option(section, "boss_bar_layout", bossBarLayout);
+	config_set_int_option(section, "boss_bar_two_mode", bossBarTwoMode);
+	config_set_int_option(section, "debug_mode", debugMode ? 1 : 0);
+	config_set_int_option(section, "hang_timeout", crashlog_get_hang_timeout());
+	config_set_int_option(section, "enemy_bars", enemyBars ? 1 : 0);
+	config_set_int_option(section, "enemy_bar_layout", enemyBarLayout);
+	config_set_int_option(section, "enemy_bar_position", enemyBarPosition);
+	config_set_int_option(section, "enemy_bar_opacity", enemyBarOpacity);
+	config_set_int_option(section, "smooth_motion", smoothMotion ? 1 : 0);
+	config_set_int_option(section, "extra_sparks", extraSparks ? 1 : 0);
+	config_set_string_option(section, "music_device", music_device_names[music_device]);
+	config_set_string_option(section, "soundfont", soundfont);
+	for (int i = 0; i < SSW_COUNT; ++i)
+	{
+		config_set_int_option(section, superSparkKeys[i], superSparkMode[i]);
+		config_set_int_option(section, superSparkCapKeys[i], superSparkClassicCap[i] ? 1 : 0);
+	}
+	config_set_int_option(section, "superspark_wallop_second_bolt", wallopSecondBolt);
+	for (int i = 0; i < EDW_COUNT; ++i)
+		config_set_int_option(section, epDiffKeys[i], epDiffMode[i]);
+	config_set_int_option(section, "gauge_grad_generator", gaugeGradGenerator);
+	config_set_int_option(section, "gauge_grad_shield", gaugeGradShield);
+	config_set_int_option(section, "gauge_grad_armor", gaugeGradArmor);
+	config_set_int_option(section, "zica_l11_base", zicaLaserBase);
+	config_set_int_option(section, "zica_l11_length", zicaLaserLength);
+	config_set_int_option(section, "zica_l11_lock", zicaLaserLock ? 1 : 0);
+	config_set_int_option(section, "zica_laser_buff", zicaLaserBuff ? 1 : 0);
+	config_set_int_option(section, "charge_laser_cannon", chargeLaserCannon ? 1 : 0);
+	config_set_int_option(section, "xmas", xmasMode);
+
+	config_set_int_option(section, "custom_weapon_enabled", customWeaponEnabled ? 1 : 0);
+	// Weapon-wide identity (maps to the single port; shared across all levels).
+	config_set_string_option(section, "custom_weapon_name",    customWeaponName);
+	config_set_int_option(section, "custom_weapon_cost",          customWeaponCost);
+	config_set_int_option(section, "custom_weapon_power_use",     customWeaponPowerUse);
+	config_set_int_option(section, "custom_weapon_equip_slot",    customWeaponEquipSlot);
+	config_set_int_option(section, "custom_weapon_item_graphic",  customWeaponItemGraphic);
+	config_set_int_option(section, "custom_weapon_charge_stages", customWeaponChargeStages);
+	config_set_int_option(section, "custom_weapon_modes",         customWeaponModes);
+	config_set_int_option(section, "custom_weapon_sk_mount",      customSidekickMount);
+	config_set_int_option(section, "custom_weapon_sk_sprite",     customSidekickSprite);
+	config_set_int_option(section, "custom_weapon_sk_frames",     customSidekickFrames);
+	config_set_int_option(section, "custom_weapon_sk_frame_step", customSidekickFrameStep);
+	config_set_int_option(section, "custom_weapon_sk_animate",    customSidekickAnimate);
+	// Each (mode, power level)'s raw weapon, as a compact comma-separated integer blob.
+	for (int m = 0; m < CUSTOM_WEAPON_MODES; ++m)
+		for (int p = 0; p < CUSTOM_POWER_LEVELS; ++p)
+		{
+			char key[64], blob[16384];   // one raw-weapon blob; sized for the widest (255-bullet) design
+			snprintf(key, sizeof(key), "custom_weapon_m%d_l%d_raw", m + 1, p + 1);
+			customWeaponSerializeLevel(m, p, blob, sizeof(blob));
+			config_set_string_option(section, key, blob);
+		}
+
+	for (int i = 0; i < expertSettingsCount; ++i)
+		config_set_int_option(section, expertSettings[i].cfgKey, *expertSettings[i].value);
 
 	FILE *file = dir_fopen(get_user_directory(), "opentyrian.cfg", "w");
 	if (file == NULL)
@@ -451,6 +837,7 @@ void JE_loadGame(JE_byte slot)
 	extraGame = false;
 	galagaMode = false;
 	timedBattleMode = false;
+	endlessMode = false;  // saves are never endless (high-scores-only mode); always load as a normal game
 
 	initialDifficulty = saveFiles[slot-1].initialDifficulty;
 	gameHasRepeated   = saveFiles[slot-1].gameHasRepeated;
@@ -764,7 +1151,13 @@ const char *get_user_directory(void)
 	
 	if (strlen(user_dir) == 0)
 	{
-#ifndef TARGET_WIN32
+#if defined(__SWITCH__)
+		// Fixed writable location on the SD card; switch_platform_init() creates it.
+		strcpy(user_dir, "sdmc:/switch/opentyrian2000");
+#elif defined(__vita__)
+		// Fixed writable location on the memory card; vita_platform_init() creates it.
+		strcpy(user_dir, "ux0:data/opentyrian2000");
+#elif !defined(TARGET_WIN32)
 		char *xdg_config_home = getenv("XDG_CONFIG_HOME");
 		if (xdg_config_home != NULL)
 		{
@@ -841,7 +1234,7 @@ void JE_loadConfiguration(void)
 		tyrMusicVolume = 191;
 		fxVolume = 191;
 		gammaCorrection = 0;
-		processorType = 3;
+		processorType = 4;  // detail level "Pentium"
 		gameSpeed = 4;
 		versionNum = 3;
 	}
@@ -925,7 +1318,7 @@ void JE_loadConfiguration(void)
 			saveFiles[z].autoFireSpecial = temp != 0;
 
 			memcpy(&temp, p, 1); p++;  // chargeSidekickAutofire
-			saveFiles[z].chargeSidekickAutofire = temp != 0;
+			saveFiles[z].chargeSidekickAutofire = temp;  // 0=OFF, 1=ON, 2=fully-charged-only, 3=ON (fastest)
 
 			memcpy(&temp, p, 1); p++;  // difficultyAdjust
 			saveFiles[z].difficultyAdjust = temp != 0;
@@ -1018,7 +1411,7 @@ void JE_loadConfiguration(void)
 
 			saveFiles[z].autoFireSpecial = false;
 
-			saveFiles[z].chargeSidekickAutofire = false;
+			saveFiles[z].chargeSidekickAutofire = CHARGE_AUTOFIRE_OFF;
 			saveFiles[z].difficultyAdjust = true;
 			saveFiles[z].cheatInfiniteSidekickAmmo = false;
 			saveFiles[z].cheatInfiniteShields = false;
@@ -1124,7 +1517,7 @@ void JE_saveConfiguration(void)
 		temp = tempSaveFile.autoFireSpecial != false;
 		memcpy(p, &temp, 1); p++;
 
-		temp = tempSaveFile.chargeSidekickAutofire != false;
+		temp = tempSaveFile.chargeSidekickAutofire;  // 0=OFF, 1=ON, 2=fully-charged-only, 3=ON (fastest)
 		memcpy(p, &temp, 1); p++;
 
 		temp = tempSaveFile.difficultyAdjust != false;

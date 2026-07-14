@@ -1,0 +1,4535 @@
+/*
+ * OpenTyrian: A modern cross-platform port of Tyrian
+ *
+ * Endless mode — see endless.h.
+ *
+ * The run plays real, UNMODIFIED shipped levels in a random cross-episode order.
+ * Between levels the player visits an OUTPOST (bank interest, reroll the shop, buy
+ * hull upgrades, then the standard item shop) and CHARTS A COURSE: a branching
+ * choice of the next sector, each option carrying its own risk/reward MUTATORS.
+ * Difficulty ramps through depth-scaled enemy stats (HP / boss HP / fire rate /
+ * projectile speed) plus whatever mutators the chosen sector adds. The run ends on
+ * death; only the depth reached (a high score) persists.
+ */
+
+#include "endless.h"
+
+#include "config.h"        // difficultyLevel, DIFFICULTY_*, player-independent globals
+#include "custom_weapon.h" // customWeaponPort / customSidekickSlot (reserved shop slots)
+#include "episodes.h"      // item arrays + SHIP_NUM/PORT_NUM/... counts, episodeAvail, JE_initEpisode
+#include "file.h"          // dir_fopen / dir_fopen_warn (endless.sav sidecar I/O)
+#include "font.h"          // draw_font_hv_shadow, JE_textWidth, fonts, alignment
+#include "fonthand.h"      // JE_outText
+#include "game_menu.h"     // JE_itemScreen, JE_getLevelSections
+#include "joystick.h"      // push_joysticks_as_keyboard
+#include "keyboard.h"      // newkey/lastkey_scan/keysactive, service_SDL_events
+#include "loudness.h"      // fade_song
+#include "lvlmast.h"       // shapeFile[]
+#include "mainint.h"       // JE_getCost
+#include "mouse.h"         // mouse_x/y, JE_mouseStart/Replace, mouseCursor
+#include "mtrand.h"        // mt_rand
+#include "musmast.h"       // songBuy, DEFAULT_SONG_BUY (shop / buy-sell music)
+#include "nortsong.h"      // JE_playSampleNum, setDelay, wait_delayorinput, limit_render_fps
+#include "nortvars.h"      // JE_anyButton
+#include "palette.h"       // colors, fade_palette, fade_black
+#include "picload.h"       // JE_loadPic
+#include "player.h"        // player[]
+#include "sndmast.h"       // S_SELECT, S_CURSOR, S_SPRING
+#include "sprite.h"        // JE_loadCompShapes, enemySpriteSheets, shopSpriteSheet
+#include "tyrian2.h"       // itemAvail, itemAvailMax
+#include "varz.h"          // eventRec, maxEvent, map* globals
+#include "video.h"         // VGAScreen/VGAScreen2, JE_showVGA, output_vsync
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// The stock Tyrian 2000 weapon table fills ports 1-47 with real weapons; ports
+// 48-60 are dummy "Test" placeholders (see custom_weapon.c), so the shop only
+// ever offers front/rear weapons from 1-47.
+#define ENDLESS_REAL_WEAPON_PORTS 47
+
+// --- Run state ------------------------------------------------------------------
+
+int      endlessRunDepth  = 0;   // levels cleared this run (0 on the first level)
+unsigned endlessActiveMods = 0;  // ENDLESS_MOD_* bits for the current level
+int      endlessArmorBonus = 0;  // run-persistent +max armor bought at the outpost
+int      endlessRunKills = 0;    // total enemies destroyed this run (shown on the end screen)
+int      endlessRunBossKills = 0;// boss-tier enemies destroyed this run
+
+// --- Run seed & structural RNG --------------------------------------------------
+// Structure (level order, mutators, perks, shop stock) draws from a dedicated SplitMix64
+// stream, isolated from the shared gameplay mt_rand (notes.md §Seeded structure RNG).
+static char   endlessRunSeed[ENDLESS_SEED_MAXLEN] = "";  // the run's seed string (also shown in-game)
+static Uint64 endlessSeedHash = 0;   // FNV-1a hash of endlessRunSeed; the base for every per-zone reseed
+static Uint64 endlessRngState = 0;   // live SplitMix64 state (structural stream)
+static Uint64 endlessEliteRngState = 0;  // live SplitMix64 state for the seeded elite/champion tier rolls
+
+// FNV-1a over the string's bytes: maps any typed text to a 64-bit seed, so every seed is valid.
+static Uint64 endlessHashString(const char *s)
+{
+	Uint64 h = 14695981039346656037ULL;  // FNV offset basis
+	for (; *s != '\0'; ++s)
+		h = (h ^ (Uint8)*s) * 1099511628211ULL;  // FNV prime
+	return h;
+}
+
+// One SplitMix64 step on `state`: the endless RNG core, shared by the structural stream and the
+// separate elite-tier stream below. Every use is `...Rand() % n`.
+static Uint32 endlessSplitMixNext(Uint64 *state)
+{
+	Uint64 z = (*state += 0x9E3779B97F4A7C15ULL);
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	z ^= z >> 31;
+	return (Uint32)(z >> 32);
+}
+
+// Derive a fresh stream state for a (zone, phase): mix the run's seed hash with a salt so each
+// (seed, salt) is an independent, reproducible sequence.
+static Uint64 endlessSplitMixSeed(Uint64 salt)
+{
+	Uint64 z = endlessSeedHash + (salt + 1) * 0x9E3779B97F4A7C15ULL;
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	z ^= z >> 31;
+	return z;
+}
+
+// The structural random: a drop-in for mt_rand() at the structural call sites (level order,
+// course mutators, perk offers, shop stock). Re-derived per (zone, phase) by endlessReseed.
+static Uint32 endlessRand(void)
+{
+	return endlessSplitMixNext(&endlessRngState);
+}
+
+// Re-derive the structural stream for a fresh (zone, phase): each zone's generation is independent
+// of what the player did in earlier zones. Called at each outpost and each level start (see
+// endlessBetweenLevels / endlessRegenerateLevel).
+static void endlessReseed(Uint64 salt)
+{
+	endlessRngState = endlessSplitMixSeed(salt);
+}
+
+// The elite/champion tier random: its own seeded stream, per (seed, zone) in endlessResetElites;
+// only the roll sequence is seed-fixed (notes.md §Seeded structure RNG).
+static Uint32 endlessEliteRand(void)
+{
+	return endlessSplitMixNext(&endlessEliteRngState);
+}
+
+void endlessSetSeed(const char *s)
+{
+	SDL_strlcpy(endlessRunSeed, (s != NULL) ? s : "", sizeof(endlessRunSeed));
+	endlessSeedHash = endlessHashString(endlessRunSeed);
+	endlessReseed(0);
+}
+
+const char *endlessSeedString(void)
+{
+	return endlessRunSeed;
+}
+
+// Per-zone timers (reset each zone): elapsed ticks drive ENRAGE; the turbodrive timer counts
+// down the quickened-fire window after each kill. Advanced by endlessGameplayTick.
+static int endlessZoneTicks      = 0;
+#define ENDLESS_TURBODRIVE_TICKS 70   // ~2s of boosted fire per kill (TURBODRIVE)
+static int endlessTurbodriveTimer = 0;
+
+// Escalating outpost prices, reset each visit.
+static long endlessRerollCost = 0;
+static int  endlessHullCost   = 0;
+
+// E-Shop kill-fire buff: bought once per shop visit, its modifier bits are stashed here and
+// OR'd into the next sector's mods at course selection (see endlessSelectCourse), so they
+// survive the course choice that would otherwise overwrite endlessActiveMods.
+static unsigned endlessPurchasedMods = 0;
+// Which kill-fire buff was bought this visit (mutually exclusive): 0 none, 1 Turbodrive,
+// 2 Overdrive.
+static int endlessBuffKind = 0;
+// Overdrive stacks: +1 per kill while the buff window is up (capped), each worth +5% fire
+// and +2.5% damage. Reset to 0 the moment the kill-fire window lapses (see endlessGameplayTick).
+static int endlessOverdriveStacks = 0;
+
+// Kill-fire buff recharge: the run depth at which the three E-Shop kill-fire buys unlock again
+// after a purchase (0 = no lock). Run-persistent and saved (v5), so a mid-cooldown save/resume
+// can't wipe it. The lock length scales with depth; see endlessBuffCooldownLength.
+static int endlessBuffCooldownUntil = 0;
+
+// --- Expanded E-Shop state -----------------------------------------------------------------------
+// Buff "charge" scales the kill-fire window/damage with the cash paid (normalized by depth,
+// cap 20). Reset each run.
+static int endlessBuffCharge = 0;
+static int endlessBuffWindowTicks(void)  // base kill-fire window, extended by charge (up to ~2.5x)
+{
+	// charge 0 -> 1.0x (~2s), charge 10 -> 1.75x (~3.5s), charge 20 -> 2.5x (~5s)
+	return ENDLESS_TURBODRIVE_TICKS * (40 + 3 * endlessBuffCharge) / 40;
+}
+static int endlessBuffChargeFromPaid(long paid)  // cash paid -> charge tier (normalized by depth), cap 20
+{
+	const long unit = 2000 + (long)endlessRunDepth * 150;
+	const int c = (int)(paid / unit);
+	return (c > 20) ? 20 : (c < 0 ? 0 : c);
+}
+
+// Revive token: a held one-shot that survives a lethal hit (price doubles per revive spent this run).
+// Cleanse charges: pre-bought strips of the worst mutator off the next chosen course. Both are
+// run-persistent (reset each run). Per-visit escalating costs for the new buys are (re)set in
+// endlessResetShopPrices; endlessGambleMsg holds the last gamble outcome for the E-Shop help line.
+static bool endlessReviveHeld = false;
+static int  endlessRevivesUsed = 0;
+static int  endlessCleanseChargeCount = 0;
+static long endlessBombCost = 0, endlessExtraPerkCost = 0, endlessCleanseCost = 0;
+static char endlessGambleMsg[48] = "";
+static bool endlessGamblePerkWon = false;  // a gamble handed out a free perk pick; the E-Shop dispatch opens MENU_PERKS
+static int  endlessShopTax = 0;            // Loan Shark: permanent +% on every shop price for the rest of the run
+static bool endlessGambleRigged = false;   // Rigged: the NEXT gamble secretly rolls twice and keeps the worse result
+static int  endlessLongCon = 0;            // The Long Con: sectors until a paid-and-forgotten APEX ambush comes due (0 = none)
+static bool endlessArmorHudDirty = false;  // set when the Overheat DoT shaves hull; the game loop repaints the (event-driven) armor bar
+static bool endlessResumeVisit   = false;  // a save was just loaded: the next outpost restores its snapshot instead of rerolling (consumed by endlessBetweenLevels)
+
+// Hardcore mode for the current run (see endless.h): no saving at all + a locked outpost on a
+// mid-zone bail. Chosen on the seed screen, applied in newEndlessGame, cleared by endlessResetRun.
+bool endlessHardcore = false;
+
+// --- "Quit Level" -> outpost retry (see endless.h) -------------------------------------------
+bool endlessQuitToOutpost = false;  // ESC-menu Quit (endless): return to the outpost instead of ending the run
+bool endlessLockedSortie  = false;  // the reopened outpost is locked to the launch-time loadout/course (hardcore only)
+// The launch-time snapshot Quit Level reverts to. The endless run/outpost half lives in an
+// EndlessSlotRec (declared near the save code); these primitives hold the loadout + committed level
+// and are declared up here so endlessResetRun (above the rec typedef) can clear them.
+static bool     endlessSortieHave  = false; // a launch-time snapshot exists
+static Player   endlessSortiePlayer[2];     // player[] loadout at launch (cash / items / superbombs)
+static unsigned endlessSortieModsV = 0;     // endlessActiveMods at launch (the committed level's mutators)
+static JE_byte  endlessSortieSec   = 0;     // committed level section
+static int      endlessSortieEp    = 0;     // committed episode
+static JE_byte  endlessSortieFile  = 0;     // committed lvl file number
+// One-shots consumed at the course pick (E-Shop buff / sabotage charges / Long Con), snapshotted
+// pre-consumption so a non-hardcore bail can restore them (see endlessRestoreSortie).
+static unsigned endlessSortiePrePurchased = 0;
+static int      endlessSortiePreCleanse   = 0;
+static int      endlessSortiePreLongCon   = 0;
+
+// Base (shipped) level each zone is built on, captured in endlessRegenerateLevel just before it
+// renames levelName to "ZONE n" (levelName still holds the level's authored name there). When a
+// new zone starts, the current base rolls down into "previous". Read only by the crash logger
+// (endless base-level accessors below); both are reset per run in endlessResetRun.
+static char endlessBaseName[11]     = "";
+static int  endlessBaseEp           = 0;
+static int  endlessBaseLvl          = 0;
+static char endlessPrevBaseName[11] = "";
+static int  endlessPrevBaseEp       = 0;
+static int  endlessPrevBaseLvl      = 0;
+
+// Recently-played base levels (anti-repeat): a small ring keyed by (episode, section), [0] = the
+// zone just played. The next zone's course/level picker avoids everything in this window, so the
+// same base level can't recur twice in a row and won't return until at least ENDLESS_LEVEL_HISTORY
+// other zones have been played (the window shrinks gracefully when too few safe levels exist to
+// fill it). Recorded in endlessRegenerateLevel (the one choke point every zone load passes through),
+// reset in endlessResetRun, persisted with the run (save v6), and surfaced in the crash log.
+#define ENDLESS_LEVEL_HISTORY 5
+static int     endlessRecentEp[ENDLESS_LEVEL_HISTORY];
+static JE_byte endlessRecentSec[ENDLESS_LEVEL_HISTORY];
+static int     endlessRecentCount;  // valid entries, 0..ENDLESS_LEVEL_HISTORY
+
+// Push (ep, sec) as the newest recently-played level. A repeat of the current newest (e.g. a locked-
+// sortie relaunch reloading the same committed level) is ignored so it can't crowd the window.
+static void endlessRecordRecentLevel(int ep, int sec)
+{
+	if (endlessRecentCount > 0 && endlessRecentEp[0] == ep && endlessRecentSec[0] == (JE_byte)sec)
+		return;
+	for (int i = ENDLESS_LEVEL_HISTORY - 1; i > 0; --i)
+	{
+		endlessRecentEp[i]  = endlessRecentEp[i - 1];
+		endlessRecentSec[i] = endlessRecentSec[i - 1];
+	}
+	endlessRecentEp[0]  = ep;
+	endlessRecentSec[0] = (JE_byte)sec;
+	if (endlessRecentCount < ENDLESS_LEVEL_HISTORY)
+		++endlessRecentCount;
+}
+
+// Is (ep, sec) among the newest `window` recently-played levels? window is clamped to what's tracked.
+static bool endlessLevelInRecent(int ep, JE_byte sec, int window)
+{
+	if (window > endlessRecentCount)
+		window = endlessRecentCount;
+	for (int i = 0; i < window; ++i)
+		if (endlessRecentEp[i] == ep && endlessRecentSec[i] == sec)
+			return true;
+	return false;
+}
+
+// Combo kill counter: +1 per kill while a kill-fire window is up, reset the instant it lapses.
+// Not itself capped (the HUD's plain "xN"); only the derived fire-rate multiplier below is.
+static int endlessComboKills = 0;
+#define ENDLESS_COMBO_KILLS_PER_STEP 25  // every this many combo kills adds +1x to the fire-rate multiplier
+// Linear ramp: 2x at combo 0, +1x per step, capped at 8 steps (x10 at a 200 combo).
+// Turbodrive, Overdrive and the evil jams share the schedule; only Overblast skips the fire boost.
+#define ENDLESS_COMBO_MAX_STEPS       8
+
+// The evil kill-fire mirrors. Fire-jam curses (Backfire, Burnout): while the window is up they add
+// cooldown to every shot (slower fire) instead of removing it, ramping with the same combo steps;
+// Burnout stacks even more jam. Damage-cut curses (Burnout, Misfire): each kill stacks a shot-damage
+// reduction, peaking at the stack cap and floored so you can still fight.
+#define ENDLESS_EVIL_JAM_BASE        3   // base extra shotRepeat ticks per shot while a fire-jam curse is up
+#define ENDLESS_EVIL_JAM_PER_STEP    3   // + this many more per combo step (up to ENDLESS_COMBO_MAX_STEPS)
+#define ENDLESS_EVIL_JAM_STACK_MAX   10  // Burnout: up to this many MORE jam ticks at full stacks
+#define ENDLESS_EVIL_DMG_MAX         75  // Burnout / Misfire: up to -this% shot damage at full stacks (mirror of the +150% boon)
+#define ENDLESS_EVIL_DMG_FLOOR       25  // ...but never cut the player's shot damage below this %
+
+// --- Perks: run-persistent, stacking upgrades -----------------------------------------
+// Free pick-1-of-3 after each cleared zone; each effect folds into an existing player-side
+// lever so there's no new subsystem. Reset each run. Tunables below are all by-eye.
+#define ENDLESS_PERK_DAMAGE_PCT    12  // +% shot damage per Heavy Rounds stack
+#define ENDLESS_PERK_FIRE_PCT      20  // fire-decrement accumulator % per Rapid Cyclers stack
+#define ENDLESS_PERK_ARMOR_STEP     8  // +max armor per Ablative Plating stack
+#define ENDLESS_PERK_CASH_PCT      15  // +% cash (clears + bounties) per Scavenger stack
+#define ENDLESS_PERK_REGEN_TICKS  140  // ticks per +1 armor at 1 Nanorepair stack (faster with more)
+#define ENDLESS_PERK_SIPHON_PCT    12  // heal-on-kill chance % per Siphon stack
+#define ENDLESS_PERK_BULWARK        1  // incoming damage reduced by this per Bulwark stack (min 1 dmg kept)
+#define ENDLESS_PERK_ADRENALINE_PCT 45 // extra fire-accumulator % per Adrenaline stack while badly hurt
+#define ENDLESS_PERK_ADRENALINE_HP  3  // Adrenaline triggers when armor < 1/this of max
+#define ENDLESS_PERK_GLASS_DMG     40  // Glass Cannon: +% shot damage
+#define ENDLESS_PERK_GLASS_ARMOR    8  // Glass Cannon: -max armor (the drawback)
+#define ENDLESS_PERK_SPECIALCD_PCT 25  // extra special-cooldown-decrement accumulator % per stack
+#define ENDLESS_PERK_POWERUSE_PCT  15  // -% generator power drawn per main-weapon shot, per Efficient Coils stack
+#define ENDLESS_PERK_SHIELDRGN_STEP 3  // shield-regen interval cut by this many ticks per Shield Matrix stack (base 15)
+#define ENDLESS_PERK_SHIELDRGN_MIN  3  // ...but never quicker than +1 shield per this many ticks (floor)
+#define ENDLESS_PERK_CHARGE_STEP    4  // ticks cut from the charge-sidekick charge interval per Rapid Charger stack (base 20)
+#define ENDLESS_PERK_CHARGE_MIN     4  // ...but a charge level never builds quicker than this many ticks (floor)
+
+// "Buy Extra Perk" (E-Shop) surcharge: every perk stack the player already holds adds this % to the
+// extra-perk price, capped, on top of the base depth price + per-visit doubling. So the deeper the
+// perk collection, the pricier it gets to grow it further (perks are strong and bounded).
+#define ENDLESS_EXTRA_PERK_OWNED_PCT  40   // +% per owned perk stack
+#define ENDLESS_EXTRA_PERK_OWNED_CAP 1000  // ...but the owned-count surcharge tops out here (+1000% = x11)
+
+enum {
+	PERK_DAMAGE, PERK_FIRERATE, PERK_ARMOR, PERK_CASH,
+	PERK_REGEN, PERK_SIPHON, PERK_BOUNTY,
+	PERK_BULWARK, PERK_ADRENALINE, PERK_GLASSCANNON,  // relic-like
+	PERK_SPECIALCD,
+	PERK_AUTOSPECIAL,
+	PERK_POWERUSE,
+	PERK_SHIELDREGEN,
+	PERK_CHARGERATE,   // append new perks here; the index is the on-disk save slot, so don't renumber
+	PERK_COUNT
+};
+
+typedef struct {
+	const char *name;      // menu label (<= 17 chars, menuInt width)
+	const char *desc;      // help-line description
+	JE_byte     maxStack;  // how many times it can be taken
+} EndlessPerk;
+
+static const EndlessPerk endlessPerkTable[PERK_COUNT] = {
+	{ "Heavy Rounds",     "Your shots deal more damage.",         5 },
+	{ "Rapid Cyclers",    "Your guns fire noticeably faster.",    4 },
+	{ "Ablative Plating", "Raises your maximum armor.",           6 },
+	{ "Scavenger",        "More cash from clears and bounties.",  4 },
+	{ "Nanorepair",       "Slowly regenerate armor in flight.",   3 },
+	{ "Siphon",           "Chance to restore armor on a kill.",   3 },
+	{ "Bounty Hunter",    "Elite and champion bounties doubled.", 1 },
+	{ "Bulwark",          "Take less damage from every hit.",     5 },
+	{ "Adrenaline",       "Fire much faster when badly hurt.",    3 },
+	{ "Glass Cannon",     "Big damage, but a weaker hull.",       1 },
+	{ "Rapid Recharge",   "Specials and ammo recharge faster.",   4 },
+	{ "Autofire Special", "Auto-fires your special as you shoot.", 1 },
+	{ "Efficient Coils",  "Your weapons draw less generator power.", 5 },
+	{ "Shield Matrix",    "Your shield recharges faster.",        4 },
+	{ "Rapid Charger",    "Charge sidekicks power up faster.",    4 },
+};
+
+bool endlessPerkPending = false;             // a perk pick is queued for the next shop
+static JE_byte endlessPerkOwned[PERK_COUNT]; // stack counts, reset each run
+static int endlessPerkChoice[3];             // this visit's offered perk ids
+static int endlessPerkChoiceN = 0;           // how many are offered (0..3)
+static int endlessRegenTick = 0;             // Nanorepair countdown (reset each run)
+static int endlessPerkCashPercent(void);     // Scavenger cash multiplier (defined below)
+// The run depth whose post-zone perk pick has already been resolved (taken or declined); -1 =
+// none yet. endlessBetweenLevels offers the forced pick only when this lags the current depth,
+// so re-entering the same outpost (e.g. after a save/reload) can't hand out a second perk.
+static int endlessPerkDepthDone = -1;
+
+// Cash the player had on entering the shop this visit. The E-Shop cash-fraction buys (buff /
+// Buy Special) price off this snapshot, not live cash, so their cost stays fixed for the whole
+// visit (buying one doesn't cheapen the next). Captured in endlessResetShopPrices.
+static long endlessShopEntryCash = 0;
+
+#define ENDLESS_HULL_STEP 6      // +armor per hull upgrade
+#define ENDLESS_HULL_BASE 60     // starting cap on the run-persistent armor bonus (zone 0)
+#define ENDLESS_HULL_MAX  150    // absolute ceiling (ship base + this + perks stays < 255, byte-safe)
+
+// The hull-reinforcement cap rises with depth, so the outpost always has another tier to sell
+// on a deep run. Every 6 zones unlocks one more +6 step, up to ENDLESS_HULL_MAX.
+static int endlessHullMax(void)
+{
+	int m = ENDLESS_HULL_BASE + (endlessRunDepth / 6) * ENDLESS_HULL_STEP;
+	return (m > ENDLESS_HULL_MAX) ? ENDLESS_HULL_MAX : m;
+}
+
+// The pre-difficulty "choose your seed" screen (see endless.h), shown for a new Endless run.
+// Styled after difficultySelect (the adjacent screen): pic-2 background, centered rows.
+bool endlessSeedSelect(char *outSeed, size_t outN, bool *outHardcore)
+{
+	if (shopSpriteSheet.data == NULL)
+		JE_loadCompShapes(&shopSpriteSheet, '1');  // mouse-pointer sprites (as difficultySelect does)
+
+	char seed[ENDLESS_SEED_MAXLEN] = "";  // the seed being typed ("" => a random seed is rolled on Start)
+	size_t len = 0;
+	bool hardcore = false;  // the Hardcore toggle (default off); written to *outHardcore on Start
+
+	enum { ROW_SEED, ROW_RANDOM, ROW_HARDCORE, ROW_START, ROW_COUNT };
+	int selected = ROW_SEED;
+
+	const int xCenter = 320 / 2;  // fixed 320 center (see difficultySelect / gameplaySelect rationale)
+	const int yRows   = 82;
+	const int dyRows  = 20;
+	const int hRow    = 15;
+
+	// Background + static titles: drawn once into VGAScreen2, copied to VGAScreen each frame.
+	JE_loadPic(VGAScreen2, 2, false);
+	draw_font_hv_shadow(VGAScreen2, xCenter, 20, "ENDLESS", large_font, centered, 15, -3, false, 2);
+	draw_font_hv_shadow(VGAScreen2, xCenter, 54, "Type a seed for a repeatable run,",  small_font, centered, 15, 2, false, 1);
+	draw_font_hv_shadow(VGAScreen2, xCenter, 64, "or leave it blank for a random one.", small_font, centered, 15, 2, false, 1);
+
+	wait_noinput(true, true, true);
+
+	bool first = true, done = false, commit = false;
+	int prev_mx = mouse_x, prev_my = mouse_y;
+	newkey = newmouse = new_text = false;  // input flags are consumed + cleared at the END of each pass
+	while (!done)
+	{
+		memcpy(VGAScreen->pixels, VGAScreen2->pixels, (size_t)VGAScreen->pitch * VGAScreen->h);
+
+		char seedRow[48];
+		if (len > 0)
+			snprintf(seedRow, sizeof(seedRow), "Seed: %s_", seed);
+		else
+			SDL_strlcpy(seedRow, "Seed: (random)", sizeof(seedRow));
+		const char *label[ROW_COUNT] = { seedRow, "Randomize", hardcore ? "Hardcore: On" : "Hardcore: Off", "Start" };
+
+		int rowW[ROW_COUNT];
+		for (int i = 0; i < ROW_COUNT; ++i)
+		{
+			rowW[i] = JE_textWidth(label[i], normal_font);
+			draw_font_hv_shadow(VGAScreen, xCenter, yRows + dyRows * i, label[i],
+			                    normal_font, centered, 15, -4 + (i == selected ? 2 : 0), false, 2);
+		}
+
+		// A line under the rows spells out what the current Hardcore choice means, then the controls.
+		draw_font_hv_shadow(VGAScreen, xCenter, yRows + dyRows * ROW_COUNT + 4,
+		                    hardcore ? "Hardcore: no saving, and no second chances."
+		                             : "Standard: save anytime; bail a level to re-outfit.",
+		                    small_font, centered, 15, 2, false, 1);
+		draw_font_hv_shadow(VGAScreen, xCenter, yRows + dyRows * ROW_COUNT + 18,
+		                    "Up/Down Move    Enter Select    Esc Back", small_font, centered, 15, 4, false, 1);
+
+		if (first)
+		{
+			fade_palette(colors, 10, 0, 255);
+			first = false;
+		}
+
+		// Present at the render rate, smooth like every other menu: pump SDL events every frame and
+		// end the pass the moment input arrives. JE_mouseStart calls service_SDL_events, so input
+		// accumulates onto the edge flags (cleared only at the end of the pass, never mid-pass), so
+		// no keystroke is dropped. setDelay bounds an idle pass; input ends it early.
+		mouseCursor = MOUSE_POINTER_NORMAL;
+		push_joysticks_as_keyboard();
+		setDelay(1);
+		for (;;)
+		{
+			JE_mouseStart();   // service_SDL_events(false): pump + accumulate, then prep the cursor
+			JE_showVGA();
+			JE_mouseReplace();
+			if (newkey || newmouse || new_text || getDelayTicks() == 0)
+				break;
+			if (!output_vsync)
+				limit_render_fps();
+		}
+
+		// Row hit-testing (centered rows): which row, if any, is the cursor over. Only a mouse
+		// MOVE re-selects (so arrow-key navigation isn't yanked back to a resting cursor); a click
+		// still acts on whatever row it lands on.
+		int hover = -1;
+		for (int i = 0; i < ROW_COUNT; ++i)
+		{
+			const int x0 = xCenter - rowW[i] / 2, x1 = xCenter + rowW[i] / 2;
+			const int y0 = yRows + dyRows * i,    y1 = y0 + hRow;
+			if (mouse_x >= x0 && mouse_x < x1 && mouse_y >= y0 && mouse_y < y1)
+				hover = i;
+		}
+		const bool mouseMoved = (mouse_x != prev_mx || mouse_y != prev_my);
+		prev_mx = mouse_x;
+		prev_my = mouse_y;
+		if (mouseMoved && hover >= 0 && hover != selected)
+		{
+			selected = hover;
+			JE_playSampleNum(S_CURSOR);
+		}
+
+		bool activate = false;
+		if (newmouse)
+		{
+			if (lastmouse_but == SDL_BUTTON_RIGHT)
+			{
+				JE_playSampleNum(S_SPRING);
+				done = true;  // cancel
+			}
+			else if (hover >= 0)
+			{
+				selected = hover;
+				activate = true;
+			}
+		}
+		else if (newkey)
+		{
+			switch (lastkey_scan)
+			{
+			case SDL_SCANCODE_UP:
+				selected = (selected == 0) ? ROW_COUNT - 1 : selected - 1;
+				JE_playSampleNum(S_CURSOR);
+				break;
+			case SDL_SCANCODE_DOWN:
+				selected = (selected + 1) % ROW_COUNT;
+				JE_playSampleNum(S_CURSOR);
+				break;
+			case SDL_SCANCODE_BACKSPACE:
+				if (len > 0)
+					seed[--len] = '\0';
+				selected = ROW_SEED;
+				break;
+			case SDL_SCANCODE_LEFT:
+			case SDL_SCANCODE_RIGHT:
+				// A natural left/right on the on/off Hardcore row flips it.
+				if (selected == ROW_HARDCORE)
+				{
+					hardcore = !hardcore;
+					JE_playSampleNum(S_CLICK);
+				}
+				break;
+			case SDL_SCANCODE_RETURN:
+			case SDL_SCANCODE_KP_ENTER:
+				activate = true;
+				break;
+			case SDL_SCANCODE_ESCAPE:
+				JE_playSampleNum(S_SPRING);
+				done = true;  // cancel
+				break;
+			default:
+				break;
+			}
+		}
+
+		// Typed characters always edit the seed field -- any printable ASCII is a valid seed byte.
+		if (new_text)
+		{
+			for (size_t ti = 0; last_text[ti] != '\0'; ++ti)
+			{
+				const unsigned char c = (unsigned char)last_text[ti];
+				if (c >= 32 && c < 127 && len < sizeof(seed) - 1)
+					seed[len++] = (char)c;
+			}
+			seed[len] = '\0';
+			selected = ROW_SEED;
+		}
+
+		if (activate && !done)
+		{
+			if (selected == ROW_RANDOM)
+			{
+				snprintf(seed, sizeof(seed), "%lu", (unsigned long)(1u + mt_rand() % 999999999u));  // a fresh random seed to preview / share
+				len = strlen(seed);
+				JE_playSampleNum(S_SELECT);
+			}
+			else if (selected == ROW_HARDCORE)
+			{
+				hardcore = !hardcore;  // Enter / click on the toggle flips it, doesn't start the run
+				JE_playSampleNum(S_CLICK);
+			}
+			else  // ROW_SEED or ROW_START: begin the run
+			{
+				if (len == 0)  // blank field => roll a random seed so a run always has one
+					snprintf(seed, sizeof(seed), "%lu", (unsigned long)(1u + mt_rand() % 999999999u));
+				SDL_strlcpy(outSeed, seed, outN);
+				if (outHardcore)
+					*outHardcore = hardcore;
+				JE_playSampleNum(S_SELECT);
+				commit = true;
+				done = true;
+			}
+		}
+
+		newkey = newmouse = new_text = false;  // consume this pass's input so nothing repeats next pass
+	}
+
+	fade_black(commit ? 10 : 15);  // fade out like difficultySelect, so the next screen fades in cleanly
+	return commit;
+}
+
+void endlessResetRun(void)
+{
+	endlessRunDepth   = 0;
+	endlessActiveMods = 0;
+	endlessArmorBonus = 0;
+	endlessRunKills   = 0;
+	endlessRunBossKills = 0;
+	endlessPurchasedMods = 0;
+	endlessBuffKind = 0;
+	endlessBuffCooldownUntil = 0;  // kill-fire recharge: fresh run, no lock
+	endlessOverdriveStacks = 0;
+	endlessComboKills = 0;
+	endlessPerkPending = false;
+	endlessPerkChoiceN = 0;
+	endlessPerkDepthDone = -1;
+	endlessResumeVisit = false;
+	endlessRegenTick = 0;
+	endlessBuffCharge = 0;
+	endlessReviveHeld = false;
+	endlessRevivesUsed = 0;
+	endlessCleanseChargeCount = 0;
+	endlessGamblePerkWon = false;
+	endlessShopTax = 0;         // gamble state: clear any lingering debt tax / rigged flag / long con
+	endlessGambleRigged = false;
+	endlessLongCon = 0;
+	endlessLockedSortie = false;   // no locked "gave up" outpost on a fresh run
+	endlessQuitToOutpost = false;
+	endlessSortieHave = false;     // no launch-time snapshot yet
+	endlessSortiePrePurchased = 0; // no pre-pick one-shots stashed yet
+	endlessSortiePreCleanse = 0;
+	endlessSortiePreLongCon = 0;
+	// Default to non-hardcore. newEndlessGame overrides this from the seed screen right after the
+	// reset; a save/resume (endlessApplyCurrent runs this reset) correctly leaves it cleared, since
+	// hardcore runs never save and so are never resumed.
+	endlessHardcore = false;
+	endlessBaseName[0] = endlessPrevBaseName[0] = '\0';  // crash-log base-level history: fresh run
+	endlessBaseEp = endlessBaseLvl = endlessPrevBaseEp = endlessPrevBaseLvl = 0;
+	endlessRecentCount = 0;  // anti-repeat ring: fresh run (a resume reloads it in endlessApplyCurrent)
+	player[0].superbombs = 0;  // fresh run: no bombs (they persist across levels within a run)
+	memset(endlessPerkOwned, 0, sizeof(endlessPerkOwned));
+	endlessSetSeed("");  // safe default; newEndlessGame / a resume load sets the real run seed next
+}
+
+void endlessCountKill(int linknum)
+{
+	if (!endlessMode)
+		return;
+
+	// A multi-part enemy is several enemy[] slots sharing one nonzero linknum, all removed
+	// consecutively in a single kill loop, so count the whole enemy once, not once per tile
+	// (else the run tally and the Overdrive stack balloon). Lone enemies are linknum 0 and always
+	// counted. Two live enemies never share a linknum, so deduping consecutive same-linknum calls
+	// is safe.
+	static int lastCountedLink = 0;
+	if (linknum != 0 && linknum == lastCountedLink)
+		return;
+	lastCountedLink = linknum;
+
+	++endlessRunKills;
+	// Boss kills are tallied in draw_boss_bar (when a boss's health bar empties), so the
+	// "Bosses slain" stat counts only real bar-spawning bosses, not the high-armor regulars the
+	// old armor >= ENDLESS_BOSS_ARMOR test here wrongly swept in.
+	if (endlessActiveMods & ENDLESS_MOD_KILLFIRE_ANY)
+	{
+		endlessTurbodriveTimer = endlessBuffWindowTicks();  // refresh the window (boost OR evil jam; charge lengthens it)
+		++endlessComboKills;                              // combo kill -> compounds the fire boost / evil jam
+	}
+	if ((endlessActiveMods & ENDLESS_MOD_STACKED) && endlessOverdriveStacks < ENDLESS_OVERDRIVE_MAX_STACKS)
+		++endlessOverdriveStacks;                        // per-kill damage stack (Overdrive/Overblast) or damage-cut stack (Burnout/Misfire)
+
+	// Siphon perk: a per-kill chance to restore 1 armor (up to the ship's max).
+	if (endlessPerkOwned[PERK_SIPHON] > 0
+	    && (int)(mt_rand() % 100) < endlessPerkOwned[PERK_SIPHON] * ENDLESS_PERK_SIPHON_PCT  // per-kill: gameplay RNG, not the seed
+	    && player[0].armor < player[0].initial_armor)
+		++player[0].armor;
+}
+
+void endlessPreloadBanks(void)
+{
+	// Apply the level's first enemy-sprite-bank load (event type 5) immediately, so the starting
+	// banks are resident before anything spawns. The engine zeroes the bank slots at level start
+	// and schedules this load on the event timeline; applying it up front is a harmless safety net
+	// (it loads exactly the level's own first banks) so the earliest enemies render. Later event-5s
+	// still fire as normal.
+	for (int i = 0; i < maxEvent; ++i)
+	{
+		if (eventRec[i].eventtype != 5)
+			continue;
+
+		const int banks[4] = {
+			eventRec[i].eventdat,  eventRec[i].eventdat2,
+			eventRec[i].eventdat3, eventRec[i].eventdat4,
+		};
+		for (int s = 0; s < 4; ++s)
+		{
+			const int b = banks[s];
+			if (b > 0 && b <= 36 && enemySpriteSheetIds[s] != (Uint8)b)
+			{
+				JE_loadCompShapes(&enemySpriteSheets[s], shapeFile[b - 1]);
+				enemySpriteSheetIds[s] = (Uint8)b;
+			}
+		}
+		break;  // only the initial bank set
+	}
+}
+
+// Random endless-safe (ep, section, file) from any installed episode, avoiding the recently-played
+// levels; the file distinguishes the two Ep1-section-3 TYRIAN cuts. fileOut may be NULL.
+static bool endlessRandomSafeLevel(int *epOut, JE_byte *secOut, JE_byte *fileOut)
+{
+	// Build the full cross-episode pool once (each JE_getLevelSections parses a levels%d.dat off
+	// disk), then sample it in memory -- so the recent-play rejection below can retry for free
+	// instead of re-reading files. Sampling is uniform per LEVEL (not per episode as the old two-
+	// step pick was), which spreads variety more evenly across the differently-sized episodes.
+	struct { int ep; JE_byte sec, file; } pool[EPISODE_MAX * 64];
+	int npool = 0;
+	for (int e = 1; e <= EPISODE_MAX && npool < (int)COUNTOF(pool); ++e)
+	{
+		if (!episodeAvail[e - 1])
+			continue;
+		JE_byte secs[64], files[64];
+		const uint n = JE_getLevelSections(e, secs, files, COUNTOF(secs));
+		for (uint i = 0; i < n && npool < (int)COUNTOF(pool); ++i)
+		{
+			pool[npool].ep   = e;
+			pool[npool].sec  = secs[i];
+			pool[npool].file = files[i];
+			++npool;
+		}
+	}
+	if (npool == 0)
+		return false;
+
+	// Prefer a level outside the whole recent-play window; if too few levels exist to honour it,
+	// relax the window one step at a time (window 0 excludes nothing, so this always terminates
+	// with a pick -- a repeat a few zones early beats failing to choose a level at all).
+	for (int window = endlessRecentCount; window >= 0; --window)
+	{
+		for (int attempt = 0; attempt < npool * 4 + 8; ++attempt)
+		{
+			const int k = (int)(endlessRand() % (uint)npool);
+			if (endlessLevelInRecent(pool[k].ep, pool[k].sec, window))
+				continue;
+			*epOut  = pool[k].ep;
+			*secOut = pool[k].sec;
+			if (fileOut != NULL)
+				*fileOut = pool[k].file;
+			return true;
+		}
+	}
+	return false;
+}
+
+JE_byte endlessPickNextLevel(void)
+{
+	// Fallback single-level picker (used if the branching choice can't build candidates).
+	// Picks a random endless-safe level from any installed episode, switching episode data
+	// if needed (the weapon arsenal is shared, so the loadout is unaffected).
+	int ep;
+	JE_byte sec, file;
+	if (!endlessRandomSafeLevel(&ep, &sec, &file))
+	{
+		forcedLvlFileNum = 0;
+		return FIRST_LEVEL;
+	}
+
+	if (ep != episodeNum)
+		JE_initEpisode(ep);
+	forcedLvlFileNum = file;  // load this ']L''s file, not just the section's first (see JE_loadMap)
+	return sec;
+}
+
+// --- Per-level random music ------------------------------------------------------
+// Endless plays a random track each level (1-based song numbers into musicTitle[]), avoiding
+// an immediate repeat between zones. The non-level jingles and a few misfits are left out:
+static const JE_byte endlessLevelSongs[] = {  // omits shop #3, level-end #10, game-over #11, high-score #34, MusicMan #19, ZANAC3 #31, BEER #41
+	1, 2, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32, 33, 35, 36, 37, 38, 39, 40,
+};
+
+static void endlessPickLevelMusic(void)
+{
+	// Deterministic per (seed, zone), so a Quit Level relaunch reproduces the same track; the anti-
+	// repeat re-derives the PREVIOUS zone's song from its own stream (notes.md §Seeded structure RNG).
+	JE_byte prev = 0;
+	if (endlessRunDepth > 0)
+	{
+		endlessReseed((Uint64)(endlessRunDepth - 1) * 2 + 1);
+		prev = endlessLevelSongs[endlessRand() % COUNTOF(endlessLevelSongs)];
+		endlessReseed((Uint64)endlessRunDepth * 2 + 1);  // re-prime this zone's stream
+	}
+	JE_byte s = endlessLevelSongs[endlessRand() % COUNTOF(endlessLevelSongs)];
+	if (s == prev)  // one deterministic re-roll to dodge an immediate repeat between zones
+		s = endlessLevelSongs[endlessRand() % COUNTOF(endlessLevelSongs)];
+	levelSong = s;  // the level-start play_song(levelSong - 1) uses this
+}
+
+// Whether this zone shows the "light cone" spotlight -- rolled in endlessRegenerateLevel.
+static bool endlessLightCone = false;
+
+bool endlessLightConeActive(void) { return endlessLightCone; }
+
+// Base (shipped) level accessors for the crash logger. "Base" = the current ZONE's underlying
+// authored level; "Prev" = the one the previous zone was built on ("" name until the 2nd zone).
+const char *endlessBaseLevelName(void)     { return endlessBaseName; }
+int         endlessBaseLevelEpisode(void)  { return endlessBaseEp; }
+int         endlessBaseLevelSection(void)  { return endlessBaseLvl; }
+const char *endlessPrevLevelName(void)     { return endlessPrevBaseName; }
+int         endlessPrevLevelEpisode(void)  { return endlessPrevBaseEp; }
+int         endlessPrevLevelSection(void)  { return endlessPrevBaseLvl; }
+
+// Anti-repeat recent-level ring, newest first (i = 0). Bounds-checked so the crash logger can walk
+// it without trusting the count. Out-of-range indices read as 0.
+int endlessRecentLevelCount(void)          { return endlessRecentCount; }
+int endlessRecentLevelEpisode(int i)       { return (i >= 0 && i < endlessRecentCount) ? endlessRecentEp[i]  : 0; }
+int endlessRecentLevelSection(int i)       { return (i >= 0 && i < endlessRecentCount) ? endlessRecentSec[i] : 0; }
+
+void endlessRegenerateLevel(void)
+{
+	// Endless plays the shipped level exactly as authored -- its enemies, their
+	// placement, spawn timing, and terrain are all left untouched. This hook only fixes
+	// up the bits of per-level state that a random level jump would otherwise leave in a
+	// state that crashes (or misbehaves in) a plain single-player run.
+
+	// Remember the shipped level this zone is built on before we overwrite levelName below --
+	// JE_loadMap (which ran just before this) left the level's authored name in levelName. Roll
+	// the current base down to "previous" first. Surfaced only in the crash log.
+	memcpy(endlessPrevBaseName, endlessBaseName, sizeof(endlessPrevBaseName));
+	endlessPrevBaseEp  = endlessBaseEp;
+	endlessPrevBaseLvl = endlessBaseLvl;
+	SDL_strlcpy(endlessBaseName, levelName, sizeof(endlessBaseName));
+	endlessBaseEp  = episodeNum;
+	endlessBaseLvl = mainLevel;
+
+	// Log this zone's base level into the anti-repeat ring so the next course/level pick avoids it
+	// (and the few before it). This is the single point every zone load passes through, so it also
+	// covers the first zone, the debug jump, and the locked-sortie relaunch (a same-level reload is
+	// ignored by endlessRecordRecentLevel).
+	endlessRecordRecentLevel(episodeNum, mainLevel);
+
+	// Show the run zone on the HUD instead of the underlying level's name. And endless
+	// has no datacubes -- a randomly-picked level's cube data can crash on collect.
+	snprintf(levelName, sizeof(levelName), "ZONE %d", endlessRunDepth + 1);
+	cubeMax = 0;
+	lastCubeMax = 0;
+
+	// Pin the planet-map hub to one safe planet (see endlessBetweenLevels for why).
+	mapOrigin = 1;
+	mapPNum = 1;
+	mapPlanet[0] = 1;
+	mapSection[0] = mainLevel;
+
+	// A randomly-jumped level may carry special-mode flags (Galaga 2-player, bonus,
+	// extra-game) whose machinery doesn't fit a 1-player endless run and can crash.
+	galagaMode = false;
+	extraGame = false;
+	bonusLevelCurrent = false;
+	normalBonusLevelCurrent = false;
+
+	// Fresh elite decisions each level (linknums are reused per level).
+	endlessResetElites();
+
+	// A resumed outpost snapshot is consumed by the shop; once a level actually starts, make
+	// sure no stale resume flag can leak into a LATER outpost (e.g. an in-shop load).
+	endlessResumeVisit = false;
+
+	// Reset the per-zone timers (ENRAGE ramp, TURBODRIVE/Overdrive window).
+	endlessZoneTicks = 0;
+	endlessTurbodriveTimer = 0;
+	endlessOverdriveStacks = 0;
+	endlessComboKills = 0;
+
+	// Re-derive the seeded stream for this zone's level-start draws (music), keyed by depth so it
+	// stays fixed for a seed regardless of what the player did at the outpost (gamble/reroll/buys).
+	endlessReseed((Uint64)endlessRunDepth * 2 + 1);
+
+	// Random level-appropriate music each level (overrides the shipped level's own track).
+	endlessPickLevelMusic();
+
+	// Roll this zone's light cone (spotlight): a seeded 1-in-10 chance in its own reseed phase,
+	// fixed per (seed, depth) without shifting the existing music/course/shop draws.
+	endlessReseed((Uint64)endlessRunDepth * 2 + 0x40000000);
+	endlessLightCone = (endlessRand() % 10 == 0);
+}
+
+// --- Depth- and mutator-scaled enemy difficulty --------------------------------
+// Endless never changes WHICH enemies appear -- it only scales the stats of what the level
+// already spawns, via levers the engine applies at use (notes.md §Difficulty ramp).
+
+// Difficulty factor (percent) tilting the depth ramp: NORMAL = 100 keeps the tuned baseline,
+// and the spread is wide so the modes feel distinct (notes.md §Difficulty ramp).
+static int endlessDifficultyRampPercent(void)
+{
+	switch (difficultyLevel)
+	{
+	case DIFFICULTY_WIMP:       return 50;
+	case DIFFICULTY_EASY:       return 75;
+	case DIFFICULTY_NORMAL:     return 100;
+	case DIFFICULTY_HARD:       return 120;   // 80% elite cap at ~zone 100
+	case DIFFICULTY_IMPOSSIBLE: return 134;   // 80% elite cap at ~zone 90
+	default:                    return 160;   // Insanity and beyond: 80% elite cap at ~zone 75
+	}
+}
+
+// Depth driving the enemy-difficulty levers: real run depth x1.25, tilted by base difficulty
+// (endlessDifficultyRampPercent). Each lever below has its own slope so the caps mature one
+// at a time across the run instead of piling into a wall (notes.md §Endless / Difficulty
+// ramp); HUD, score, milestones and the economy still use the real endlessRunDepth.
+static int endlessEffectiveDepth(void)
+{
+	return endlessRunDepth * endlessDifficultyRampPercent() * 5 / 400;
+}
+
+// Ordinary-enemy HP multiplier (100 = normal): +4% per (effective) level; FORTIFIED +120%
+// (2.2x HP, clearly felt); FRAGILE -50%.
+int endlessArmorPercent(void)
+{
+	int pct = 100 + endlessEffectiveDepth() * 4;
+	if (endlessActiveMods & ENDLESS_MOD_FORTIFIED)
+		pct += 120;
+	if (endlessActiveMods & ENDLESS_MOD_FRAGILE)
+		pct -= 50;
+	if (pct < 25)
+		pct = 25;
+	if (pct > 600)
+		pct = 600;
+	return pct;
+}
+
+// Boss HP multiplier (1 = normal): +1x every 8 (effective) levels, reaching the 16x cap at run
+// depth ~96 on Normal; FORTIFIED +3x (a 4x boss at depth 0); FRAGILE ~halves it.
+int endlessBossHpMult(void)
+{
+	int mult = 1 + endlessEffectiveDepth() / 8;
+	if (endlessActiveMods & ENDLESS_MOD_FORTIFIED)
+		mult += 3;
+	if (endlessActiveMods & ENDLESS_MOD_MARKED)  // gamble "Marked": the boss you paid to forget comes back bulked up
+		mult += 2;
+	if (endlessActiveMods & ENDLESS_MOD_FRAGILE)
+		mult = (mult + 1) / 2;
+	if (mult > 16)
+		mult = 16;
+	if (mult < 1)
+		mult = 1;
+	return mult;
+}
+
+// Enemy shot-cooldown multiplier (100 = normal; LOWER = fires faster): -0.75% per (effective)
+// level, bottoming at the 4x-fire floor at run depth ~80 on Normal; FRENZY an extra -50% (~2x
+// fire), floored at 25% so deep FRENZY runs reach ~4x.
+int endlessFireDelayPercent(void)
+{
+	int reduce = endlessEffectiveDepth() * 3 / 4;
+	if (endlessActiveMods & ENDLESS_MOD_FRENZY)
+		reduce += 50;
+	if (endlessActiveMods & ENDLESS_MOD_ENRAGE)  // ramps up the longer you linger in the zone
+	{
+		int e = endlessZoneTicks / 25;
+		reduce += (e > 55) ? 55 : e;
+	}
+	if (endlessActiveMods & ENDLESS_MOD_OVERCLOCK)  // everything runs hot
+		reduce += 30;
+	if (endlessActiveMods & ENDLESS_MOD_OVERLOAD)   // Overclock cranked way up
+		reduce += 55;
+	if (reduce > 75)
+		reduce = 75;
+	return 100 - reduce;
+}
+
+// Enemy projectile-speed multiplier (100 = normal): +1.67% per (effective) level, reaching the
+// 2.4x cap at run depth ~67 on Normal; SWIFT +70% (1.7x shots).
+int endlessShotSpeedPercent(void)
+{
+	int pct = 100 + endlessEffectiveDepth() * 5 / 3;
+	if (endlessActiveMods & ENDLESS_MOD_SWIFT)
+		pct += 70;
+	if (endlessActiveMods & ENDLESS_MOD_DILATION)  // time dilation: shots crawl
+		pct -= 45;
+	if (endlessActiveMods & ENDLESS_MOD_OVERCLOCK)  // everything runs hot
+		pct += 40;
+	if (endlessActiveMods & ENDLESS_MOD_OVERLOAD)   // Overclock cranked way up
+		pct += 90;
+	if (pct > 240)
+		pct = 240;
+	if (pct < 40)
+		pct = 40;
+	return pct;
+}
+
+// The tide resumes the shot-DAMAGE climb past its intensity cap (notes.md §Difficulty ramp).
+// Defined here (not in the tide block below) because a macro must precede its user.
+#define ENDLESS_TIDE_DMG_STEP  3    // tide levels per +1% enemy shot damage past the 220 intensity cap
+#define ENDLESS_TIDE_DMG_CAP   400  // absolute ceiling on the tide-boosted shot-damage percent (sanity backstop)
+
+// Enemy shot-DAMAGE multiplier (100 = normal): +1.75% per (effective) level; DEVASTATING +75%.
+// Capped lower than the others, then the tide resumes a SLOW climb (notes.md §Difficulty ramp).
+int endlessShotDamagePercent(void)
+{
+	int pct = 100 + endlessEffectiveDepth() * 7 / 4;
+	if (endlessActiveMods & ENDLESS_MOD_DEVASTATING)
+		pct += 75;
+	if (pct > 220)
+		pct = 220;
+	// The tide (0 until effective zone 35, then +1 per effective zone, uncapped) adds a gentle
+	// +1% per ENDLESS_TIDE_DMG_STEP ON TOP of the intensity cap: ~+30% by zone 100, ~+70% by
+	// zone 200 on NORMAL. The high ENDLESS_TIDE_DMG_CAP is only a backstop; the consumer
+	// (tyrian2.c) also clamps the final per-shot byte to 255, so a big multiplier can't wrap.
+	pct += endlessTideLevel() / ENDLESS_TIDE_DMG_STEP;
+	if (pct > ENDLESS_TIDE_DMG_CAP)
+		pct = ENDLESS_TIDE_DMG_CAP;
+	return pct;
+}
+
+// --- Rising tide: quantity scaling past the intensity caps ------------------------
+// The intensity levers above saturate by ~effective zone 100-125; the tide adds the one axis
+// with NO engine ceiling -- extra shots per volley and a rising elite/champion share -- off
+// this single coefficient, staying 0 through the early hump (notes.md §Endless).
+
+#define ENDLESS_TIDE_START      35   // effective zone the tide begins (intensity is ~capped by here)
+// Enemy "rising tide" of EXTRA shots per volley (see endlessExtraEnemyShots). These define the
+// NORMAL-difficulty baseline: ENDLESS_TIDE_SHOT_ADD shots at zone ENDLESS_TIDE_SHOT_ANCHOR, plus
+// another ADD for every ENDLESS_TIDE_SHOT_STEP zones after. Harder/easier difficulties reach each
+// step sooner/later (scaled by the same rampPercent as the other enemy levers).
+#define ENDLESS_TIDE_SHOT_ANCHOR 100  // ZONE (on NORMAL) at which the tide adds ENDLESS_TIDE_SHOT_ADD shots
+#define ENDLESS_TIDE_SHOT_ADD    5    // shots added per step (and the count at the anchor zone on NORMAL)
+#define ENDLESS_TIDE_SHOT_STEP   33   // +ADD shots for every this-many zones past the anchor (on NORMAL)
+#define ENDLESS_TIDE_SHOT_MAX    50   // ceiling on added shots/volley (the enemy-shot pool caps total too)
+
+// The single tide coefficient (the "knob"): 0 through the early game, then +1 per effective zone,
+// uncapped. Everything the tide drives is derived from this.
+int endlessTideLevel(void)
+{
+	if (!endlessMode)
+		return 0;
+	const int t = endlessEffectiveDepth() - ENDLESS_TIDE_START;
+	return (t > 0) ? t : 0;
+}
+
+// Extra enemy shots per firing volley: +ADD at the anchor zone, +ADD again every STEP zones,
+// capped at MAX, with the zone difficulty-scaled like every other lever. Uses endlessRunDepth
+// directly, not the shared endlessTideLevel(). tyrian2.c fans these out around the weapon's
+// own shots; the enemy-shot pool (ENEMY_SHOT_MAX) still hard-caps what reaches the screen.
+int endlessExtraEnemyShots(void)
+{
+	if (!endlessMode)
+		return 0;
+	// Difficulty-scaled zone: == the real zone (endlessRunDepth+1) on NORMAL (ramp 100), advanced on
+	// harder difficulties and held back on easier ones -- same rampPercent as the other enemy levers.
+	const int zone     = 1 + endlessRunDepth * endlessDifficultyRampPercent() / 100;
+	const int zeroZone = ENDLESS_TIDE_SHOT_ANCHOR - ENDLESS_TIDE_SHOT_STEP;  // where the ramp crosses 0 (= 67)
+	if (zone <= zeroZone)
+		return 0;
+	int extra = ENDLESS_TIDE_SHOT_ADD * (zone - zeroZone) / ENDLESS_TIDE_SHOT_STEP;
+	if (extra > ENDLESS_TIDE_SHOT_MAX)
+		extra = ENDLESS_TIDE_SHOT_MAX;
+	return extra;
+}
+
+// --- Elite enemies --------------------------------------------------------------
+// A depth-scaled trickle of tougher, tinted, bounty-paying enemies. The roll is cached per
+// linkgroup so a multi-tile enemy is one tier as a whole (notes.md §Difficulty ramp).
+
+static signed char endlessEliteLink[256];  // per-linknum tier this level: -1 undecided, else 1/2/3
+
+void endlessResetElites(void)
+{
+	for (unsigned i = 0; i < COUNTOF(endlessEliteLink); ++i)
+		endlessEliteLink[i] = -1;
+
+	// Seed this zone's elite/champion tier stream from the run seed + depth, so the rolls are
+	// reproducible for a given seed. Own salt phase: a large offset that can't collide with the
+	// outpost (depth*2), level/music (depth*2+1), or light-cone (depth*2+0x40000000) streams.
+	endlessEliteRngState = endlessSplitMixSeed((Uint64)endlessRunDepth * 2 + 0x50000000);
+}
+
+// Chance (percent) that an eligible enemy becomes SPECIAL: a 2% trickle rising to an 80% cap;
+// Elite Pack forces half, Apex/Legion force all (notes.md §Difficulty ramp).
+static int endlessEliteChancePercent(void)
+{
+	if (endlessActiveMods & (ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION))
+		return 100;
+	if (endlessActiveMods & ENDLESS_MOD_ELITEPACK)
+		return 50;
+	int pct = 2 + endlessEffectiveDepth() / 2;
+	if (pct > 25)
+		// Past the 25% shoulder (effective depth 46), climb the last 55 points to the cap at
+		// ~0.54/level, so the share reaches 80% at effective depth 148 (~zone 120 on Normal).
+		pct = 25 + (endlessEffectiveDepth() - 46) * 27 / 50;
+	if (pct > 80)
+		pct = 80;                           // leave a true 100% to the Apex / Legion sectors
+	return pct;
+}
+
+// Roll one enemy's tier: 1 normal, 2 elite, 3 champion. Champions are ~half as common as
+// elites (1 in 3 of the specials) -- except a LEGION sector makes every special a champion.
+static int endlessPickTier(void)
+{
+	if ((int)(endlessEliteRand() % 100) >= endlessEliteChancePercent())  // seeded elite stream, per (seed, zone)
+		return 1;  // normal
+	if (endlessActiveMods & ENDLESS_MOD_LEGION)
+		return 3;  // every special is a champion
+	// Among specials, the champion share climbs with the tide (tougher shooters deeper),
+	// from the base ~1/3 toward a majority.
+	int champPct = 33 + endlessTideLevel() / 3;
+	if (champPct > 70)
+		champPct = 70;
+	return ((int)(endlessEliteRand() % 100) < champPct) ? 3 : 2;  // seeded elite stream, per (seed, zone)
+}
+
+int endlessRollEliteTier(JE_byte linknum)
+{
+	if (linknum == 0)  // lone single-tile enemy: independent per-enemy roll
+		return endlessPickTier();
+	// Multi-tile enemy: decide once for the whole linkgroup so every tile is the same tier.
+	if (endlessEliteLink[linknum] < 0)
+		endlessEliteLink[linknum] = (signed char)endlessPickTier();
+	return endlessEliteLink[linknum];
+}
+
+// Elite/champion HP multiplier -- a damage divisor applied like the boss one: the enemy
+// spends N damage per 1 armor, so it effectively has N times its HP. ~2x, up with depth.
+int endlessEliteHpMult(void)
+{
+	int mult = 2 + endlessEffectiveDepth() / 20;
+	if (mult > 5)
+		mult = 5;
+	return mult;
+}
+
+// Combined per-hit HP divisor for an endless enemy. Non-boss elites/champions use the full
+// elite multiplier; an elite/champion BOSS (already depth-scaled) gets a gentler x2 bump on
+// top, capped so no enemy becomes an unkillable sponge. Ordinary enemies -> 1.
+int endlessEnemyHpMult(bool hasBossBar, int bossHpMult, int eliteState)
+{
+	if (!hasBossBar)
+		return (eliteState >= 2) ? endlessEliteHpMult() : 1;
+	if (eliteState < 2)
+		return bossHpMult;                             // normal boss: unchanged
+	int mult = bossHpMult * 2;                         // elite/champion boss: gentle bump
+	int cap  = (bossHpMult > ENDLESS_HP_MULT_MAX) ? bossHpMult : ENDLESS_HP_MULT_MAX;
+	return (mult > cap) ? cap : mult;                  // capped, but never below the base
+}
+
+// Extra cash for destroying an elite / a champion (on top of the normal score value).
+// Elite/champion bounties: base scales with depth, doubled by the Bounty Hunter perk, then
+// scaled by the Scavenger cash multiplier. (endlessPerkCashPercent is defined above.)
+long endlessEliteBounty(void)
+{
+	long b = 150 + (long)endlessRunDepth * 40;
+	if (b > 2500)  // per-elite cap: the tide multiplies elite COUNT, so keep per-kill value bounded
+		b = 2500;  // (else deep zones mint enough cash to trivially buy Overdrive -- the tide's own counter)
+	if (endlessPerkOwned[PERK_BOUNTY])
+		b *= 2;
+	return b * endlessPerkCashPercent() / 100;
+}
+long endlessChampionBounty(void)
+{
+	long b = 350 + (long)endlessRunDepth * 90;
+	if (b > 6000)  // per-champion cap (same reasoning as the elite cap above)
+		b = 6000;
+	if (endlessPerkOwned[PERK_BOUNTY])
+		b *= 2;
+	return b * endlessPerkCashPercent() / 100;
+}
+
+// Champion aggression, applied per-champion on top of the sector's global scaling: they
+// fire noticeably faster and their shots hit harder.
+int endlessChampionFireDelayPercent(void)  { return 60; }   // 0.6x cooldown (~1.7x fire rate)
+int endlessChampionShotDamagePercent(void) { return 150; }  // +50% shot damage
+
+// Award an elite/champion kill: pay the bounty and post a kill message to the in-game text
+// bar. Called from both enemy-death sites (tyrian2.c) for every elite/champion tile -- a
+// lone enemy fires once; a multi-tile enemy re-posts the same line (which just redraws).
+void endlessAwardEliteKill(int eliteState)
+{
+	if (!endlessMode || eliteState < 2)
+		return;
+
+	const bool champion = (eliteState == 3);
+	const long bounty = champion ? endlessChampionBounty() : endlessEliteBounty();
+	player[0].cash += bounty;
+
+	// Message reads the same for an elite/champion regular or boss.
+	// Label stays left-aligned in the normal message-bar slot; only the cash bonus is right-aligned,
+	// its rightmost pixel sitting on x=244 (before the HUD at x=299).
+	char label[48], cash[24];
+	snprintf(label, sizeof(label), "%s Enemy destroyed!", champion ? "Champion" : "Elite");
+	snprintf(cash, sizeof(cash), "+%ld", bounty);
+	JE_drawTextWindowSplit(label, cash, 244);
+}
+
+// --- Special-weapon pickups -----------------------------------------------------
+// Endless has no data-cube archive and no secret-level warps, so the datacubes and secret
+// orbs a shipped level drops would otherwise be dead pickups. Instead each grants a random
+// SPECIAL weapon (Repulsor, Flare, ...), equipped instantly with a text-bar announcement.
+
+// Number of sprites in the HUD "power-up" sheet (spriteSheet10). A Sprite2_array begins with
+// a Uint16 offset table, one entry per sprite; entry[0] is the byte offset to sprite 1's
+// pixels -- i.e. the table's own size -- so entry[0] / 2 is the sprite count. Used to reject
+// specials whose icon index would blit past the table (see endlessGrantSpecial).
+static unsigned endlessHudIconCount(void)
+{
+	if (spriteSheet10.data == NULL || spriteSheet10.size < sizeof(Uint16))
+		return 0;
+	return SDL_SwapLE16(((Uint16 *)spriteSheet10.data)[0]) / (unsigned)sizeof(Uint16);
+}
+
+// Name of the last special weapon endlessGrantSpecial granted this shop visit, shown in the
+// E-Shop "Special Weapon" help line. Reset at shop entry (endlessResetShopPrices).
+static char endlessLastSpecialName[31] = "";
+
+const char *endlessLastGrantedSpecial(void) { return endlessLastSpecialName; }
+
+void endlessGrantSpecial(void)
+{
+	if (!endlessMode)
+		return;
+
+	// Gather the real, SAFE specials: non-empty name, a dispatcher-handled effect type
+	// (stype 1..18), and an in-range itemgraphic -- the HUD redraws the equipped icon every
+	// frame, so the bad icon several unfinished specials carry crashes instantly.
+	const unsigned iconMax = endlessHudIconCount();
+
+	// Invulnerability (stype 12 in JE_specialComplete -- the invulnerable_ticks effect) is
+	// deliberately kept OUT of the endless pool: a Buy Special that could roll full
+	// invulnerability would trivialize the run. Excluding by stype covers every
+	// invulnerability entry in the data ("Invulnerability" and "Invulnerability [easier]").
+	JE_byte pool[SPECIAL_NUM];
+	int n = 0;
+	for (int id = 1; id <= SPECIAL_NUM; ++id)
+		if (special[id].name[0] != '\0' &&
+		    special[id].stype >= 1 && special[id].stype <= 18 &&
+		    special[id].stype != 12 &&  // never Invulnerability (see note above)
+		    special[id].itemgraphic >= 1 && special[id].itemgraphic <= iconMax)
+			pool[n++] = (JE_byte)id;
+	if (n == 0)
+		return;
+
+	// Never hand back the special the player already has equipped -- a pickup/grant should feel like
+	// a change, not a dud. Drop the current one from the pool, but only when something else remains
+	// (if it's the sole valid special, keep it rather than grant nothing).
+	if (n > 1)
+	{
+		const JE_byte current = player[0].items.special;
+		for (int i = 0; i < n; ++i)
+			if (pool[i] == current)
+			{
+				pool[i] = pool[--n];  // swap-remove; order is irrelevant for a uniform pick
+				break;
+			}
+	}
+
+	const JE_byte id = pool[mt_rand() % n];  // pickup/shop grant: gameplay RNG, not the seed
+	player[0].items.special = id;
+	shotMultiPos[SHOT_SPECIAL]  = 0;
+	shotRepeat[SHOT_SPECIAL]    = 0;
+	shotMultiPos[SHOT_SPECIAL2] = 0;
+	shotRepeat[SHOT_SPECIAL2]   = 0;
+
+	// Copy the granted special's name, trimming the padding whitespace some data names carry
+	// (else the E-Shop help reads "Got NAME !" with a gap before the "!").
+	const char *s = special[id].name;
+	while (*s == ' ' || *s == '\t')
+		++s;
+	SDL_strlcpy(endlessLastSpecialName, s, sizeof(endlessLastSpecialName));
+	for (size_t len = strlen(endlessLastSpecialName);
+	     len > 0 && (endlessLastSpecialName[len - 1] == ' ' || endlessLastSpecialName[len - 1] == '\t'); )
+		endlessLastSpecialName[--len] = '\0';
+
+	char msg[64];
+	snprintf(msg, sizeof(msg), "Special weapon:  %s", endlessLastSpecialName);
+	JE_drawTextWindow(msg);
+}
+
+// --- Time-based & player-side modifiers -----------------------------------------
+// endlessZoneTicks / endlessTurbodriveTimer live up top; advanced by endlessGameplayTick.
+
+void endlessGameplayTick(void)
+{
+	if (!endlessMode)
+		return;
+	++endlessZoneTicks;
+
+	// Overheat (gamble deal): the reactor runs hot -- shed 1 hull every ~80 ticks (a hair faster than
+	// a single Nanorepair stack can mend). Floored at 1 so the DoT itself never lands the killing blow
+	// (that keeps it clear of the death/revive path in varz.c); it just steadily bleeds you toward
+	// one-hit-from-death while your guns run wild. Cleared next sector when the OVERHEAT bit lapses.
+	if ((endlessActiveMods & ENDLESS_MOD_OVERHEAT) && player[0].armor > 1 && (endlessZoneTicks % 80) == 0)
+	{
+		--player[0].armor;
+		endlessArmorHudDirty = true;  // JE_drawArmor is event-driven -- ask the game loop to repaint the bar (mainint.c)
+	}
+
+	if (endlessTurbodriveTimer > 0)
+	{
+		--endlessTurbodriveTimer;
+		if (endlessTurbodriveTimer == 0)
+		{
+			endlessOverdriveStacks = 0;  // the kill-fire window lapsed -> lose the Overdrive stacks
+			endlessComboKills = 0;        // and the combo resets -- back to the base 2x on the next kill
+		}
+	}
+
+	// Nanorepair perk: regenerate 1 armor every so often (interval shortens with more stacks).
+	if (endlessPerkOwned[PERK_REGEN] > 0)
+	{
+		if (++endlessRegenTick >= ENDLESS_PERK_REGEN_TICKS / endlessPerkOwned[PERK_REGEN])
+		{
+			endlessRegenTick = 0;
+			if (player[0].armor < player[0].initial_armor)
+				++player[0].armor;
+		}
+	}
+}
+
+// True (once) if the Overheat DoT just shaved a point of hull this tick; the game loop uses it to
+// repaint the armor bar, which is otherwise only redrawn on a damage/special/setup event.
+bool endlessConsumeArmorHudDirty(void)
+{
+	const bool dirty = endlessArmorHudDirty;
+	endlessArmorHudDirty = false;
+	return dirty;
+}
+
+bool endlessTurbodriveActive(void)
+{
+	return endlessMode && endlessTurbodriveTimer > 0;
+}
+
+// --- Kill-fire buff HUD readout -------------------------------------------------------
+// Live combo/timer/fire/damage numbers for JE_inGameDisplays -- the BUFF's own contribution
+// only, and no buff NAME (just the numbers) by design.
+int endlessKillBuffTicksLeft(void) { return endlessTurbodriveTimer; }
+int endlessKillBuffTicksMax(void)  { return endlessBuffWindowTicks(); }
+
+// The combo kill count driving the escalation (see endlessKillBuffFireDecrements) -- shown on
+// the HUD as a plain "xN". Universal: climbs for Turbodrive and Overdrive alike (both refresh
+// endlessComboKills the same way in endlessCountKill).
+int endlessKillBuffComboCount(void)
+{
+	if (!endlessMode)
+		return 0;
+	return endlessComboKills;
+}
+
+// Themed HUD colour bank (matches the ship tints): red Turbodrive (bank 12 / 0xC0), yellow
+// Overdrive (bank 7 / 0x70), blue Overblast (bank 9), bank 4 for an evil curse.
+int endlessKillBuffColorBank(void)
+{
+	if (endlessActiveMods & ENDLESS_MOD_KILLFIRE_EVIL)
+		return 4;
+	if (endlessActiveMods & ENDLESS_MOD_OVERBLAST)
+		return 9;   // blue -- the damage-only buff
+	return (endlessActiveMods & ENDLESS_MOD_OVERDRIVE) ? 7 : 12;
+}
+
+// The buff's current fire-rate MULTIPLIER (1 = none; 2x..10x from the combo ramp -- same for
+// Turbodrive and Overdrive). Derived from the same decrement count the fire block actually applies
+// (endlessKillBuffFireDecrements) plus 1 for the weapon's own per-tick decrement, so the HUD
+// multiplier can never drift from the real, combo-scaled rate.
+int endlessKillBuffFireMultiplier(void)
+{
+	if (!endlessTurbodriveActive())
+		return 1;
+	return endlessKillBuffFireDecrements() + 1;
+}
+
+int endlessKillBuffDamagePercent(void)
+{
+	if (!endlessTurbodriveActive() || !(endlessActiveMods & ENDLESS_MOD_DMGUP))
+		return 0;  // only the DAMAGE buffs (Overdrive/Overblast) grant a bonus -- Turbodrive is fire-only
+	int pct = endlessBuffCharge * 2;  // cash-paid charge adds flat damage on top of the per-kill stacks
+	pct += endlessOverdriveStacks * ENDLESS_OVERDRIVE_DMG_MAX / ENDLESS_OVERDRIVE_MAX_STACKS;  // Overdrive OR Overblast: +150% at full stacks (combo 200)
+	return pct;
+}
+
+// Extra shotRepeat decrements this tick while a kill-fire BOON is up (multiplier = dec+1; the combo
+// ramp up top). Returns 0 during an evil curse -- those SLOW fire (see endlessKillFireJamTicks).
+int endlessKillBuffFireDecrements(void)
+{
+	if (!(endlessActiveMods & ENDLESS_MOD_FIREBOOST))
+		return 0;  // only Turbodrive/Overdrive quicken fire (not Overblast); the evil mirrors slow it
+	int steps = endlessComboKills / ENDLESS_COMBO_KILLS_PER_STEP;
+	if (steps > ENDLESS_COMBO_MAX_STEPS)
+		steps = ENDLESS_COMBO_MAX_STEPS;
+	return 1 + steps;
+}
+
+// --- Evil kill-fire curses (Backfire / Burnout / Misfire): the hostile mirrors ------------------
+// Is the currently-active kill-fire window an evil curse (slows fire / cuts damage) not a boon?
+bool endlessKillFireIsEvil(void)
+{
+	return endlessMode && endlessTurbodriveActive()
+	    && (endlessActiveMods & ENDLESS_MOD_KILLFIRE_EVIL);
+}
+
+// Extra shotRepeat cooldown added to every shot while an evil curse is up (0 otherwise), so the guns
+// fire SLOWER. Mirrors endlessKillBuffFireDecrements: ramps with the same combo steps, and Evil
+// Overdrive piles on more from its per-kill stacks. Applied at shot-reset in shots.c (clamped there).
+int endlessKillFireJamTicks(void)
+{
+	if (!endlessTurbodriveActive() || !(endlessActiveMods & ENDLESS_MOD_FIREJAM))
+		return 0;  // only Backfire/Burnout jam fire (not Misfire, which only cuts damage)
+	int steps = endlessComboKills / ENDLESS_COMBO_KILLS_PER_STEP;
+	if (steps > ENDLESS_COMBO_MAX_STEPS)
+		steps = ENDLESS_COMBO_MAX_STEPS;
+	int add = ENDLESS_EVIL_JAM_BASE + steps * ENDLESS_EVIL_JAM_PER_STEP;
+	if (endlessActiveMods & ENDLESS_MOD_BURNOUT)
+		add += endlessOverdriveStacks * ENDLESS_EVIL_JAM_STACK_MAX / ENDLESS_OVERDRIVE_MAX_STACKS;
+	return add;
+}
+
+// Evil Overdrive: the shot-damage REDUCTION % currently applied (0 otherwise). Peaks at
+// ENDLESS_EVIL_DMG_MAX at full stacks; endlessPlayerDamagePercent subtracts it (with a floor).
+int endlessKillBuffEvilDamagePenalty(void)
+{
+	if (!endlessKillFireIsEvil() || !(endlessActiveMods & ENDLESS_MOD_DMGDOWN))
+		return 0;  // Burnout OR Misfire cut shot damage
+	return endlessOverdriveStacks * ENDLESS_EVIL_DMG_MAX / ENDLESS_OVERDRIVE_MAX_STACKS;
+}
+
+// The one-word HUD label naming the active evil curse: JAMMED (Backfire) / BURNOUT / MISFIRE.
+// Empty string when no evil kill-fire window is up. (A sector carries at most one evil mod.)
+const char *endlessKillFireEvilName(void)
+{
+	if (!endlessKillFireIsEvil())
+		return "";
+	if (endlessActiveMods & ENDLESS_MOD_BURNOUT)
+		return "BURNOUT";
+	if (endlessActiveMods & ENDLESS_MOD_MISFIRE)
+		return "MISFIRE";
+	return "JAMMED";  // Backfire
+}
+
+// GRAVITY: a steady downward drag growing with zone AND difficulty; the absolute cap stays
+// clear of the ship's top speed so full throttle can always climb (notes.md §Difficulty ramp).
+#define ENDLESS_GRAVITY_BASE     1.6f   // px/tick at zone 0 on NORMAL (difficulty then scales this)
+#define ENDLESS_GRAVITY_PER_ZONE 0.04f  // +px/tick per zone cleared, before the difficulty tilt
+#define ENDLESS_GRAVITY_MAX      3.6f   // hard cap (72% of VT_VMAX): full throttle always climbs ~1.4 px/tick
+float endlessGravityDrift(void)
+{
+	if (!endlessMode || !(endlessActiveMods & ENDLESS_MOD_GRAVITY))
+		return 0.0f;
+	float g = (ENDLESS_GRAVITY_BASE + ENDLESS_GRAVITY_PER_ZONE * (float)endlessRunDepth)
+	        * (float)endlessDifficultyRampPercent() / 100.0f;
+	return (g > ENDLESS_GRAVITY_MAX) ? ENDLESS_GRAVITY_MAX : g;
+}
+
+int endlessGravityPull(void)  // classic (non-VT) path: integer px/tick that tracks the (fractional) drift
+{
+	const float g = endlessGravityDrift();
+	if (g == 0.0f)
+	{
+		return 0;
+	}
+	// Carry the sub-pixel remainder between ticks (like endlessExtraScrollSteps) so the integer
+	// nudge averages out to exactly the scaled drift, whatever the zone -- not a fixed 1/2 wobble.
+	static float accum = 0.0f;
+	accum += g;
+	const int step = (int)accum;
+	accum -= (float)step;
+	return step;
+}
+
+// Player shot-damage scale (100 = normal): OVERCHARGE is a flat +50%; Overdrive adds +2.5%
+// per active kill-stack on top. Applied to the player's shots (tyrian2.c).
+int endlessPlayerDamagePercent(void)
+{
+	if (!endlessMode)
+		return 100;
+	int pct = (endlessActiveMods & ENDLESS_MOD_OVERCHARGE) ? 150 : 100;
+	if ((endlessActiveMods & ENDLESS_MOD_DMGUP) && endlessTurbodriveActive())
+		pct += endlessOverdriveStacks * ENDLESS_OVERDRIVE_DMG_MAX / ENDLESS_OVERDRIVE_MAX_STACKS;  // Overdrive OR Overblast: +150% at full stacks (combo 200)
+	if (endlessTurbodriveActive() && (endlessActiveMods & ENDLESS_MOD_DMGUP))
+		pct += endlessBuffCharge * 2;  // cash-paid charge adds damage only to the DAMAGE buffs (Overdrive/Overblast), not fire-only Turbodrive
+	pct += endlessPerkOwned[PERK_DAMAGE] * ENDLESS_PERK_DAMAGE_PCT;  // Heavy Rounds perk (run-persistent)
+	if (endlessPerkOwned[PERK_GLASSCANNON])
+		pct += ENDLESS_PERK_GLASS_DMG;                              // Glass Cannon relic (paired with -armor)
+	// Burnout / Misfire: each kill stacks a shot-damage CUT (mirror of Overdrive/Overblast's bonus),
+	// floored so you can still fight. Applied last so it bites into every other bonus.
+	if ((endlessActiveMods & ENDLESS_MOD_DMGDOWN) && endlessTurbodriveActive())
+	{
+		pct -= endlessKillBuffEvilDamagePenalty();
+		if (pct < ENDLESS_EVIL_DMG_FLOOR)
+			pct = ENDLESS_EVIL_DMG_FLOOR;
+	}
+	return pct;
+}
+
+// Flat reduction applied to each hit the player takes (Bulwark relic), applied in JE_playerDamage.
+// Always leaves at least 1 damage so it can't make the player invulnerable.
+int endlessPlayerDamageReduce(void)
+{
+	if (!endlessMode)
+		return 0;
+	return endlessPerkOwned[PERK_BULWARK] * ENDLESS_PERK_BULWARK;
+}
+
+// Cash multiplier (100 = unchanged) from the Scavenger perk, applied to the clear bonus and
+// elite/champion bounties.
+static int endlessPerkCashPercent(void)
+{
+	return 100 + endlessPerkOwned[PERK_CASH] * ENDLESS_PERK_CASH_PCT;
+}
+
+// +max armor from the Ablative Plating perk; added to the ship's armor each level start (varz.c),
+// alongside the outpost hull upgrade (endlessArmorBonus).
+int endlessPerkArmorBonus(void)
+{
+	int bonus = endlessPerkOwned[PERK_ARMOR] * ENDLESS_PERK_ARMOR_STEP;
+	if (endlessPerkOwned[PERK_GLASSCANNON])
+		bonus -= ENDLESS_PERK_GLASS_ARMOR;  // Glass Cannon relic drawback (varz.c clamps armor >= 1)
+	return bonus;
+}
+
+// Rapid Cyclers perk: extra shotRepeat decrements this tick, as a smooth fractional rate via an
+// accumulator (like the scroll-step boost). Applied every tick from the player fire block.
+int endlessPerkFireDecrements(void)
+{
+	static int accum = 0;
+	if (!endlessMode)
+	{
+		accum = 0;
+		return 0;
+	}
+	int rate = endlessPerkOwned[PERK_FIRERATE] * ENDLESS_PERK_FIRE_PCT;
+	// Adrenaline relic: a big extra boost while armor is below 1/N of the ship's max.
+	if (endlessPerkOwned[PERK_ADRENALINE] > 0 && player[0].initial_armor > 0
+	    && player[0].armor * ENDLESS_PERK_ADRENALINE_HP < player[0].initial_armor)
+		rate += endlessPerkOwned[PERK_ADRENALINE] * ENDLESS_PERK_ADRENALINE_PCT;
+	if (rate == 0)
+	{
+		accum = 0;
+		return 0;
+	}
+	accum += rate;
+	int steps = accum / 100;
+	accum -= steps * 100;
+	return steps;
+}
+
+// Rapid Recharge perk: extra cooldown decrements/tick (fractional accumulator). The caller
+// applies them to the special-fire gate AND the sidekick ammo refill -- not the main guns.
+int endlessPerkSpecialCooldownDecrements(void)
+{
+	static int accum = 0;
+	if (!endlessMode || endlessPerkOwned[PERK_SPECIALCD] == 0)
+	{
+		accum = 0;
+		return 0;
+	}
+	accum += endlessPerkOwned[PERK_SPECIALCD] * ENDLESS_PERK_SPECIALCD_PCT;
+	int steps = accum / 100;
+	accum -= steps * 100;
+	return steps;
+}
+
+// Autofire Special perk: while owned, the equipped special weapon fires on its own as long as the
+// main fire button is held -- the run-persistent equivalent of the debug "Autofire Special" toggle.
+// Read in varz.c's special-fire path, OR'd with the debug autoFireSpecial global.
+bool endlessPerkAutoFireSpecial(void)
+{
+	return endlessMode && endlessPerkOwned[PERK_AUTOSPECIAL] > 0;
+}
+
+// Efficient Coils perk: power-use scale per main-weapon shot (100 = normal, lower = cheaper);
+// applied in shots.c player_shot_create. Floored so firing is never entirely free.
+int endlessPerkPowerUsePercent(void)
+{
+	if (!endlessMode)
+		return 100;
+	int pct = 100 - endlessPerkOwned[PERK_POWERUSE] * ENDLESS_PERK_POWERUSE_PCT;
+	return pct < 20 ? 20 : pct;
+}
+
+// Shield Matrix perk: shortens the shield-regen interval from `base` (tyrian2.c), floored; a
+// no-op outside endless / with no stacks. A quicker shield still drains the generator quicker.
+int endlessPerkShieldWait(int base)
+{
+	if (!endlessMode || endlessPerkOwned[PERK_SHIELDREGEN] == 0)
+		return base;
+	int wait = base - endlessPerkOwned[PERK_SHIELDREGEN] * ENDLESS_PERK_SHIELDRGN_STEP;
+	return wait < ENDLESS_PERK_SHIELDRGN_MIN ? ENDLESS_PERK_SHIELDRGN_MIN : wait;
+}
+
+// Rapid Charger perk: shortens the charge-sidekick charge interval from `base` (mainint.c),
+// floored; a no-op outside endless / with no stacks.
+int endlessPerkChargeTicks(int base)
+{
+	if (!endlessMode || endlessPerkOwned[PERK_CHARGERATE] == 0)
+		return base;
+	int t = base - endlessPerkOwned[PERK_CHARGERATE] * ENDLESS_PERK_CHARGE_STEP;
+	return t < ENDLESS_PERK_CHARGE_MIN ? ENDLESS_PERK_CHARGE_MIN : t;
+}
+
+// Roll this shop visit's perk offers: up to 3 distinct perks that aren't already maxed out.
+// Called once per post-zone shop (endlessBetweenLevels), before the perk menu is shown.
+void endlessGeneratePerkChoices(void)
+{
+	int pool[PERK_COUNT], n = 0;
+	for (int i = 0; i < PERK_COUNT; ++i)
+		if (endlessPerkOwned[i] < endlessPerkTable[i].maxStack)
+			pool[n++] = i;
+
+	// Partial Fisher-Yates: shuffle the first min(3, n) slots and take them.
+	endlessPerkChoiceN = n < 3 ? n : 3;
+	for (int i = 0; i < endlessPerkChoiceN; ++i)
+	{
+		int j = i + (int)(endlessRand() % (unsigned)(n - i));
+		int t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+		endlessPerkChoice[i] = pool[i];
+	}
+}
+
+int endlessPerkChoiceCount(void)
+{
+	return endlessPerkChoiceN;
+}
+
+const char *endlessPerkChoiceName(int i)
+{
+	if (i < 0 || i >= endlessPerkChoiceN)
+		return "";
+	return endlessPerkTable[endlessPerkChoice[i]].name;
+}
+
+// Help-line text for an offered perk: its description plus how many the player already owns.
+const char *endlessPerkChoiceDesc(int i)
+{
+	static char buf[80];
+	if (i < 0 || i >= endlessPerkChoiceN)
+		return "";
+	const int id = endlessPerkChoice[i];
+	snprintf(buf, sizeof(buf), "%s  (Owned: %d)", endlessPerkTable[id].desc, endlessPerkOwned[id]);
+	return buf;
+}
+
+// Acquire offered perk i. The forced post-zone pick is FREE (perks come sparingly -- see the cadence
+// gate in endlessBetweenLevels); the paid path is the E-Shop "Buy Extra Perk", which charges up front
+// in endlessTryBuyExtraPerk before opening this menu.
+void endlessTakePerk(int i)
+{
+	if (i < 0 || i >= endlessPerkChoiceN)
+		return;
+	const int id = endlessPerkChoice[i];
+	if (endlessPerkOwned[id] < endlessPerkTable[id].maxStack)
+		++endlessPerkOwned[id];
+	endlessPerkDepthDone = endlessRunDepth;  // this zone's perk is resolved (survives a save/reload)
+}
+
+// Cash paid for declining the perk ("take the cash"), scaling with depth so it stays tempting.
+long endlessPerkDeclineBonus(void)
+{
+	return 1000 + (long)endlessRunDepth * 200;
+}
+
+void endlessDeclinePerk(void)
+{
+	player[0].cash += endlessPerkDeclineBonus();
+	endlessPerkDepthDone = endlessRunDepth;  // this zone's perk is resolved (survives a save/reload)
+}
+
+// Perk registry accessors, used by the endless debug screen to list / toggle / stack perks.
+int         endlessPerkCount(void)          { return PERK_COUNT; }
+const char *endlessPerkName(int id)         { return (id >= 0 && id < PERK_COUNT) ? endlessPerkTable[id].name : ""; }
+const char *endlessPerkDesc(int id)         { return (id >= 0 && id < PERK_COUNT) ? endlessPerkTable[id].desc : ""; }
+int         endlessPerkMaxStack(int id)     { return (id >= 0 && id < PERK_COUNT) ? endlessPerkTable[id].maxStack : 0; }
+int         endlessPerkGetOwned(int id)     { return (id >= 0 && id < PERK_COUNT) ? endlessPerkOwned[id] : 0; }
+
+void endlessPerkSetOwned(int id, int n)
+{
+	if (id < 0 || id >= PERK_COUNT)
+		return;
+	if (n < 0)
+		n = 0;
+	if (n > endlessPerkTable[id].maxStack)
+		n = endlessPerkTable[id].maxStack;
+	endlessPerkOwned[id] = (JE_byte)n;
+}
+
+// OVERCLOCK / SLIPSTREAM: extra layer-1 scroll steps this tick, as a smooth fractional
+// accumulator rate (notes.md §Endless scroll boost).
+int endlessExtraScrollSteps(void)
+{
+	static int accum = 0;
+	int boost = 0;
+	if (endlessMode)
+	{
+		if (endlessActiveMods & (ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_WARP))
+			boost = 220;             // "much faster" -- the level blurs past
+		else if (endlessActiveMods & (ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SLIPSTREAM))
+			boost = 70;              // +70% scroll pace
+	}
+	if (boost == 0)
+	{
+		accum = 0;
+		return 0;
+	}
+	accum += boost;
+	int steps = accum / 100;
+	accum -= steps * 100;
+	return steps;
+}
+
+// True while a scroll-speed modifier is active -- STABLE across ticks, unlike the fractional
+// step count, so the bg bottom-margin gate can't flicker (notes.md §Endless scroll boost).
+bool endlessScrollBoostActive(void)
+{
+	return endlessMode &&
+	       (endlessActiveMods & (ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SLIPSTREAM |
+	                             ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_WARP)) != 0;
+}
+
+// Smooth vertical scroll for ONE layer: outputs the constant display rate + sub-pixel fraction, and
+// (only under a scroll modifier) returns extra px so base + extra tracks a boosted target. Call once
+// per channel per tick; channel 0/1/2 = bg layer 1/2/3. notes.md §Slow-scroll smoothing.
+int endlessScrollExtraPx(int channel, int fireStep, int delayMax, int baseThisTick,
+                         float *rateOut, float *fracOut)
+{
+	static int carry[3] = { 0, 0, 0 };  // signed pending extra scroll, px*100, per channel
+	static int trem[3]  = { 0, 0, 0 };  // remainder of the target's /delayMax division, per channel
+	if (rateOut != NULL)
+		*rateOut = 0.0f;
+	if (fracOut != NULL)
+		*fracOut = 0.0f;
+	if (channel < 0 || channel > 2)
+		return 0;
+	int boost = 0;
+	if (endlessMode)
+	{
+		if (endlessActiveMods & (ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_WARP))
+			boost = 220;                 // "much faster" -- the level blurs past
+		else if (endlessActiveMods & (ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SLIPSTREAM))
+			boost = 70;                  // +70% scroll pace
+	}
+	if (fireStep <= 0)  // the layer isn't scrolling this section
+	{
+		carry[channel] = 0;
+		trem[channel]  = 0;
+		return 0;
+	}
+	if (delayMax < 1)
+		delayMax = 1;
+	// Target per-tick scroll (px*100): average base rate fireStep/delayMax scaled by the modifier,
+	// remainder carried so the long-run average is exact. boost 0 (no modifier) still runs -- the
+	// base rate alone is smoothed for the display. notes.md §Slow-scroll smoothing.
+	int tnum = fireStep * (100 + boost) + trem[channel];
+	int target = tnum / delayMax;
+	trem[channel] = tnum - target * delayMax;
+	carry[channel] += target - baseThisTick * 100;
+	// Only a real modifier drains whole px to ADD scroll (base + extra tracks the target); the base
+	// rate alone emits none, so the sim scroll stays byte-identical to the stock game.
+	int px = 0;
+	if (boost > 0 && carry[channel] >= 100)
+	{
+		px = carry[channel] / 100;
+		carry[channel] -= px * 100;
+	}
+	if (carry[channel] > 5000 || carry[channel] < -5000)  // guard runaway if a layer is never drawn
+		carry[channel] = 0;
+	if (rateOut != NULL)
+		*rateOut = (float)target / 100.0f;
+	if (fracOut != NULL)
+		*fracOut = (float)carry[channel] / 100.0f;
+	return px;
+}
+
+// Player-ship blit filter (0 = none). Only PLAYER-SIDE buffs tint the hull, while the kill-fire
+// boost is active: Overdrive burns red, plain Turbodrive electric yellow. (The
+// E-Shop "Turbodrive"/"Overdrive" buys and a Turbodrive sector all directly buff the player;
+// Overclock/Overload change ENEMY behaviour, so they no longer tint the ship.)
+int endlessShipTintFilter(void)
+{
+	if (!endlessMode)
+		return 0;
+	if (endlessTurbodriveActive())  // active kill-fire window (boost OR evil curse)
+	{
+		if (endlessActiveMods & ENDLESS_MOD_KILLFIRE_EVIL)
+			return ENDLESS_EVIL_SHIP_FILTER;         // ominous curse tint
+		if (endlessActiveMods & ENDLESS_MOD_OVERBLAST)
+			return ENDLESS_OVERBLAST_SHIP_FILTER;    // blue -- damage-only buff
+		return (endlessActiveMods & ENDLESS_MOD_OVERDRIVE)
+		       ? ENDLESS_OVERDRIVE_SHIP_FILTER   // electric yellow
+		       : ENDLESS_TURBODRIVE_SHIP_FILTER;   // red
+	}
+	return 0;
+}
+
+// Starting cash for a fresh run, by chosen difficulty (easier = more to spend).
+long endlessStartingCash(void)
+{
+	switch (difficultyLevel)
+	{
+	case DIFFICULTY_WIMP:       return 20000;
+	case DIFFICULTY_EASY:       return 15000;
+	case DIFFICULTY_NORMAL:     return 11000;
+	case DIFFICULTY_HARD:       return  8000;
+	case DIFFICULTY_IMPOSSIBLE: return  6000;
+	default:                    return  4000;  // Insanity and beyond
+	}
+}
+
+// --- Mutators -------------------------------------------------------------------
+// Payout/help registry: per-bit clear-cash `reward` (tenths of the base) + monitor `word`.
+// Generation lives in endlessGenerateCourses; every bit a course can carry is listed here.
+typedef struct {
+	unsigned    bit;
+	short       reward;    // clear-cash reward in TENTHS of the base (10 = 1.0x base; may be < 0)
+	const char *word;      // short phrase for the generated help line
+} EndlessMod;
+
+static const EndlessMod endlessModTable[] = {
+	// -- hostile --  (`word` is the Chart-a-Course monitor label: a plain WHAT-IT-DOES phrase,
+	//                 not flavor -- "more enemy HP", not "tough hulls". Keep each under ~105px
+	//                 in TINY_FONT (roughly 20 chars) so it fits the monitor's 113px columns;
+	//                 game_menu.c anchors threats top-left and boons bottom-right)
+	{ ENDLESS_MOD_FORTIFIED,     10, "more enemy HP" },
+	{ ENDLESS_MOD_FRENZY,        10, "faster enemy fire" },
+	{ ENDLESS_MOD_SWIFT,          8, "faster enemy shots" },
+	{ ENDLESS_MOD_DEVASTATING,   10, "harder enemy hits" },
+	{ ENDLESS_MOD_ENRAGE,        10, "enemy fire rate climbs" },
+	{ ENDLESS_MOD_GRAVITY,        8, "downward pull" },
+	{ ENDLESS_MOD_ELITEPACK,     20, "half enemies elite" },
+	{ ENDLESS_MOD_OVERCLOCK,     10, "faster scroll + fire" },
+	{ ENDLESS_MOD_KAMIKAZE,      12, "enemies home in" },   // moderate homing, NO ram -- the mid sector tier (what Homing used to be)
+	{ ENDLESS_MOD_HOMING,         6, "light homing" },      // the gentlest homing tier -- enemies barely lean toward you
+	{ ENDLESS_MOD_RAMPAGE,       50, "enemies ram you" },   // gamble-only brutal Kamikaze: strong homing + extra ram damage (top-tier danger weight)
+	{ ENDLESS_MOD_OVERLOAD,      15, "extreme scroll + fire" },
+	{ ENDLESS_MOD_APEX,          40, "all enemies elite" },
+	{ ENDLESS_MOD_LEGION,        50, "all champion enemies" },
+	{ ENDLESS_MOD_WARP,           0, "much faster scrolling" },
+	{ ENDLESS_MOD_BACKFIRE, 12, "kills jam your guns" },
+	{ ENDLESS_MOD_BURNOUT,   18, "kills weaken guns" },
+	{ ENDLESS_MOD_MISFIRE,   14, "kills cut your damage" },
+	{ ENDLESS_MOD_OVERHEAT,  14, "hull burns over time" },  // the reactor cooks you (gamble deal + rare Redline sector)
+	// -- boons: they HELP you, so little/no cash (a couple pay big instead) --
+	{ ENDLESS_MOD_FRAGILE,       -5, "less enemy HP" },
+	{ ENDLESS_MOD_TURBODRIVE,      0, "kills quicken guns" },
+	{ ENDLESS_MOD_OVERCHARGE,     0, "more weapon damage" },
+	{ ENDLESS_MOD_DILATION,       0, "slower enemy shots" },
+	{ ENDLESS_MOD_FAVOR,          0, "cheaper next shop" },
+	{ ENDLESS_MOD_SLIPSTREAM,     0, "faster scrolling" },
+	{ ENDLESS_MOD_OVERDRIVE,   0, "kills stack firepower" },
+	{ ENDLESS_MOD_OVERBLAST,   0, "kills stack damage" },
+	{ ENDLESS_MOD_BOUNTY,        30, "big cash payout" },
+	{ ENDLESS_MOD_CURSED,        40, "cash now, empty shop" },
+};
+
+// The base level-clear reward, before per-modifier bonuses. It scales up with the run so the
+// payout stays a meaningful supplement against the depth-inflated shop prices (weapons run
+// ~5k-30k, upgrades far more); every modifier reward is a multiple of this. Capped so a very
+// deep run can't mint an absurd single payout.
+static long endlessClearBase(void)
+{
+	long base = 900 + (long)endlessRunDepth * 220;
+	return (base > 60000) ? 60000 : base;
+}
+
+// Clear payout for an ARBITRARY modifier set at the current depth: the base plus the summed
+// per-modifier reward (each in tenths of the base). Used both to pay out (endlessClearBonus)
+// and to SHOW the payout on a course's help line (endlessComboHelp) -- so the two can't disagree.
+static long endlessClearBonusFor(unsigned mods)
+{
+	const long base = endlessClearBase();
+	long tenths = 0;
+	for (unsigned i = 0; i < COUNTOF(endlessModTable); ++i)
+		if (mods & endlessModTable[i].bit)
+			tenths += endlessModTable[i].reward;
+	const long total = base + base * tenths / 10;
+	const long floor = base / 4;
+	return (total > floor) ? total : floor;  // always a minimum reward
+}
+
+// Cash paid on CLEARING a level -- the base plus whatever the active sector's mutators add.
+// Taking the harder route pays off.
+static long endlessClearBonus(void)
+{
+	return endlessClearBonusFor(endlessActiveMods);
+}
+
+// --- Shop stock -----------------------------------------------------------------
+
+// Whether an item id is a real, buyable item in its category — filters out the
+// blank/placeholder slots and the reserved custom-weapon ("Test") ports.
+static bool endlessItemBuyable(JE_byte costType, int id)
+{
+	const char *name = NULL;
+	switch (costType)
+	{
+	case 2: name = ships[id].name;    break;  // ship
+	case 3:                                    // front weapon
+	case 4:                                    // rear weapon
+		if (id == customWeaponPort)
+			return false;
+		name = weaponPort[id].name;
+		if (SDL_strncasecmp(name, "Test", 4) == 0)
+			return false;
+		break;
+	case 5: name = shields[id].name;  break;  // shield
+	case 6: name = powerSys[id].name; break;  // generator
+	case 7:                                    // left sidekick
+	case 8:                                    // right sidekick
+		if (id == customSidekickSlot)
+			return false;
+		name = options[id].name;
+		if (strncmp(name, "None", 4) == 0)
+			return false;
+		break;
+	}
+	// Data section-divider placeholders (e.g. "Miscellaneous Option Weapons") aren't real
+	// buyable items -- keep them out of the shop.
+	if (name != NULL && SDL_strncasecmp(name, "Miscellaneous", 13) == 0)
+		return false;
+	return name != NULL && name[0] != '\0';
+}
+
+// True if id is in the exclude list -- used to keep a weapon that already appears in one
+// menu (e.g. front weapons) from being repeated in the paired menu (rear weapons).
+static bool endlessIdExcluded(const JE_byte *exclude, int excludeCount, int id)
+{
+	for (int k = 0; k < excludeCount; ++k)
+		if (exclude[k] == id)
+			return true;
+	return false;
+}
+
+// Fill one shop category (an itemAvail[] row) with a random, shuffled selection of ids -- any
+// buyable item can appear at any depth (no price or rarity preference). Any id in exclude[]
+// (excludeCount entries) is held back so paired menus don't show the same item twice; pass
+// NULL/0 for categories with no pairing.
+static void endlessFillCategory(int availIdx, JE_byte costType, int idMax, bool allowNone, int curItem, const JE_byte *exclude, int excludeCount)
+{
+	const int want = 5;  // items shown per category: None + 4 where None is allowed, else 5
+	int n = 0;
+
+	if (allowNone)
+		itemAvail[availIdx][n++] = 0;
+
+	// Always include the currently-equipped item so JE_itemScreen doesn't append it as an
+	// extra (6th) row -- it auto-adds the equipped item whenever it isn't already offered.
+	if (curItem > 0)
+	{
+		bool present = false;
+		for (int k = 0; k < n; ++k)
+			if (itemAvail[availIdx][k] == curItem)
+				present = true;
+		if (!present)
+			itemAvail[availIdx][n++] = curItem;
+	}
+
+	// Build the pool of every buyable, non-excluded id not already placed (the equipped item,
+	// and for rear weapons everything the front row already offered, are held out here). idMax
+	// never exceeds PORT_NUM across the call sites, so PORT_NUM+1 slots always suffice.
+	JE_byte pool[PORT_NUM + 1];
+	int poolN = 0;
+	for (int id = 1; id <= idMax && poolN < (int)COUNTOF(pool); ++id)
+	{
+		if (!endlessItemBuyable(costType, id))
+			continue;
+		if (endlessIdExcluded(exclude, excludeCount, id))
+			continue;
+		bool dup = false;
+		for (int k = 0; k < n; ++k)
+			if (itemAvail[availIdx][k] == id)
+				dup = true;
+		if (!dup)
+			pool[poolN++] = (JE_byte)id;
+	}
+
+	// Shuffle the pool (Fisher-Yates on the structural stream) and take the first `want` -- a
+	// genuinely random selection every visit, no price or rarity preference.
+	for (int i = poolN - 1; i > 0; --i)
+	{
+		const int j = (int)(endlessRand() % (Uint32)(i + 1));
+		const JE_byte t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+	}
+	for (int i = 0; i < poolN && n < want; ++i)
+		itemAvail[availIdx][n++] = pool[i];
+
+	itemAvailMax[availIdx] = n;
+}
+
+// Randomize the whole shop inventory (uniformly random per visit). Called on entering the
+// outpost and on each reroll.
+static void endlessFillShop(void)
+{
+	memset(itemAvail, 0, sizeof(itemAvail));
+	memset(itemAvailMax, 0, sizeof(itemAvailMax));
+
+	// Cursed Bounty: the outpost is barren -- every category stays empty this visit.
+	if (endlessActiveMods & ENDLESS_MOD_CURSED)
+		return;
+
+	// Seed each category with the player's LIVE equipped item (player[0].items), never the stale
+	// last_items, so a reroll keeps whatever is on the ship (notes.md §Save / resume).
+	const PlayerItems *it = &player[0].items;
+
+	// Front and rear share one id pool: fill front first (holding back the equipped rear), then
+	// rear excluding the front row, so no weapon id lands in both menus at once.
+	const JE_byte rearEquip = it->weapon[REAR_WEAPON].id;
+
+	// itemAvail rows per category (see itemAvailMap in game_menu.c): 0 ships, 1 front,
+	// 2 rear, 3 generator, 5 left sidekick, 6 right sidekick, 8 shield.
+	endlessFillCategory(0, 2, SHIP_NUM,   false, it->ship,                        NULL, 0);  // ships
+	endlessFillCategory(1, 3, ENDLESS_REAL_WEAPON_PORTS, false, it->weapon[FRONT_WEAPON].id, &rearEquip, rearEquip > 0 ? 1 : 0);  // front weapons (skip equipped rear)
+	endlessFillCategory(2, 4, ENDLESS_REAL_WEAPON_PORTS, true,  it->weapon[REAR_WEAPON].id,  itemAvail[1], itemAvailMax[1]);  // rear (+None), no dupes vs front
+	endlessFillCategory(3, 6, POWER_NUM,  false, it->generator,                   NULL, 0);  // generators
+	endlessFillCategory(5, 7, OPTION_NUM, true,  it->sidekick[LEFT_SIDEKICK],     NULL, 0);  // left sidekick (+None)
+	endlessFillCategory(6, 8, OPTION_NUM, true,  it->sidekick[RIGHT_SIDEKICK],    NULL, 0);  // right sidekick (+None)
+	endlessFillCategory(8, 5, SHIELD_NUM, false, it->shield,                      NULL, 0);  // shields
+}
+
+// --- Zone milestones ------------------------------------------------------------
+
+// One flavour line per 5-zone band (index = zone / 5), shown on the run-end summary screen.
+// The tone escalates from ominous to apocalyptic as the zone climbs. Clamps to the last line
+// past the end of the list.
+static const char *endlessMilestoneLine(int d)
+{
+	static const char *const lines[] = {
+		"The gate seals shut behind you.",   //   0-4
+		"The zones grow aware of you.",       //   5
+		"The enemy has marked your name.",    //  10
+		"A dark tide rises to meet you.",     //  15
+		"No signal reaches home from here.",  //  20
+		"The swarm hungers, and multiplies.", //  25
+		"Hostile stars wheel overhead.",      //  30
+		"Beyond every chart ever drawn.",     //  35
+		"The enemy tide has no ebb.",         //  40
+		"Every zone bleeds a little more.",   //  45
+		"Few living souls have come this far.", //  50
+		"The stars themselves grow cold.",    //  55
+		"A dreadful hush between the guns.",  //  60
+		"The void hums with ancient malice.", //  65
+		"The abyss has turned to stare back.", //  70
+		"Your name is forgotten out here.",   //  75
+		"Only the guns remember you now.",    //  80
+		"The dark has grown teeth.",          //  85
+		"Past where reason dares to follow.", //  90
+		"The hull screams, and still holds.", //  95
+		"Legends come this far to die.",      // 100
+		"The enemy pours out of nowhere.",    // 105
+		"Reality frays along the seams.",     // 110
+		"The stars burn wrong out here.",     // 115
+		"No light was meant to reach here.",  // 120
+		"The swarm goes on without end.",     // 125
+		"You are their ghost story now.",     // 130
+		"The abyss forgets its own floor.",   // 135
+		"Time itself loses the thread.",      // 140
+		"The last known star winks out.",     // 145
+		"Beyond the beyond, and climbing.",   // 150
+		"These zones should not exist.",      // 155
+		"The void has learned your name.",    // 160
+		"Still it grows. Still you press on.", // 165
+		"No rescue was ever coming.",         // 170
+		"The end is a place. You near it.",   // 175
+		"Further now than death itself.",     // 180
+		"The dark is all that remains.",      // 185
+		"You were never meant to reach here.", // 190
+		"And still the zones unfold.",        // 195
+		"Two hundred zones of ruin behind.",  // 200
+		"The nightmare has no far edge.",     // 205
+		"No sane soul flies these zones.",    // 210
+		"The guns glow white with wrath.",    // 215
+		"The void itself recoils from you.",  // 220
+		"You are the terror they flee.",      // 225
+		"Beyond every legend ever told.",     // 230
+		"Even the dark runs out of dark.",    // 235
+		"The final zones of creation.",       // 240
+		"One breath from the end of all.",    // 245
+		"The last dark. Press on.",		      // 250+ (final change)
+	};
+	int i = d / 5;
+	if (i < 0)
+		i = 0;
+	if (i >= (int)COUNTOF(lines))
+		i = (int)COUNTOF(lines) - 1;
+	return lines[i];
+}
+
+// --- Outpost economy: reroll / hull upgrade -------------------------------------
+// These two actions REPLACE the Data Cubes and Ship Specs entries in JE_itemScreen's
+// own front menu when endlessMode is on (see game_menu.c), so the economy reuses the
+// in-game shop rather than a bespoke screen. Prices escalate per use, reset each visit.
+
+void endlessResetShopPrices(void)
+{
+	endlessRerollCost = 6000 + (long)endlessRunDepth * 1000;
+	endlessHullCost   = 15000 + endlessRunDepth * 2000;
+	endlessBombCost   = 2500 + (long)endlessRunDepth * 400;
+	endlessExtraPerkCost = 70000 + (long)endlessRunDepth * 2500;  // EXTREME: ~100k with 1 perk owned (x1.4 surcharge); extra perks are a rare luxury on top of the free post-zone picks
+	endlessCleanseCost = 25000 + (long)endlessRunDepth * 2500;
+	endlessCleanseChargeCount = 0;  // fresh visit: no pending sabotage strips carried in
+	endlessGambleMsg[0] = '\0';
+	endlessPurchasedMods = 0;   // fresh visit: no pending buff
+	endlessBuffKind = 0;        // a kill-fire buff (Turbodrive or Overdrive) can be bought again
+	endlessLastSpecialName[0] = '\0';             // no special bought yet this visit
+	endlessShopEntryCash = (long)player[0].cash;  // freeze the cash-fraction buy prices for this visit
+}
+
+long endlessRerollPrice(void) { return endlessRerollCost; }
+int  endlessHullPrice(void)   { return endlessHullCost; }
+bool endlessHullMaxed(void)   { return endlessArmorBonus >= endlessHullMax(); }
+
+// E-Shop cash-fraction buys, all priced off the shop-entry cash and applied to the NEXT sector.
+// Only one of the three kill-fire buffs per visit; Buy Special is a single premium buy.
+long endlessTurbodrivePrice(void)       { return endlessShopEntryCash * 2 / 3; }    // 66%
+long endlessOverblastPrice(void) { return endlessShopEntryCash * 3 / 4; }   // 75% (Overblast)
+long endlessOverdrivePrice(void) { return endlessShopEntryCash * 19 / 20; } // 95% (Overdrive)
+long endlessSpecialPrice(void)    { return endlessShopEntryCash * 4 / 5; }    // 80%
+bool endlessBuffBought(void)      { return endlessBuffKind != 0; }
+int  endlessBuffKindBought(void)  { return endlessBuffKind; }
+
+// Kill-fire buff recharge. After any Turbodrive/Overblast/Overdrive buy, all three lock until the
+// run reaches endlessBuffCooldownUntil, so a cash-rich late run can't buy one every sector. The
+// lock length (in sectors) scales with depth: base 2, +1 for every full 20 zones past depth 50
+// (2 early, 3 by zone 70, 4 by zone 90, ...). Stored at purchase time as an absolute unlock depth,
+// so it can't drift as the run deepens.
+#define ENDLESS_BUFF_COOLDOWN_BASE        2
+#define ENDLESS_BUFF_COOLDOWN_RAMP_START 50
+#define ENDLESS_BUFF_COOLDOWN_RAMP_STEP  20
+static int endlessBuffCooldownLength(void)
+{
+	int n = ENDLESS_BUFF_COOLDOWN_BASE;
+	if (endlessRunDepth > ENDLESS_BUFF_COOLDOWN_RAMP_START)
+		n += (endlessRunDepth - ENDLESS_BUFF_COOLDOWN_RAMP_START) / ENDLESS_BUFF_COOLDOWN_RAMP_STEP;
+	return n;
+}
+static void endlessArmBuffCooldown(void) { endlessBuffCooldownUntil = endlessRunDepth + endlessBuffCooldownLength(); }
+
+bool endlessBuffOnCooldown(void)   { return endlessRunDepth < endlessBuffCooldownUntil; }
+int  endlessBuffCooldownLeft(void) { int d = endlessBuffCooldownUntil - endlessRunDepth; return (d > 0) ? d : 0; }
+
+bool endlessTryBuyTurbodrive(void)  // Turbodrive
+{
+	long cost = endlessTurbodrivePrice();
+	if (endlessBuffKind != 0 || endlessBuffOnCooldown() || cost < 1 || player[0].cash < (ulong)cost)
+		return false;
+	player[0].cash -= cost;
+	endlessBuffCharge = endlessBuffChargeFromPaid(cost);  // bigger spend -> longer window + more damage
+	endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_TURBODRIVE;  // OR'd into the next sector in endlessSelectCourse; one kill-fire effect at a time (clears any gambled curse)
+	endlessBuffKind = 1;
+	endlessArmBuffCooldown();  // lock all three kill-fire buys for the scaled recharge
+	return true;
+}
+
+bool endlessTryBuyOverdrive(void)  // Overdrive: Turbodrive + Overblast fire-rate/damage stacks
+{
+	long cost = endlessOverdrivePrice();
+	if (endlessBuffKind != 0 || endlessBuffOnCooldown() || cost < 1 || player[0].cash < (ulong)cost)
+		return false;
+	player[0].cash -= cost;
+	endlessBuffCharge = endlessBuffChargeFromPaid(cost);  // bigger spend -> longer window + more damage
+	endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_OVERDRIVE;  // implies the base kill-fire window (see endlessCountKill); one kill-fire effect at a time (clears any gambled curse)
+	endlessBuffKind = 2;
+	endlessArmBuffCooldown();  // lock all three kill-fire buys for the scaled recharge
+	return true;
+}
+
+bool endlessTryBuyOverblast(void)  // Overblast: Overdrive's per-kill DAMAGE stacks only -- no fire boost
+{
+	long cost = endlessOverblastPrice();
+	if (endlessBuffKind != 0 || endlessBuffOnCooldown() || cost < 1 || player[0].cash < (ulong)cost)
+		return false;
+	player[0].cash -= cost;
+	endlessBuffCharge = endlessBuffChargeFromPaid(cost);  // bigger spend -> longer window + more damage
+	endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_OVERBLAST;  // one kill-fire effect at a time (clears any gambled curse)
+	endlessBuffKind = 3;
+	endlessArmBuffCooldown();  // lock all three kill-fire buys for the scaled recharge
+	return true;
+}
+
+// The kill-fire buff bits bought this shop visit but not yet applied (endlessSelectCourse ORs
+// them into the next sector). Exposed so the debug level-select can fold them in too.
+unsigned endlessPendingMods(void) { return endlessPurchasedMods; }
+
+bool endlessTryBuySpecial(void)
+{
+	long cost = endlessSpecialPrice();
+	if (cost < 1 || player[0].cash < (ulong)cost)
+		return false;
+	player[0].cash -= cost;
+	endlessGrantSpecial();  // equips a random valid special (+ HUD message in-level)
+	return true;
+}
+
+// --- Buy Bomb (F2): +1 to the superbomb stockpile (the AST. CITY collectable bomb). -------------
+long endlessBombPrice(void) { return endlessBombCost; }
+bool endlessBombFull(void)  { return player[0].superbombs >= 10; }
+bool endlessTryBuyBomb(void)
+{
+	if (player[0].superbombs >= 10 || player[0].cash < (ulong)endlessBombCost)
+		return false;
+	player[0].cash -= endlessBombCost;
+	++player[0].superbombs;
+	endlessBombCost = endlessBombCost * 3 / 2;  // escalate within the visit so a full restock costs more
+	return true;
+}
+
+// --- Revive token (F3): survive one lethal hit, full-restore (die = run over otherwise). In a
+// permadeath run this cheats death outright, so it's priced STUPIDLY high -- a rare, run-defining
+// splurge -- and still doubles per revive already spent this run so it never becomes immortality. ---
+long endlessRevivePrice(void)
+{
+	const int steps = endlessRevivesUsed > 5 ? 5 : endlessRevivesUsed;
+	return (150000 + (long)endlessRunDepth * 10000) * (1 << steps);
+}
+bool endlessReviveArmed(void) { return endlessReviveHeld; }
+bool endlessTryBuyRevive(void)
+{
+	const long cost = endlessRevivePrice();
+	if (endlessReviveHeld || player[0].cash < (ulong)cost)
+		return false;
+	player[0].cash -= cost;
+	endlessReviveHeld = true;
+	return true;
+}
+// Consume a held revive at the moment of death: true = the player survives (caller clears the screen).
+bool endlessConsumeRevive(void)
+{
+	if (!endlessMode || !endlessReviveHeld)
+		return false;
+	endlessReviveHeld = false;
+	++endlessRevivesUsed;
+	player[0].armor = player[0].initial_armor;  // full hull restore
+	return true;
+}
+
+// --- Extra Perk (F4): pay for a bonus perk pick; the E-Shop dispatch opens the perk menu after. -
+// Total perk stacks the player currently holds (summed across every perk); drives the owned-count
+// surcharge below so a bigger collection costs more to grow.
+static int endlessPerkTotalOwned(void)
+{
+	int total = 0;
+	for (int i = 0; i < PERK_COUNT; ++i)
+		total += endlessPerkOwned[i];
+	return total;
+}
+long endlessExtraPerkPrice(void)
+{
+	// Base = depth price, doubled per buy this visit (endlessExtraPerkCost). Surcharge = a capped
+	// per-owned-perk % on top, recomputed live so it climbs as you actually accumulate perks.
+	int surcharge = endlessPerkTotalOwned() * ENDLESS_EXTRA_PERK_OWNED_PCT;
+	if (surcharge > ENDLESS_EXTRA_PERK_OWNED_CAP)
+		surcharge = ENDLESS_EXTRA_PERK_OWNED_CAP;
+	return endlessExtraPerkCost * (100 + surcharge) / 100;
+}
+bool endlessTryBuyExtraPerk(void)
+{
+	const long price = endlessExtraPerkPrice();  // single source of truth: the same value shown in the E-Shop help line
+	if (player[0].cash < (ulong)price)
+		return false;
+	player[0].cash -= price;
+	endlessExtraPerkCost = endlessExtraPerkCost * 2;  // escalate the base steeply (perks are strong and bounded)
+	endlessGeneratePerkChoices();                     // dispatch opens MENU_PERKS to pick one
+	return true;
+}
+
+// --- Sabotage Sector (F5): buy "cleanse charges" that strip the worst mutator off the next chosen
+// course (applied in endlessSelectCourse). Handy against a forced Ambush you can't route around. --
+long endlessCleansePrice(void)   { return endlessCleanseCost; }
+int  endlessCleanseCharges(void) { return endlessCleanseChargeCount; }
+bool endlessTryBuyCleanse(void)
+{
+	if (endlessCleanseChargeCount >= 3 || player[0].cash < (ulong)endlessCleanseCost)
+		return false;
+	player[0].cash -= endlessCleanseCost;
+	++endlessCleanseChargeCount;
+	endlessCleanseCost = endlessCleanseCost * 2;
+	return true;
+}
+// Strip the single most-dangerous hostile bit from a modifier set (one per cleanse charge).
+static unsigned endlessStripWorstMod(unsigned mods)
+{
+	static const unsigned order[] = {  // nastiest first
+		ENDLESS_MOD_LEGION, ENDLESS_MOD_APEX, ENDLESS_MOD_RAMPAGE, ENDLESS_MOD_OVERLOAD,
+		ENDLESS_MOD_ELITEPACK, ENDLESS_MOD_DEVASTATING, ENDLESS_MOD_FORTIFIED, ENDLESS_MOD_FRENZY,
+		ENDLESS_MOD_SWIFT, ENDLESS_MOD_OVERCLOCK, ENDLESS_MOD_ENRAGE, ENDLESS_MOD_GRAVITY,
+		ENDLESS_MOD_KAMIKAZE, ENDLESS_MOD_HOMING,  // the two mild homing tiers -- stripped last
+	};
+	for (unsigned i = 0; i < COUNTOF(order); ++i)
+		if (mods & order[i])
+			return mods & ~order[i];
+	return mods;
+}
+
+// --- Gamble (F6): a flat depth-scaled fee for a random outcome. Wins span 0..51, pushes 52..61,
+// and a long tail 62..99. Roughly neutral EV at high variance, but the tail is harsh: it can strip
+// gun power, erase a perk, steal the special, halve cash, or mark the player for a deferred ambush.
+// The wins stay worthwhile (a revive, a free perk, a hull tier, +gun power, a fat next-clear).
+// Every branch reuses an existing lever: player items/perks, endlessArmorBonus, endlessReviveHeld,
+// the shop-tax/rigged/long-con state above, and next-sector mod bits.
+long endlessGamblePrice(void) { return 25000 + (long)endlessRunDepth * 2000; }  // steep: the gamble is a slot machine (some outcomes scale off this cost), priced so it can't be spam-pulled to fish for jackpots/free perks
+const char *endlessGambleResult(void) { return endlessGambleMsg; }
+bool endlessGambleWonPerk(void) { return endlessGamblePerkWon; }
+// Clear the gamble-won-perk flag once its perk menu has been opened. Without this the flag stayed set
+// after the pick, so every LATER successful E-Shop buy (Turbodrive/Overblast/Overdrive/...) saw it
+// still true and wrongly re-opened the perk menu -- showing the stale, previously-offered choices.
+void endlessClearGamblePerk(void) { endlessGamblePerkWon = false; }
+int  endlessShopTaxPercent(void) { return endlessShopTax; }
+// Every DISTINCT gamble outcome, as a stable ID. endlessTryGamble maps a random roll to one of these
+// (preserving the weighted ladder + sub-rolls); the debug "Gamble Outcomes" page fires them straight
+// by ID via endlessForceGambleOutcome. Keep endlessGambleOutcomeNames[] below in the same order.
+enum {
+	EGO_JACKPOT, EGO_WIN, EGO_REVIVE, EGO_PERK, EGO_HULL, EGO_OVERCLOCK, EGO_SPECIAL,
+	EGO_ARSENAL, EGO_SECONDWIND, EGO_BLOODMONEY, EGO_OVERBLAST, EGO_OVERCHARGE, EGO_FAVOR, EGO_GOLDEN,
+	EGO_DOUBLENOTHING, EGO_REFUND, EGO_NOTHING,
+	EGO_LOANSHARK, EGO_NITRO, EGO_OVERHEAT, EGO_GLASSCANNON,
+	EGO_MELTDOWN, EGO_STICKY, EGO_RUSTBUCKET, EGO_AMNESIA, EGO_DUD,
+	EGO_SWINDLED, EGO_CURSE_JAM, EGO_CURSE_FAIL, EGO_CURSE_MISFIRE, EGO_CURSE_FRENZY,
+	EGO_MARKED, EGO_LONGCON,
+	EGO_ROBBED, EGO_DISARMED, EGO_PSYCH, EGO_RIGGED, EGO_CLEANED,
+	EGO_RAMPAGE,  // ultra-rare (~1/5000): the original brutal Kamikaze -- rammers on the next sector
+	EGO_MEGAJACKPOT,  // ultra-rare (~1/5000): the dream pull -- a flat, pile-independent +$1,000,000
+	EGO_COUNT
+};
+static const char *const endlessGambleOutcomeNames[EGO_COUNT] = {
+	"Jackpot (+5x)", "Win (+2x)", "Revive token", "Free perk pick", "Hull tier +", "Overclock gun +1", "Special weapon",
+	"Arsenal (max bombs)", "Second wind (heal)", "Blood money", "Overblast next", "Overcharge next", "Merchant Favor", "Golden Touch",
+	"Double or Nothing", "Refund fee", "Nothing (house wins)",
+	"Loan Shark (+tax)", "Nitro deal", "Overheat deal", "Glass Cannon",
+	"Meltdown (gun -1)", "Sticky Fingers", "Rustbucket", "Amnesia (-perk)", "Dud Arsenal",
+	"Swindled (-20%)", "Curse: gun jam", "Curse: gun fail", "Curse: misfire", "Curse: frenzy",
+	"Marked (boss+)", "The Long Con",
+	"Robbed (-bomb)", "Disarmed (-revive)", "Jackpot Psych", "Rigged next pull", "Cleaned out (-50%)",
+	"Kamikaze Rush", "Mega Jackpot (+$1M)",
+};
+
+// Apply a single outcome's EFFECT (no fee, no roll). Shared by the random gamble and the debug page,
+// so the two can never drift. `cost` scales the cash payouts (the debug page passes the live price).
+static void endlessApplyGambleOutcome(int id, long cost)
+{
+	switch (id)
+	{
+	case EGO_JACKPOT: { const long win = cost * 5; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "JACKPOT!  +$%ld", win); break; }
+	case EGO_MEGAJACKPOT: { const long win = 1000000; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "MEGA JACKPOT!  +$%ld", win); break; }
+	case EGO_WIN:     { const long win = cost * 2; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Win!  +$%ld", win); break; }
+	case EGO_REVIVE:
+		if (!endlessReviveHeld)
+		{ endlessReviveHeld = true; SDL_strlcpy(endlessGambleMsg, "Won a REVIVE token!", sizeof endlessGambleMsg); }
+		else
+		{ const long win = cost * 4; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Revive held --  +$%ld", win); }
+		break;
+	case EGO_PERK:
+		endlessGeneratePerkChoices();  // the E-Shop dispatch opens MENU_PERKS when endlessGambleWonPerk() is set
+		if (endlessPerkChoiceCount() > 0)
+		{ endlessGamblePerkWon = true; SDL_strlcpy(endlessGambleMsg, "Won a free perk pick!", sizeof endlessGambleMsg); }
+		else
+		{ const long win = cost * 3; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Perks maxed --  +$%ld", win); }
+		break;
+	case EGO_HULL:
+		if (endlessArmorBonus < endlessHullMax())
+		{ endlessArmorBonus += ENDLESS_HULL_STEP; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Hull tier!  +%d armor", ENDLESS_HULL_STEP); }
+		else
+		{ const long win = cost * 3; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Hull maxed --  +$%ld", win); }
+		break;
+	case EGO_OVERCLOCK:  // +1 permanent front-gun power (the bait that makes Meltdown sting)
+		if ((int)player[0].items.weapon[FRONT_WEAPON].power < 11)
+		{ ++player[0].items.weapon[FRONT_WEAPON].power; SDL_strlcpy(endlessGambleMsg, "Overclocked!  +1 gun power", sizeof endlessGambleMsg); }
+		else
+		{ const long win = cost * 3; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Guns maxed --  +$%ld", win); }
+		break;
+	case EGO_SPECIAL: endlessGrantSpecial(); snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Won a special weapon! (%s)", endlessLastSpecialName); break;
+	case EGO_ARSENAL:
+	{
+		int got = 0;
+		while (player[0].superbombs < 10) { ++player[0].superbombs; ++got; }
+		if (got > 0)
+			snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Arsenal!  +%d bombs", got);
+		else
+		{ const long win = cost * 2; player[0].cash += win; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Bombs full --  +$%ld", win); }
+		break;
+	}
+	case EGO_SECONDWIND:
+		player[0].armor = player[0].initial_armor;  // full hull restore (bonuses stack on top, as with Revive)
+		SDL_strlcpy(endlessGambleMsg, "Second wind! Hull restored.", sizeof endlessGambleMsg);
+		break;
+	case EGO_BLOODMONEY:  // floor of a normal Win, plus a fat bonus the more wrecked your hull is
+	{
+		const int maxA = player[0].initial_armor > 0 ? player[0].initial_armor : 1;
+		const int miss = maxA - (int)player[0].armor;
+		const long win = cost * 2 + (long)cost * 3 * (miss > 0 ? miss : 0) / maxA;
+		player[0].cash += win;
+		snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Blood money!  +$%ld", win);
+		break;
+	}
+	case EGO_OVERBLAST:
+		endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_OVERBLAST;
+		SDL_strlcpy(endlessGambleMsg, "Overblast next sector!", sizeof endlessGambleMsg);
+		break;
+	case EGO_OVERCHARGE:
+		endlessPurchasedMods |= ENDLESS_MOD_OVERCHARGE;
+		SDL_strlcpy(endlessGambleMsg, "Overcharge next sector!", sizeof endlessGambleMsg);
+		break;
+	case EGO_FAVOR:
+		endlessPurchasedMods |= ENDLESS_MOD_FAVOR;
+		SDL_strlcpy(endlessGambleMsg, "Favor: cheap shop next!", sizeof endlessGambleMsg);
+		break;
+	case EGO_GOLDEN:
+		endlessPurchasedMods |= ENDLESS_MOD_BOUNTY;
+		SDL_strlcpy(endlessGambleMsg, "Golden touch: big clear next!", sizeof endlessGambleMsg);
+		break;
+	case EGO_DOUBLENOTHING:  // a straight coin-flip on your entire cash pile
+		if (endlessRand() % 2)
+		{
+			if (player[0].cash > 1000000000UL)
+				player[0].cash = 2000000000UL;   // clamp so the doubling can't wrap the counter
+			else
+				player[0].cash *= 2;
+			SDL_strlcpy(endlessGambleMsg, "DOUBLED! The pile is yours.", sizeof endlessGambleMsg);
+		}
+		else
+		{ player[0].cash = 0; SDL_strlcpy(endlessGambleMsg, "NOTHING. Wiped clean.", sizeof endlessGambleMsg); }
+		break;
+	case EGO_REFUND: player[0].cash += cost; SDL_strlcpy(endlessGambleMsg, "Machine jammed -- fee back.", sizeof endlessGambleMsg); break;
+	case EGO_NOTHING: SDL_strlcpy(endlessGambleMsg, "Nothing. The house wins.", sizeof endlessGambleMsg); break;
+	case EGO_LOANSHARK:  // a fortune now, a permanent tax on every price for the rest of the run
+	{
+		const long win = cost * 3;  // scales off the live fee (like the other wins) so it stays a real lump sum -- borrowing against your future
+		player[0].cash += win;
+		endlessShopTax += 25;  // compounds if you take the deal twice -- debt you never climb out of
+		snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Loan shark: +$%ld, +25%% tax", win);
+		break;
+	}
+	case EGO_NITRO:  // +damage next sector, but any hit is fatal (see varz.c damage path)
+		endlessPurchasedMods |= (ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_NITRO);
+		SDL_strlcpy(endlessGambleMsg, "Nitro: +power, one hit kills!", sizeof endlessGambleMsg);
+		break;
+	case EGO_OVERHEAT:  // kills quicken your guns, but the hull cooks (see endlessGameplayTick DoT)
+		endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_TURBODRIVE;
+		endlessPurchasedMods |= ENDLESS_MOD_OVERHEAT;
+		SDL_strlcpy(endlessGambleMsg, "Overheat: fast guns, hull cooks!", sizeof endlessGambleMsg);
+		break;
+	case EGO_GLASSCANNON:  // +2 permanent gun power, but shave permanent max hull
+	{
+		const int pw = (int)player[0].items.weapon[FRONT_WEAPON].power;
+		player[0].items.weapon[FRONT_WEAPON].power = (pw + 2 > 11) ? 11 : (pw + 2);
+		const int floorBonus = 8 - (int)player[0].initial_armor;  // keep effective max hull >= ~8
+		endlessArmorBonus -= 2 * ENDLESS_HULL_STEP;
+		if (endlessArmorBonus < floorBonus)
+			endlessArmorBonus = floorBonus;
+		if ((int)player[0].armor + endlessArmorBonus < 1)  // never leave the hull sitting at 0 in the shop
+			player[0].armor = (JE_byte)(1 - endlessArmorBonus);
+		SDL_strlcpy(endlessGambleMsg, "Glass cannon: +2 power, -hull!", sizeof endlessGambleMsg);
+		break;
+	}
+	case EGO_MELTDOWN:  // -1 permanent gun power
+		if ((int)player[0].items.weapon[FRONT_WEAPON].power > 1)
+		{ --player[0].items.weapon[FRONT_WEAPON].power; SDL_strlcpy(endlessGambleMsg, "Meltdown!  -1 gun power.", sizeof endlessGambleMsg); }
+		else
+			SDL_strlcpy(endlessGambleMsg, "Guns already stripped bare.", sizeof endlessGambleMsg);
+		break;
+	case EGO_STICKY:  // steal the equipped special
+		if (player[0].items.special > 0)
+		{
+			player[0].items.special = 0;
+			shotMultiPos[SHOT_SPECIAL]  = 0; shotRepeat[SHOT_SPECIAL]  = 0;
+			shotMultiPos[SHOT_SPECIAL2] = 0; shotRepeat[SHOT_SPECIAL2] = 0;
+			SDL_strlcpy(endlessGambleMsg, "Sticky fingers: special gone!", sizeof endlessGambleMsg);
+		}
+		else
+		{ const long loss = (long)(player[0].cash / 10); player[0].cash -= loss; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Frisked!  -$%ld", loss); }
+		break;
+	case EGO_RUSTBUCKET:  // knock a shield or generator down a tier
+		if (player[0].items.shield > 1 && (endlessRand() % 2))
+		{ --player[0].items.shield; SDL_strlcpy(endlessGambleMsg, "Rustbucket: shield sags!", sizeof endlessGambleMsg); }
+		else if (player[0].items.generator > 1)
+		{ --player[0].items.generator; SDL_strlcpy(endlessGambleMsg, "Rustbucket: reactor sags!", sizeof endlessGambleMsg); }
+		else if (player[0].items.shield > 1)
+		{ --player[0].items.shield; SDL_strlcpy(endlessGambleMsg, "Rustbucket: shield sags!", sizeof endlessGambleMsg); }
+		else
+		{ const long loss = (long)(player[0].cash / 10); player[0].cash -= loss; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Gear too cheap -- $%ld gone", loss); }
+		break;
+	case EGO_AMNESIA:  // erase a random owned perk
+	{
+		int owned[PERK_COUNT], n = 0;
+		for (int i = 0; i < PERK_COUNT; ++i)
+			if (endlessPerkOwned[i] > 0)
+				owned[n++] = i;
+		if (n > 0)
+		{ --endlessPerkOwned[owned[endlessRand() % (unsigned)n]]; SDL_strlcpy(endlessGambleMsg, "Amnesia: a perk erased!", sizeof endlessGambleMsg); }
+		else
+		{ const long loss = (long)(player[0].cash / 10); player[0].cash -= loss; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Mind blank -- robbed  -$%ld", loss); }
+		break;
+	}
+	case EGO_DUD:  // fill your bombs to the brim... then jam them for the next sector
+		while (player[0].superbombs < 10)
+			++player[0].superbombs;
+		endlessPurchasedMods |= ENDLESS_MOD_DUD;
+		SDL_strlcpy(endlessGambleMsg, "Loaded up... duds next sector!", sizeof endlessGambleMsg);
+		break;
+	case EGO_SWINDLED: { const long loss = (long)(player[0].cash / 5); player[0].cash -= loss; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Swindled!  -$%ld", loss); break; }
+	case EGO_CURSE_JAM:
+		endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_BACKFIRE;
+		SDL_strlcpy(endlessGambleMsg, "Cursed: guns jam next!", sizeof endlessGambleMsg);
+		break;
+	case EGO_CURSE_FAIL:
+		endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_BURNOUT;
+		SDL_strlcpy(endlessGambleMsg, "Cursed: guns fail next!", sizeof endlessGambleMsg);
+		break;
+	case EGO_CURSE_MISFIRE:
+		endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_MISFIRE;
+		SDL_strlcpy(endlessGambleMsg, "Cursed: guns misfire next!", sizeof endlessGambleMsg);
+		break;
+	case EGO_CURSE_FRENZY:
+		endlessPurchasedMods |= ENDLESS_MOD_FRENZY;
+		SDL_strlcpy(endlessGambleMsg, "Cursed: fast fire next!", sizeof endlessGambleMsg);
+		break;
+	case EGO_MARKED:
+		endlessPurchasedMods |= ENDLESS_MOD_MARKED;
+		SDL_strlcpy(endlessGambleMsg, "Marked: the next boss bulks up!", sizeof endlessGambleMsg);
+		break;
+	case EGO_LONGCON:
+		endlessLongCon = 3;  // an APEX ambush comes due three sectors from now (endlessSelectCourse)
+		SDL_strlcpy(endlessGambleMsg, "The long con... something coming.", sizeof endlessGambleMsg);
+		break;
+	case EGO_ROBBED:
+		if (player[0].superbombs > 0)
+			--player[0].superbombs;
+		SDL_strlcpy(endlessGambleMsg, "Robbed: lost a bomb.", sizeof endlessGambleMsg);
+		break;
+	case EGO_DISARMED:
+		if (endlessReviveHeld)
+		{ endlessReviveHeld = false; SDL_strlcpy(endlessGambleMsg, "Disarmed! Revive gone.", sizeof endlessGambleMsg); }
+		else
+		{ const long loss = (long)(player[0].cash / 5); player[0].cash -= loss; snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Pickpocketed!  -$%ld", loss); }
+		break;
+	case EGO_PSYCH:  // the cruel fake-out: flashes a jackpot, then snatches a little extra
+	{
+		const long loss = (player[0].cash < (ulong)cost) ? (long)player[0].cash : cost;
+		player[0].cash -= (ulong)loss;
+		snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "'JACKPOT!' ...psych. -$%ld", loss);
+		break;
+	}
+	case EGO_RIGGED:
+		endlessGambleRigged = true;  // your NEXT pull rolls twice and keeps the worse
+		SDL_strlcpy(endlessGambleMsg, "The house is watching you...", sizeof endlessGambleMsg);
+		break;
+	case EGO_RAMPAGE:  // the original brutal Kamikaze as a jackpot-of-doom: rammers next sector
+		endlessPurchasedMods |= ENDLESS_MOD_RAMPAGE;
+		SDL_strlcpy(endlessGambleMsg, "KAMIKAZE RUSH! Rammers next!", sizeof endlessGambleMsg);
+		break;
+	default:  // EGO_CLEANED: half your cash -- the brutal tail that mirrors the jackpot
+	{
+		const long loss = (long)(player[0].cash / 2);
+		player[0].cash -= loss;
+		snprintf(endlessGambleMsg, sizeof endlessGambleMsg, "Cleaned out!  -$%ld", loss);
+		break;
+	}
+	}
+}
+
+// Map a 0..99 roll to an outcome ID, reproducing the weighted ladder and its sub-rolls exactly
+// (each sub-bucket consumes one endlessRand to pick within it, as the inline version did).
+static int endlessRollToOutcome(int roll)
+{
+	if (roll < 5)  return EGO_JACKPOT;
+	if (roll < 12) { switch (endlessRand() % 3) { case 0: return EGO_REVIVE; case 1: return EGO_HULL; default: return EGO_OVERCLOCK; } }  // EGO_PERK pulled out -> now a 1/2500 ultra-rare draw (endlessTryGamble)
+	if (roll < 24) return EGO_WIN;
+	if (roll < 31) return EGO_SPECIAL;
+	if (roll < 37) { switch (endlessRand() % 3) { case 0: return EGO_ARSENAL; case 1: return EGO_SECONDWIND; default: return EGO_BLOODMONEY; } }
+	if (roll < 43) return (endlessRand() % 2) ? EGO_OVERBLAST : EGO_OVERCHARGE;
+	if (roll < 48) return EGO_FAVOR;
+	if (roll < 52) return EGO_GOLDEN;
+	if (roll < 56) return EGO_DOUBLENOTHING;
+	if (roll < 59) return EGO_REFUND;
+	if (roll < 62) return EGO_NOTHING;
+	if (roll < 66) return EGO_LOANSHARK;
+	if (roll < 71) { switch (endlessRand() % 3) { case 0: return EGO_NITRO; case 1: return EGO_OVERHEAT; default: return EGO_GLASSCANNON; } }
+	if (roll < 78) { switch (endlessRand() % 5) { case 0: return EGO_MELTDOWN; case 1: return EGO_STICKY; case 2: return EGO_RUSTBUCKET; case 3: return EGO_AMNESIA; default: return EGO_DUD; } }
+	if (roll < 84) return EGO_SWINDLED;
+	if (roll < 90) { switch (endlessRand() % 5) { case 0: return EGO_CURSE_JAM; case 1: return EGO_CURSE_FAIL; case 2: return EGO_CURSE_MISFIRE; default: return EGO_CURSE_FRENZY; } }
+	if (roll < 94) return (endlessRand() % 2) ? EGO_MARKED : EGO_LONGCON;
+	if (roll < 97) { switch (endlessRand() % 4) { case 0: return EGO_ROBBED; case 1: return EGO_DISARMED; case 2: return EGO_PSYCH; default: return EGO_RIGGED; } }
+	return EGO_CLEANED;
+}
+
+bool endlessTryGamble(void)
+{
+	endlessGamblePerkWon = false;  // cleared each pull; set only by the free-perk outcome
+
+	const long cost = endlessGamblePrice();
+	if (player[0].cash < (ulong)cost)
+		return false;
+	player[0].cash -= cost;
+
+	// A few ultra-rare outcomes are rolled apart from the 0..99 ladder below, since their odds don't fit
+	// a percentile bucket. One shared 1-in-5000 draw keeps each exact: value 0 = the dream MEGA JACKPOT
+	// (+$1M), value 1 = the "jackpot of doom" Kamikaze (rammers next sector), values 2-3 = a free perk
+	// pick (2/5000 = 1/2500). (The debug "Gamble Outcomes" page can also fire any of these directly.)
+	const Uint32 ultraRare = endlessRand() % 5000;
+	if (ultraRare == 0)
+	{
+		endlessApplyGambleOutcome(EGO_MEGAJACKPOT, cost);
+		return true;
+	}
+	if (ultraRare == 1)
+	{
+		endlessApplyGambleOutcome(EGO_RAMPAGE, cost);
+		return true;
+	}
+	if (ultraRare == 2 || ultraRare == 3)  // 2/5000 = 1/2500: the free perk pick
+	{
+		endlessApplyGambleOutcome(EGO_PERK, cost);
+		return true;
+	}
+
+	int roll = (int)(endlessRand() % 100);
+	if (endlessGambleRigged)  // "Rigged": the house quietly rolls a second time and keeps the WORSE (higher) one
+	{
+		const int second = (int)(endlessRand() % 100);
+		if (second > roll)
+			roll = second;
+		endlessGambleRigged = false;
+	}
+
+	endlessApplyGambleOutcome(endlessRollToOutcome(roll), cost);
+	return true;
+}
+
+// --- Debug hooks: enumerate and fire gamble outcomes by ID (the E-Shop debug "Gamble Outcomes" page).
+int endlessGambleOutcomeCount(void) { return EGO_COUNT; }
+const char *endlessGambleOutcomeName(int id) { return (id >= 0 && id < EGO_COUNT) ? endlessGambleOutcomeNames[id] : ""; }
+void endlessForceGambleOutcome(int id)
+{
+	if (!endlessMode || id < 0 || id >= EGO_COUNT)
+		return;
+	endlessGamblePerkWon = false;
+	endlessApplyGambleOutcome(id, endlessGamblePrice());  // no fee charged: this is a test trigger
+	if (endlessGamblePerkWon)      // the free-perk outcome fired (choices are already rolled): queue a real
+		endlessPerkPending = true; // pick -- the debug screen opens it on close, else it rides the next shop gate
+	endlessGamblePerkWon = false;  // the debug screen has no E-Shop dispatch to consume the inline-perk flag
+}
+
+// Reroll the shop stock (rarity-by-depth) for the current price. Returns true if bought.
+bool endlessTryReroll(void)
+{
+	if (player[0].cash < (ulong)endlessRerollCost)
+		return false;
+	player[0].cash -= endlessRerollCost;
+	endlessRerollCost = endlessRerollCost * 8 / 5 + 3000;
+	endlessFillShop();
+	return true;
+}
+
+// Buy a run-persistent +armor hull upgrade for the current price. Returns true if bought.
+bool endlessTryReinforce(void)
+{
+	if (endlessArmorBonus >= endlessHullMax() || player[0].cash < (ulong)endlessHullCost)
+		return false;
+	player[0].cash -= endlessHullCost;
+	endlessArmorBonus += ENDLESS_HULL_STEP;
+	endlessHullCost = endlessHullCost * 3 / 2 + 5000;
+	return true;
+}
+
+// Apply the level-clear payout -- bank interest on unspent cash plus the depth/mutator-scaled
+// clear bonus -- and report the two amounts so the level-end screen can show them. Skipped
+// (both zero) before the first level is cleared. JE_endLevelAni calls this right before it
+// prints the running cash total, so the reward is already banked when the shop opens.
+void endlessApplyLevelPayout(long *interestOut, long *bonusOut)
+{
+	long interest = 0, bonus = 0;
+	if (endlessMode && endlessRunDepth > 0)
+	{
+		interest = (long)(player[0].cash / 10);   // 10% bank interest on unspent cash
+		// The interest cap RISES with depth, so banking toward a big buy (a deep hull tier, or a
+		// saved-up Overdrive) is a real strategy on a long run -- cash becomes a reserve you manage,
+		// not just per-zone Overdrive throughput. The depth-scaled ceiling still stops it snowballing.
+		long icap = 3000 + (long)endlessRunDepth * 80;
+		if (interest > icap)
+			interest = icap;
+		bonus = endlessClearBonus() * endlessPerkCashPercent() / 100;  // Scavenger perk scales the clear bonus
+		player[0].cash += interest;
+		player[0].cash += bonus;
+	}
+	if (interestOut)
+		*interestOut = interest;
+	if (bonusOut)
+		*bonusOut = bonus;
+}
+
+void endlessBetweenLevels(void)
+{
+	// Pin the planet-map hub to one safe planet before the shop opens. Endless jumps to random
+	// levels, so a level's ]G planet data can leave mapPNum/mapPlanet out of range, and
+	// JE_itemScreen's planet monitor would then read mapPlanet[]/mapSection[] (size 5) out of
+	// bounds and crash. (endlessRegenerateLevel re-pins these per level too, but the very first
+	// shop runs before any level has loaded.)
+	mapOrigin = 1;
+	mapPNum = 1;
+	mapPlanet[0] = 1;
+	mapSection[0] = 1;
+
+	// Endless has no data cubes. Clear any left over from a prior campaign game so they don't
+	// linger as icons in the buy/sell menu; the first endless shop opens before any level (and
+	// thus before endlessRegenerateLevel, which also zeroes these) has loaded.
+	cubeMax = 0;
+	lastCubeMax = 0;
+
+	mouseSetRelative(false);  // menus use absolute mouse; start_level_first re-enables relative for gameplay
+
+	// Label anything saved from this outpost as the zone the player resumes into, and make sure
+	// the slot reads as occupied. (The first outpost runs before any level has set these.)
+	snprintf(levelName, sizeof(levelName), "ZONE %d", endlessRunDepth + 1);
+	strcpy(lastLevelName, levelName);
+	if (saveLevel < 1)
+		saveLevel = FIRST_LEVEL;
+
+	// The level-clear payout (bank interest + clear bonus) is applied earlier, on the
+	// level-end screen (endlessApplyLevelPayout, called from JE_endLevelAni), so the shop
+	// opens with the reward already banked.
+
+	// Generate the next-level courses (offered in the shop's Start Level submenu), reset the
+	// reroll/hull prices, stock the shop, then open it. The player picks a course in Start Level,
+	// which sets mainLevel + the mutators and launches (see game_menu.c).
+	// On a normal visit, roll everything fresh. On a resumed visit (a save was just loaded) or a
+	// locked "gave up the level" reopen, the courses, prices, shop stock, perk offer and pending
+	// buys were all restored from the snapshot; regenerating any of them would be a free reroll
+	// (and, when locked, would break the lock), so skip the whole step.
+	if (endlessResumeVisit || endlessLockedSortie)
+	{
+		endlessResumeVisit = false;
+	}
+	else
+	{
+		// Re-derive the seeded stream for this outpost's generation (courses, shop stock, perk
+		// offers), keyed by depth. Player-timed draws later this visit (gamble, reroll) advance the
+		// stream too, but the next zone reseeds from its own depth, so they can't shift the run's
+		// structure: a given seed always yields the same courses/shop/perks at a given depth.
+		endlessReseed((Uint64)endlessRunDepth * 2);
+
+		endlessGenerateCourses();
+		endlessResetShopPrices();
+		endlessFillShop();
+
+		// Queue the forced perk pick that opens the shop ahead of its normal front menu (see
+		// JE_itemScreen), then roll this visit's offers. Offered after the first cleared zone, then
+		// every 3rd zone after that (depths 1, 4, 7, ...); perks are strong, so they come sparingly.
+		// Skip it if this depth's perk was already resolved, so re-opening the same outpost after a
+		// save/reload doesn't hand out a second perk (endlessPerkDepthDone is part of the save).
+		if (endlessRunDepth > 0 && endlessRunDepth % 3 == 1 && endlessPerkDepthDone != endlessRunDepth)
+		{
+			endlessGeneratePerkChoices();
+			endlessPerkPending = true;
+		}
+	}
+
+	// Auto-checkpoint into the bottom "LAST LEVEL" continue slot -- outpost entry is the one
+	// coherent resume point (courses/shop/perks set up; lastLevelName is "ZONE N" already).
+	// HARDCORE allows no saving of any kind, so it is suppressed (notes.md §Endless save).
+	if (!endlessHardcore)
+	{
+		const JE_byte autoSlot = twoPlayerMode ? 22 : 11;
+		JE_saveGame(autoSlot, "LAST LEVEL    ");
+		endlessSaveSlot(autoSlot);  // side-effect-free run capture into the sidecar (endlessMode is true here)
+	}
+
+	// Always play the standard buy/sell theme in the shop. A random level's ']i' command can
+	// leave songBuy on that level's own track; JE_itemScreen plays songBuy on entry, so pin it
+	// to the default here first.
+	songBuy = DEFAULT_SONG_BUY;
+	JE_itemScreen();
+}
+
+// --- Next-level courses ---------------------------------------------------------
+// The next-level choice IS the shop's "Start Level" submenu: game_menu.c drives its planet
+// monitor from these courses. Each is a shipped level plus its own risk/reward mutators.
+// Generated once per shop visit; picking one applies its mutators and launches.
+
+#define ENDLESS_MAX_COURSES 5
+
+static int      endlessCourseCnt = 0;
+static int      endlessCourseEp[ENDLESS_MAX_COURSES];
+static JE_byte  endlessCourseSec[ENDLESS_MAX_COURSES];
+static JE_byte  endlessCourseFile[ENDLESS_MAX_COURSES];  // each course's specific lvlFileNum (see forcedLvlFileNum)
+static unsigned endlessCourseMod[ENDLESS_MAX_COURSES];
+static int      endlessLastEp = 0;
+static JE_byte  endlessLastSec = 0;
+static bool     endlessForced = false;  // this visit is a forced "Ambush" (single dangerous sector)
+
+// Named course themes: a NAME dictionary of evocative labels for combos worth naming
+// (endlessComboName looks up an exact bit-set here; anything unlisted gets a generated name).
+// Generation and payout are driven by endlessModTable, not these rows -- so this is purely
+// cosmetic naming, free to extend or trim without touching behaviour.
+typedef struct { unsigned mods; const char *name; } EndlessTheme;
+
+static const EndlessTheme endlessHostileThemes[] = {
+	// -- single dangers --
+	{ ENDLESS_MOD_FORTIFIED,   "Fortified" },
+	{ ENDLESS_MOD_FRENZY,      "Frenzy" },
+	{ ENDLESS_MOD_SWIFT,       "Swift Death" },
+	{ ENDLESS_MOD_DEVASTATING, "Devastating" },
+	{ ENDLESS_MOD_ENRAGE,      "Enrage" },
+	{ ENDLESS_MOD_GRAVITY,     "Gravity Well" },
+	{ ENDLESS_MOD_ELITEPACK,   "Elite Pack" },
+	{ ENDLESS_MOD_OVERCLOCK,   "Overclock" },
+
+	// -- pairs: tough + shots --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY,       "Onslaught" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,        "Juggernaut" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING,  "Siege" },
+	// -- pairs: bullet dangers --
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,           "Barrage" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,     "Fusillade" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,      "Piercing Storm" },
+	// -- pairs: enrage (the fight drags on, fury climbs) --
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_FORTIFIED,       "War of Attrition" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_SWIFT,           "Escalation" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_DEVASTATING,     "Wrath" },
+	// -- pairs: gravity (dodge while dragged) --
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_FORTIFIED,      "Dense Matter" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_SWIFT,          "Event Horizon" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,    "Crushing Weight" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_FRENZY,         "Whirlpool" },
+	// -- pairs: elite pack --
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED,    "Praetorians" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_SWIFT,        "Vanguard" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_DEVASTATING,  "Elite Guard" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FRENZY,       "Warband" },
+	// -- pairs: overclock (it already speeds fire+shots+scroll, so pair with new axes only) --
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FORTIFIED,    "Meltdown" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_DEVASTATING,  "Reactor Breach" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_GRAVITY,      "Riptide" },  // not the Overdrive buff -- renamed to avoid the clash with the OVERDRIVE boon below
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_ELITEPACK,    "Prototype Swarm" },
+	// -- more pairs: fury / speed / mass --
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE,          "Bloodrage" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_OVERCLOCK,       "Redline" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_OVERCLOCK,        "Hypervelocity" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY,         "Accretion" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK,       "Elite Fury" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK,       "Overburn" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK,      "Neutron Star" },
+
+	// -- triples (hard) --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,       "Nightmare" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Maelstrom" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "Fortress Guns" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Deadly Escalation" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,    "Singularity" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Elite Siege" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "Blitzkrieg" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,   "Colossus" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_DEVASTATING,    "Siege Engine" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_GRAVITY,        "Heavy Siege" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE,         "Bloodwall" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,      "Vortex" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_DEVASTATING,       "Firestorm" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY,            "Cyclone" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY,            "Death Spiral" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Death Squad" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "War Machine" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,   "Doomguard" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_DEVASTATING,    "Elite Wrath" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Overkill" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "Full Auto" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Iron Storm" },
+
+	// -- quads (brutal) --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "Cataclysm" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,   "Elite Nightmare" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY,     "Abaddon" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE, "Armageddon" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE,    "Apocalypse" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE,      "Berserker Rush" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE,   "Event Collapse" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE, "Black Star" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "Praetorian Guard" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "Elite Storm" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "Bullet Hell" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "Overlord" },
+
+	// -- more triples --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_ELITEPACK, "Bloodtide" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_OVERCLOCK, "Warpath" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE, "Ironclad" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY, "Rampart" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ELITEPACK, "Hailstorm" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_OVERCLOCK, "Thunderclap" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY, "Pandemonium" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK, "Requiem" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK, "Damnation" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK, "Perdition" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK, "Warhead" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Sledgehammer" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE, "Warmonger" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ELITEPACK, "Devastator" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_OVERCLOCK, "Ravager" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY, "Desolation" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK, "Bombardment" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK, "Storm Surge" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK, "Iron Rain" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK, "Steel Storm" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Death March" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK, "Hellfire" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK, "Brimstone" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK, "Wildfire" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK, "Firewall" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Overrun" },
+	{ ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY, "Stampede" },
+	{ ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK, "Warzone" },
+	{ ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK, "Killzone" },
+	{ ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Crossfire" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK, "Massacre" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK, "Butchery" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Bloodbath" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Slaughter" },
+
+	// -- mixed (a boon bit riding a hostile course) --
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_DEVASTATING,    "Glass Cannon" },
+};
+
+// KAMIKAZE sectors (homing rammers) are much harder to fly, so they get their own pool and are
+// injected RARELY (see endlessGenerateCourses) instead of shuffled in with the normal hostiles.
+static const EndlessTheme endlessKamikazeThemes[] = {
+	{ ENDLESS_MOD_KAMIKAZE,                              "Kamikaze" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_FORTIFIED,      "Battering Ram" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_FRENZY,         "Zealots" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_SWIFT,          "Dive Bombers" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_DEVASTATING,    "Suicide Run" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_GRAVITY,        "Black Hole" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_ELITEPACK,      "Berserkers" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "Kamikaze Storm" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_ENRAGE,        "Fanatics" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_OVERCLOCK,     "Rocket Swarm" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "Death Charge" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Siege Ram" },
+};
+
+// HOMING sectors are the MILD cousin of Kamikaze: enemies gently drift toward you (no ram bonus),
+// just enough to be a nuisance. Their own pool, injected at a moderate rate (see endlessGenerateCourses)
+// so you meet them regularly -- while the real Kamikaze pool above stays super rare.
+static const EndlessTheme endlessHomingThemes[] = {
+	{ ENDLESS_MOD_HOMING,                              "Stalkers" },
+	{ ENDLESS_MOD_HOMING | ENDLESS_MOD_FORTIFIED,      "Bloodhounds" },
+	{ ENDLESS_MOD_HOMING | ENDLESS_MOD_FRENZY,         "Harriers" },
+	{ ENDLESS_MOD_HOMING | ENDLESS_MOD_SWIFT,          "Pursuers" },
+	{ ENDLESS_MOD_HOMING | ENDLESS_MOD_DEVASTATING,    "Predators" },
+	{ ENDLESS_MOD_HOMING | ENDLESS_MOD_GRAVITY,        "Undertow" },
+	{ ENDLESS_MOD_HOMING | ENDLESS_MOD_ELITEPACK,      "Wolfpack" },
+	{ ENDLESS_MOD_HOMING | ENDLESS_MOD_ENRAGE,         "Bloodlust" },
+};
+
+static const EndlessTheme endlessBoonThemes[] = {
+	{ ENDLESS_MOD_FRAGILE,    "Fragile Foe" },
+	{ ENDLESS_MOD_BOUNTY,     "Bounty Run" },
+	{ ENDLESS_MOD_TURBODRIVE,  "Turbodrive" },   // the shop's Turbodrive buy sets this same bit (endlessTryBuyTurbodrive)
+	{ ENDLESS_MOD_OVERDRIVE, "Overdrive" },   // the shop's Overdrive buy sets this same bit (endlessTryBuyOverdrive)
+	{ ENDLESS_MOD_OVERBLAST, "Overblast" },   // the shop's Overblast buy sets this same bit (endlessTryBuyOverblast)
+	{ ENDLESS_MOD_OVERCHARGE, "Overcharged" },
+	{ ENDLESS_MOD_DILATION,   "Time Dilation" },
+	{ ENDLESS_MOD_FAVOR,      "Merchant's Favor" },
+	{ ENDLESS_MOD_SLIPSTREAM, "Slipstream" },
+	{ ENDLESS_MOD_CURSED,     "Cursed Bounty" },
+	// -- boon pairs (stack your buffs) --
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE, "Ascendant" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERCHARGE,  "Bullet Time" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_TURBODRIVE,   "In the Zone" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_BOUNTY,       "Easy Money" },
+	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_BOUNTY,         "Windfall" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_TURBODRIVE,    "Blood Frenzy" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERCHARGE,   "Executioner" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SLIPSTREAM,   "Blitz" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FAVOR,        "Clearance" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_BOUNTY,     "Killing Spree" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_BOUNTY,    "Mercenary" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_BOUNTY,    "Smash 'n' Grab" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_SLIPSTREAM,  "Time Warp" },
+	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_OVERCHARGE, "Power Surge" },
+	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_OVERCHARGE, "Deadeye" },
+	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_DILATION,   "Sharpshooter" },
+	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_BOUNTY,     "Bounty Hunter" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE, "Ascension" },
+	// -- more boon combos --
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_DILATION, "Killstreak" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERDRIVE, "Bloodrush" },
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_CURSED, "Adrenaline" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FAVOR, "Momentum" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_SLIPSTREAM, "Power Play" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERDRIVE, "Berserk" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_CURSED, "Fortune" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FAVOR, "Jackpot" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_SLIPSTREAM, "Payday" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_CURSED, "Gold Rush" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FAVOR, "Bonanza" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_BOUNTY, "Lucky Break" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERDRIVE, "Fire Sale" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_CURSED, "Discount" },
+	{ ENDLESS_MOD_WARP,       "Warp Speed" },  // rare (injected)
+};
+
+// OVERLOAD (Overclock cranked way up) is a rare, brutal hostile with its own pool, injected
+// rarely (see endlessGenerateCourses) rather than shuffled into the normal rotation.
+static const EndlessTheme endlessOverloadThemes[] = {
+	{ ENDLESS_MOD_OVERLOAD,                           "Overload" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED,   "Core Breach" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_DEVASTATING, "Chain Reaction" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_ELITEPACK,   "Singularity Core" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FRENZY,      "Detonation" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_SWIFT,       "Overvelocity" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_GRAVITY,     "Implosion" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_ENRAGE,      "Overheat" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Fusion Core" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Total Meltdown" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY, "Core Meltdown" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT, "Fission" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ENRAGE, "Critical Mass" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_GRAVITY, "Chain Blast" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_ELITEPACK, "Cascade" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_OVERCLOCK, "Feedback Loop" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT, "Power Spike" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING, "Blackout" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE, "Flashpoint" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FRENZY | ENDLESS_MOD_GRAVITY, "Ground Zero" },
+};
+
+// Super-rare, super-hard sectors, injected explicitly (not part of the shuffle pool) so they
+// stay rare -- the Apex/Legion elite tiers with an extra danger, plus pure 5-danger nightmares.
+static const EndlessTheme endlessRareThemes[] = {
+	{ ENDLESS_MOD_APEX,   "Apex Swarm" },
+	{ ENDLESS_MOD_LEGION, "Legion" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_FORTIFIED,                          "Apex Titans" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_SWIFT,                              "Apex Hunters" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_DEVASTATING,                        "Annihilation" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_OVERLOAD,                           "Extinction" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Apex Siege" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_FORTIFIED,                        "Iron Legion" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_SWIFT,                            "Blitz Legion" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_DEVASTATING,                      "Ragnarok" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_OVERLOAD,                         "Judgment Day" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE,  "Hell Unleashed" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_GRAVITY, "Void Storm" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "Total War" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "Doomsday" },
+	// -- more Apex-tier (elite) rares --
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_FRENZY, "Alpha Strike" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_ENRAGE, "Omega" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_GRAVITY, "Final Hour" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_ELITEPACK, "Last Stand" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_OVERCLOCK, "Endgame" },
+	// -- more Legion-tier (champion) rares --
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_FRENZY, "Mass Extinction" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_ENRAGE, "The Reaping" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_GRAVITY, "Harbinger" },
+	// -- more pure multi-danger nightmares (Cataclysm pool) --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY, "Nemesis" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK, "Leviathan" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK, "Behemoth" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK, "Titanfall" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK, "Wrath of God" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_OVERCLOCK, "Purgatory" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY, "Tartarus" },
+};
+
+// EVIL Turbodrive / Overdrive: hostile mirrors of the two boons -- they SLOW your fire (Evil
+// Overdrive also cuts damage) as your kill combo climbs. Injected as rare pickable course
+// sectors; the three bare bits are ALSO forced gamble outcomes (EGO_CURSE_*), independent of
+// courses. Adding a row here auto-wires its name/monitor/payout (see endlessFindTheme).
+static const EndlessTheme endlessEvilThemes[] = {
+	{ ENDLESS_MOD_BACKFIRE,                           "Backfire" },
+	{ ENDLESS_MOD_BURNOUT,                            "Burnout" },
+	{ ENDLESS_MOD_MISFIRE,                            "Misfire" },
+	// -- Backfire (Evil Turbodrive, fire jam) + one danger --
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_DEVASTATING, "Sitting Duck" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FORTIFIED,   "Uphill Battle" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_SWIFT,       "Overwhelmed" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_GRAVITY,     "Dead Weight" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FRENZY,      "Crossfire" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_ENRAGE,      "Slow Burn" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_ELITEPACK,   "Cornered" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_OVERCLOCK,   "Vapor Lock" },
+	// -- Burnout (Evil Overdrive, jam + damage cut) + one danger (nastier) --
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_DEVASTATING,  "Death Rattle" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_FORTIFIED,    "Losing Battle" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_ENRAGE,       "Downward Spiral" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_ELITEPACK,    "Outclassed" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_FRENZY,       "Flatline" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_SWIFT,        "Cinders" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_GRAVITY,      "Tailspin" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_OVERCLOCK,    "System Failure" },
+	// -- Misfire (Evil Overblast, damage cut only) + one danger --
+	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_DEVASTATING,  "Peashooter" },
+	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_FORTIFIED,    "Stonewall" },
+	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_SWIFT,        "Outgunned" },
+	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_FRENZY,       "Popgun" },
+	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_ENRAGE,       "Fizzle" },
+	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_GRAVITY,      "Downhill" },
+	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_ELITEPACK,    "No Contest" },
+	// -- two dangers welded to the curse: the memorable evil nightmares --
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Death March" },
+	{ ENDLESS_MOD_BURNOUT  | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Last Legs" },
+	{ ENDLESS_MOD_MISFIRE  | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,       "Stalemate" },
+	{ ENDLESS_MOD_BURNOUT  | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "No Way Out" },
+};
+
+// Reactor Redline: the gamble "Overheat" deal loose in the wild -- your kills scream the guns faster
+// (Turbodrive) while the redlined core steadily cooks the hull (the OVERHEAT chip DoT). Its own tiny
+// pool so endlessFindTheme can name it and endlessGenerateCourses can inject it super-rarely (like
+// Kamikaze / Overload) -- fast fire welded to a self-inflicted burn.
+static const EndlessTheme endlessRedlineThemes[] = {
+	{ ENDLESS_MOD_OVERHEAT | ENDLESS_MOD_TURBODRIVE,                      "Reactor Redline" },
+	{ ENDLESS_MOD_OVERHEAT | ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FRENZY, "Redline Frenzy" },
+};
+
+// Find the theme for an exact effect-bit set (NULL = Calm / no modifiers).
+static const EndlessTheme *endlessFindTheme(unsigned mods)
+{
+	for (unsigned i = 0; i < COUNTOF(endlessHostileThemes); ++i)
+		if (endlessHostileThemes[i].mods == mods)
+			return &endlessHostileThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessKamikazeThemes); ++i)
+		if (endlessKamikazeThemes[i].mods == mods)
+			return &endlessKamikazeThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessHomingThemes); ++i)
+		if (endlessHomingThemes[i].mods == mods)
+			return &endlessHomingThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessOverloadThemes); ++i)
+		if (endlessOverloadThemes[i].mods == mods)
+			return &endlessOverloadThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessBoonThemes); ++i)
+		if (endlessBoonThemes[i].mods == mods)
+			return &endlessBoonThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessRareThemes); ++i)
+		if (endlessRareThemes[i].mods == mods)
+			return &endlessRareThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessEvilThemes); ++i)
+		if (endlessEvilThemes[i].mods == mods)
+			return &endlessEvilThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessRedlineThemes); ++i)
+		if (endlessRedlineThemes[i].mods == mods)
+			return &endlessRedlineThemes[i];
+	return NULL;
+}
+
+// Pick a random theme's mods from a table, restricted to entries that include ALL `must` bits
+// and NONE of the `forbid` bits. This lets the injections draw straight from the name tables
+// (endlessBoonThemes / endlessRareThemes) -- so adding a row there makes that sector appear,
+// with no separate injection pool to keep in sync. Returns `must` if nothing matches.
+static unsigned endlessPickThemeMods(const EndlessTheme *tbl, unsigned count, unsigned must, unsigned forbid)
+{
+	unsigned n = 0;
+	for (unsigned i = 0; i < count; ++i)
+		if ((tbl[i].mods & must) == must && (tbl[i].mods & forbid) == 0)
+			++n;
+	if (n == 0)
+		return must;
+	unsigned pick = endlessRand() % n;
+	for (unsigned i = 0; i < count; ++i)
+		if ((tbl[i].mods & must) == must && (tbl[i].mods & forbid) == 0)
+			if (pick-- == 0)
+				return tbl[i].mods;
+	return must;  // unreachable
+}
+
+// Evocative names for un-curated (randomly generated) combos, picked deterministically per
+// bitset so a given combo always reads the same.
+static const char *const endlessGenericNames[] = {
+	"Havoc", "Chaos", "Carnage", "Ruin", "Fury", "Terror", "Doom", "Peril",
+	"Menace", "Scourge", "Bedlam", "Mayhem", "Torment", "Dread", "Malice",
+	"Ordeal", "Gauntlet", "Crucible", "Inferno", "Tempest", "Reckoning",
+	"Oblivion", "Rampage", "Turmoil", "Onset", "Affliction",
+};
+
+const char *endlessComboName(unsigned mods)
+{
+	const EndlessTheme *t = endlessFindTheme(mods);
+	if (t)
+		return t->name;                    // curated combos keep their cool names
+	if (mods == 0)
+		return "Calm Sector";
+	unsigned h = mods ^ (mods >> 4) ^ (mods >> 9);  // mix so nearby bitsets differ
+	return endlessGenericNames[h % COUNTOF(endlessGenericNames)];
+}
+
+// --- Course danger tier + description ------------------------------------------------------------
+// The Chart-a-Course help line reads "<Tier>: <what's there>". The tier turns the screen into a
+// quick risk read at a glance; the payout (drawn highlighted right after this text by game_menu.c)
+// is the matching reward -- and since both derive from the same reward table, they never disagree.
+
+// Bits that make a sector DANGEROUS. The danger score sums only these, so a pure-boon course -- e.g.
+// Bounty, which pays big but adds no danger -- never reads as a high tier. Cursed is handled apart
+// (it's a trap, not a danger); the personal boons/curses split boon-side vs evil-side here.
+#define ENDLESS_HOSTILE_MASK ( \
+	ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | \
+	ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION | ENDLESS_MOD_ENRAGE | \
+	ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_OVERLOAD | \
+	ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_BURNOUT | ENDLESS_MOD_MISFIRE | ENDLESS_MOD_OVERHEAT | \
+	ENDLESS_MOD_HOMING | ENDLESS_MOD_RAMPAGE )
+
+// Max pixel width of the description on the Chart-a-Course bar (drawn at x=10 in the 320-wide legacy
+// layout, with the highlighted payout right-aligned to x=305 after it). A curated line wider than this
+// drops back to the generated worst-first phrase, which packs in only as many threats as fit. Kept a
+// hair under the payout's left edge so even a max-length line plus a fat payout stays on the bar.
+#define ENDLESS_HELP_DESC_MAX 250
+
+// A survival boon riding a hostile sector makes it play less deadly than its raw threat list:
+// frail or crawling-shot foes, harder-hitting or kill-fed guns, or a blitz-past pass all buy time.
+// endlessDangerScore credits these against the hostile total so the tier reads net danger. Credits
+// are in the same reward-tenths as endlessModTable. Pure-cash boons (Bounty, Favor, Cursed) buy no
+// safety, so they grant no credit and don't appear here.
+static const struct { unsigned bit; int credit; } endlessBoonMitigation[] = {
+	{ ENDLESS_MOD_DILATION,    8 },  // enemy shots crawl: the biggest dodge cushion
+	{ ENDLESS_MOD_FRAGILE,     8 },  // frail foes die fast: fewer guns left firing
+	{ ENDLESS_MOD_OVERCHARGE,  5 },  // shots hit harder: quicker kills
+	{ ENDLESS_MOD_OVERDRIVE,   5 },  // each kill stacks fire and damage
+	{ ENDLESS_MOD_WARP,        5 },  // the level blurs past: far less time exposed
+	{ ENDLESS_MOD_OVERBLAST,   4 },  // each kill stacks damage
+	{ ENDLESS_MOD_TURBODRIVE, 3 },  // each kill quickens the guns
+	{ ENDLESS_MOD_SLIPSTREAM,  2 },  // a faster level: a little less exposure
+};
+
+// The sector's net danger: its hostile modifiers' summed reward (endlessModTable, in tenths of the
+// base) minus any survival-boon credit above. A course with no hostile bits scores 0, so the tier
+// words it as Boon/Calm and never needs a number. A hostile course floors at 1, so even a heavily
+// mitigated danger still reads at least "Low" rather than collapsing to a boon.
+static int endlessDangerScore(unsigned mods)
+{
+	const unsigned h = mods & ENDLESS_HOSTILE_MASK;
+	if (h == 0)
+		return 0;
+	int t = 0;
+	for (unsigned i = 0; i < COUNTOF(endlessModTable); ++i)
+		if (h & endlessModTable[i].bit)
+			t += endlessModTable[i].reward;
+	for (unsigned i = 0; i < COUNTOF(endlessBoonMitigation); ++i)
+		if (mods & endlessBoonMitigation[i].bit)
+			t -= endlessBoonMitigation[i].credit;
+	return (t < 1) ? 1 : t;
+}
+
+// Tier word shown before a course's description: a one-glance risk read off the net danger score.
+// Cursed sectors are Traps; no hostile bits is a Boon (Calm with no mods at all). The nine hostile
+// bands below spread the whole score range so single-danger sectors fan out into distinct rungs;
+// the thresholds are the tuning knobs, and endlessDangerRank below must stay in lockstep with them
+// so the word and the letter grade never disagree.
+static const char *endlessDangerTier(unsigned mods)
+{
+	if (mods & ENDLESS_MOD_CURSED)          return "Trap";
+	if ((mods & ENDLESS_HOSTILE_MASK) == 0) return (mods == 0) ? "Calm" : "Boon";
+	const int s = endlessDangerScore(mods);
+	if (s <=  9) return "Low";
+	if (s <= 13) return "Moderate";
+	if (s <= 19) return "Tough";
+	if (s <= 26) return "High";
+	if (s <= 33) return "Severe";
+	if (s <= 39) return "Deadly";
+	if (s <= 49) return "Extreme";
+	if (s <= 59) return "NIGHTMARE";
+	return "APOCALYPSE";
+}
+
+// Letter-grade twin of endlessDangerTier: the same bands off the same score, level 0 (F, no hostile
+// bits at all) up to 9 (S+++); keep the thresholds in lockstep so the pair never disagree. Every
+// hostile course floors at score 1, so even the mildest danger reads E, not F. The numeric level is
+// the single source of truth for both the letter string and the green-to-red tint the monitor draws
+// it in (game_menu.c endlessRankHue[]), so those two can never drift.
+static int endlessDangerRankLevel(unsigned mods)
+{
+	if ((mods & ENDLESS_HOSTILE_MASK) == 0) return 0; // F
+	const int s = endlessDangerScore(mods);
+	if (s <=  9) return 1; // E
+	if (s <= 13) return 2; // D
+	if (s <= 19) return 3; // C
+	if (s <= 26) return 4; // B
+	if (s <= 33) return 5; // A
+	if (s <= 39) return 6; // S
+	if (s <= 49) return 7; // S+
+	if (s <= 59) return 8; // S++
+	return 9;              // S+++
+}
+static const char *const endlessRankName[10] = { "F", "E", "D", "C", "B", "A", "S", "S+", "S++", "S+++" };
+static const char *endlessDangerRank(unsigned mods)
+{
+	return endlessRankName[endlessDangerRankLevel(mods)];
+}
+
+// Curated one-line descriptions for the memorable combos -- a little VOICE where the auto phrase
+// would just list mechanics. Keyed by EXACT modifier bitset (same convention as endlessFindTheme);
+// anything not here falls back to the generated body. Kept short on purpose -- endlessComboHelp
+// width-checks the finished line and reverts to the auto phrase if a curated one won't fit.
+static const struct { unsigned mods; const char *desc; } endlessCuratedDesc[] = {
+	// -- single dangers --
+	{ ENDLESS_MOD_FORTIFIED,   "reinforced, more enemy HP" },
+	{ ENDLESS_MOD_FRENZY,      "relentless enemy fire" },
+	{ ENDLESS_MOD_SWIFT,       "blink-fast shots" },
+	{ ENDLESS_MOD_DEVASTATING, "every hit really hurts" },
+	{ ENDLESS_MOD_ENRAGE,      "fury builds over time" },
+	{ ENDLESS_MOD_GRAVITY,     "a pull drags you down" },
+	{ ENDLESS_MOD_ELITEPACK,   "half the foes are elite" },
+	{ ENDLESS_MOD_OVERCLOCK,   "the whole sector, faster" },
+	{ ENDLESS_MOD_KAMIKAZE,    "foes home in on you" },
+	{ ENDLESS_MOD_HOMING,      "foes lean toward you" },
+	{ ENDLESS_MOD_OVERLOAD,    "fire and scroll cranked up" },
+	// -- signature elite tiers --
+	{ ENDLESS_MOD_APEX,        "every foe is elite" },
+	{ ENDLESS_MOD_LEGION,      "every foe a champion" },
+	// -- common hostile pairs --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,       "armored and fast" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY,      "tough, unrelenting fire" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "slow, tough, brutal" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,          "walls of fast bullets" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "rapid, punishing fire" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "fast shots, hard hits" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED,   "an elite armored wall" },
+	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_SWIFT,       "elite and fast" },
+	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_SWIFT,         "dragged into fast fire" },
+	// -- marquee triples / quads --
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,       "tanky and relentless" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "a storm of fast shots" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "an armored gauntlet" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "everything at once" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE,    "the sky fills with death" },
+	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE, "brutal from all sides" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "wall-to-wall bullets" },
+	// -- boons --
+	{ ENDLESS_MOD_BOUNTY,      "easy money, no danger" },
+	{ ENDLESS_MOD_FRAGILE,     "frail foes, easy kills" },
+	{ ENDLESS_MOD_TURBODRIVE, "kills quicken your guns" },
+	{ ENDLESS_MOD_OVERCHARGE,  "your shots hit harder" },
+	{ ENDLESS_MOD_DILATION,    "enemy shots crawl" },
+	{ ENDLESS_MOD_FAVOR,       "a cheaper shop next" },
+	{ ENDLESS_MOD_SLIPSTREAM,  "a faster level" },
+	{ ENDLESS_MOD_OVERDRIVE,   "kills stack your power" },
+	{ ENDLESS_MOD_OVERBLAST,   "kills stack your damage" },
+	{ ENDLESS_MOD_WARP,        "blitz past, less exposure" },
+	// -- evil self-curses --
+	{ ENDLESS_MOD_BACKFIRE,    "kills jam your guns" },
+	{ ENDLESS_MOD_BURNOUT,     "kills jam and weaken you" },
+	{ ENDLESS_MOD_MISFIRE,     "kills cut your damage" },
+};
+
+static const char *endlessCuratedDescFor(unsigned mods)
+{
+	for (unsigned i = 0; i < COUNTOF(endlessCuratedDesc); ++i)
+		if (endlessCuratedDesc[i].mods == mods)
+			return endlessCuratedDesc[i].desc;
+	return NULL;
+}
+
+// Render the first `shown` of `total` worst-first threats as a natural phrase: a comma list with the
+// final pair joined by "and" ("A", "A and B", "A, B and C"), or a truncated worst-first run tagged
+// "and more" when milder threats are left off ("A and more", "A, B and more"). Shared by the fit loop
+// below so the width it measures is exactly the width it renders.
+static void endlessJoinThreats(const int *idx, int shown, int total, char *out, size_t sz)
+{
+	char acc[128] = "";
+	for (int i = 0; i < shown; ++i)
+	{
+		const char *w = endlessModTable[idx[i]].word;
+		char next[128];
+		if (i == 0)
+			snprintf(next, sizeof next, "%s", w);
+		else if (i == shown - 1 && shown == total)   // final word of a COMPLETE list -> "... and w"
+			snprintf(next, sizeof next, "%s and %s", acc, w);
+		else
+			snprintf(next, sizeof next, "%s, %s", acc, w);
+		SDL_strlcpy(acc, next, sizeof acc);
+	}
+	if (shown < total)
+		snprintf(out, sz, "%s and more", acc);
+	else
+		snprintf(out, sz, "%s", acc);
+}
+
+// Auto-generate a terse body for an un-curated combo: the active threats worst-first (highest reward),
+// packing in as many as FIT the given pixel budget and tagging "and more" when the rest are dropped --
+// so a busy sector always leads with its deadliest dangers and a cut line only ever loses the mildest.
+// Pure-boon sectors list their top benefits the same way (a boon's low reward just sorts it later).
+static void endlessAutoBody(unsigned mods, char *out, size_t sz, unsigned font, int maxW)
+{
+	int idx[COUNTOF(endlessModTable)], n = 0;
+	for (unsigned i = 0; i < COUNTOF(endlessModTable); ++i)
+		if (mods & endlessModTable[i].bit)
+			idx[n++] = (int)i;
+
+	if (n == 0) { snprintf(out, sz, "no threats"); return; }
+
+	// Order the active mods by reward, worst first (insertion sort; n is tiny).
+	for (int a = 1; a < n; ++a)
+	{
+		const int key = idx[a];
+		int b = a - 1;
+		while (b >= 0 && endlessModTable[idx[b]].reward < endlessModTable[key].reward)
+		{
+			idx[b + 1] = idx[b];
+			--b;
+		}
+		idx[b + 1] = key;
+	}
+
+	// Prefer the complete list; if it overruns the budget, fall back to the widest leading (worst-first)
+	// run that fits -- always showing at least the single deadliest threat. The truncated forms grow
+	// monotonically, so a linear scan from 2 up finds the cutoff; the full list is tried first because
+	// its "and w" tail can be shorter than the truncated "and more" it would replace.
+	int shown = n;
+	char trial[160];
+	endlessJoinThreats(idx, n, n, trial, sizeof trial);
+	if (n > 1 && JE_textWidth(trial, font) > maxW)
+	{
+		shown = 1;
+		for (int k = 2; k < n; ++k)
+		{
+			endlessJoinThreats(idx, k, n, trial, sizeof trial);
+			if (JE_textWidth(trial, font) <= maxW)
+				shown = k;
+			else
+				break;
+		}
+	}
+	endlessJoinThreats(idx, shown, n, out, sz);
+}
+
+// Hard-truncate a string until it fits maxW pixels -- a last-resort safety (curated and auto bodies
+// are already short), so nothing can ever spill past the help bar.
+static void endlessClampWidth(char *s, unsigned font, int maxW)
+{
+	for (int len = (int)strlen(s); len > 0 && JE_textWidth(s, font) > maxW; )
+		s[--len] = '\0';
+}
+
+const char *endlessComboHelp(unsigned mods)
+{
+	static char buf[192];
+
+	if (mods == 0)  // Calm: "Calm" already IS the description, so no separate threat phrase
+	{
+		snprintf(buf, sizeof buf, "Calm: clear skies ahead");
+		return buf;
+	}
+
+	const char *tier = endlessDangerTier(mods);
+
+	// The "<Tier>: " prefix eats into the bar, so the generated body only gets what's left of the budget.
+	char prefix[32];
+	snprintf(prefix, sizeof prefix, "%s: ", tier);
+	const int bodyMaxW = ENDLESS_HELP_DESC_MAX - JE_textWidth(prefix, TINY_FONT);
+
+	// Body: an exact-match curated one-liner, else a fixed short line for any Cursed trap, else the
+	// generated phrase. Width-check the curated line against the bar; if it would overrun, fall back
+	// to the worst-first auto body (which fits itself to bodyMaxW) and hard-clamp as a final safety
+	// net -- so nothing can push the payout off the bar.
+	const char *cur = endlessCuratedDescFor(mods);
+	if (cur == NULL && (mods & ENDLESS_MOD_CURSED))
+		cur = "rich now, barren shop next";
+	if (cur != NULL)
+	{
+		snprintf(buf, sizeof buf, "%s%s", prefix, cur);
+		if (JE_textWidth(buf, TINY_FONT) <= ENDLESS_HELP_DESC_MAX)
+			return buf;
+	}
+
+	char body[128];
+	endlessAutoBody(mods, body, sizeof body, TINY_FONT, bodyMaxW);
+	snprintf(buf, sizeof buf, "%s%s", prefix, body);
+	endlessClampWidth(buf, TINY_FONT, ENDLESS_HELP_DESC_MAX);
+	return buf;
+}
+
+// The TRUTHFUL clear payout for course i at the current depth -- derived from the same table
+// (endlessClearBonusFor) that actually pays it out, so the shown and banked amounts can't
+// disagree. Shown highlighted on the course's help line (game_menu.c).
+long endlessCoursePayout(int i)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		return 0;
+	return endlessClearBonusFor(endlessCourseMod[i]);
+}
+
+void endlessGenerateCourses(void)
+{
+	endlessCourseCnt = 0;
+
+	// This visit offers a random 2..5 course choices (fewer only if there aren't enough
+	// distinct safe levels to fill them).
+	const int wantCourses = 2 + (int)(endlessRand() % (ENDLESS_MAX_COURSES - 1));  // 2..5
+
+	// Gather up to wantCourses candidate levels. endlessRandomSafeLevel already keeps each pick out
+	// of the recent-play window (so no course repeats the just-played zone or the few before it);
+	// here we only dedup WITHIN this visit, by (episode, section) -- a visit never offers two courses
+	// that share a section, so the two TYRIAN cuts can't both appear at once (they'd read as the same
+	// course), but either cut can be the section-3 course on any given visit.
+	for (int guard = 0; guard < 40 && endlessCourseCnt < wantCourses; ++guard)
+	{
+		int ep;
+		JE_byte sec, file;
+		if (!endlessRandomSafeLevel(&ep, &sec, &file))
+			break;
+
+		bool dup = false;
+		for (int k = 0; k < endlessCourseCnt && !dup; ++k)
+			if (endlessCourseEp[k] == ep && endlessCourseSec[k] == sec)
+				dup = true;
+		if (dup)
+			continue;
+
+		endlessCourseEp[endlessCourseCnt] = ep;
+		endlessCourseSec[endlessCourseCnt] = sec;
+		endlessCourseFile[endlessCourseCnt] = file;
+		endlessCourseMod[endlessCourseCnt] = 0;
+		++endlessCourseCnt;
+	}
+	if (endlessCourseCnt == 0)  // fallback: guarantee at least one course
+	{
+		int ep = episodeNum;
+		JE_byte sec = FIRST_LEVEL, file = 0;
+		endlessRandomSafeLevel(&ep, &sec, &file);
+		endlessCourseEp[0] = ep;
+		endlessCourseSec[0] = sec;
+		endlessCourseFile[0] = file;
+		endlessCourseMod[0] = 0;
+		endlessCourseCnt = 1;
+	}
+
+	// Course 0 is always clean (no modifiers, neither good nor bad).
+	endlessCourseMod[0] = 0;
+
+	// Courses 1+ get distinct hostile themes shuffled from the pool (kamikaze is its own pool),
+	// so a visit never offers the same danger twice.
+	int idx[COUNTOF(endlessHostileThemes)];
+	for (unsigned i = 0; i < COUNTOF(endlessHostileThemes); ++i)
+		idx[i] = (int)i;
+	for (int i = (int)COUNTOF(endlessHostileThemes) - 1; i > 0; --i)
+	{
+		const int j = endlessRand() % (i + 1);
+		const int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+	}
+	for (int c = 1; c < endlessCourseCnt; ++c)
+		endlessCourseMod[c] = endlessHostileThemes[idx[c - 1]].mods;
+
+	// WIDEN VARIETY: about half the hostile courses instead get a RANDOM combination of the
+	// common hostile bits (any un-named combo still gets a generated name/help). Weighted
+	// toward 2 bits; kamikaze/overload/warp stay out (they're special, injected rarely).
+	static const unsigned combinable[] = {
+		ENDLESS_MOD_FORTIFIED, ENDLESS_MOD_FRENZY, ENDLESS_MOD_SWIFT, ENDLESS_MOD_DEVASTATING,
+		ENDLESS_MOD_ENRAGE, ENDLESS_MOD_GRAVITY, ENDLESS_MOD_ELITEPACK, ENDLESS_MOD_OVERCLOCK,
+	};
+	for (int c = 1; c < endlessCourseCnt; ++c)
+	{
+		if (endlessRand() % 2 != 0)   // ~half stay curated named themes
+			continue;
+		int want = 1 + (endlessRand() % 100 < 60) + (endlessRand() % 100 < 30) + (endlessRand() % 100 < 8);
+		if (want > (int)COUNTOF(combinable))
+			want = (int)COUNTOF(combinable);
+		int ord[COUNTOF(combinable)];
+		for (unsigned k = 0; k < COUNTOF(combinable); ++k)
+			ord[k] = (int)k;
+		for (int k = (int)COUNTOF(combinable) - 1; k > 0; --k)
+		{
+			const int j = endlessRand() % (k + 1);
+			const int tmp = ord[k]; ord[k] = ord[j]; ord[j] = tmp;
+		}
+		unsigned combo = 0;
+		for (int k = 0; k < want; ++k)
+			combo |= combinable[ord[k]];
+		endlessCourseMod[c] = combo;
+	}
+
+	// A boon course is uncommon (~1 in 3 visits replaces a hostile one), drawn straight from the
+	// boon theme table (WARP excluded -- it has its own rare injection below).
+	if (endlessCourseCnt > 1 && (endlessRand() % 3) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, ENDLESS_MOD_WARP);
+	}
+
+	// Homing sectors are the GENTLEST homing tier (enemies barely lean toward you, no ram) -- rare,
+	// ~1 in 25 visits one hostile course becomes a random theme from the homing pool.
+	if (endlessCourseCnt > 1 && (endlessRand() % 25) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessHomingThemes[endlessRand() % COUNTOF(endlessHomingThemes)].mods;
+	}
+
+	// Kamikaze sectors are now the MODERATE homing tier (strength 3, no ram -- the brutal rammer moved
+	// to the RAMPAGE gamble). Still rare -- ~1 in 50 visits one hostile course becomes a kamikaze theme.
+	// Rolled after homing so that, on a clash on one slot, the harder kamikaze wins it.
+	if (endlessCourseCnt > 1 && (endlessRand() % 50) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessKamikazeThemes[endlessRand() % COUNTOF(endlessKamikazeThemes)].mods;
+	}
+
+	// Warp Speed (much faster scroll, a rare boon) -- ~1 in 12 visits.
+	if (endlessCourseCnt > 1 && (endlessRand() % 12) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = ENDLESS_MOD_WARP;
+	}
+
+	// Overload (Overclock cranked way up, a rare brutal sector) -- ~1 in 14 visits.
+	if (endlessCourseCnt > 1 && (endlessRand() % 14) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessOverloadThemes[endlessRand() % COUNTOF(endlessOverloadThemes)].mods;
+	}
+
+	// Evil Turbodrive / Overdrive (a curse that turns your own kill streak against you: jammed
+	// guns, and for Evil Overdrive weaker shots too) -- rare, ~1 in 16 visits one hostile course
+	// becomes an evil-mirror sector drawn from its own pool.
+	if (endlessCourseCnt > 1 && (endlessRand() % 16) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessEvilThemes[endlessRand() % COUNTOF(endlessEvilThemes)].mods;
+	}
+
+	// Reactor Redline (the gamble "Overheat" as a wild sector: kills quicken your guns, but the
+	// redlined core cooks your hull) -- super rare, ~1 in 60 visits one hostile course goes redline.
+	if (endlessCourseCnt > 1 && (endlessRand() % 60) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessRedlineThemes[endlessRand() % COUNTOF(endlessRedlineThemes)].mods;
+	}
+
+	// Apex Swarm (every enemy elite) is a rare, nasty sector -- ~1 in 40 visits it takes over one
+	// hostile course, drawn from the Apex-tier rare themes (bare Apex, or Apex + an extra danger).
+	// Rolled late so it can override a boon slot.
+	if (endlessCourseCnt > 1 && (endlessRand() % 40) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessPickThemeMods(endlessRareThemes, COUNTOF(endlessRareThemes), ENDLESS_MOD_APEX, ENDLESS_MOD_LEGION);
+	}
+
+	// Legion (every enemy a CHAMPION) is rarer still -- among the deadliest sectors; drawn from
+	// the Legion-tier rare themes.
+	if (endlessCourseCnt > 1 && (endlessRand() % 70) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessPickThemeMods(endlessRareThemes, COUNTOF(endlessRareThemes), ENDLESS_MOD_LEGION, 0);
+	}
+
+	// Cataclysm: an extreme multi-danger nightmare (no elite tier -- just everything at once), a
+	// rare pure-hostile apex -- ~1 in 45 visits. Drawn from the rare themes carrying neither the
+	// Apex nor Legion bit (the 5+-danger pure combos).
+	if (endlessCourseCnt > 1 && (endlessRand() % 45) == 0)
+	{
+		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
+		endlessCourseMod[slot] = endlessPickThemeMods(endlessRareThemes, COUNTOF(endlessRareThemes), 0, ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION);
+	}
+
+	// Guarantee the offered courses are all distinct. The shuffle assigns distinct base themes, but
+	// the random-combo widening (and, rarely, an injection) can independently land two slots on the
+	// same modifier set, e.g. two "Fusillade"s (FRENZY|DEVASTATING). Re-roll any duplicate to an
+	// as-yet-unused hostile theme, so Chart-a-Course is always a real choice of different sectors.
+	// (Boon/signature slots never collide; their bits can't be produced by the widen.)
+	for (int c = 1; c < endlessCourseCnt; ++c)
+	{
+		bool duplicate = false;
+		for (int k = 0; k < c && !duplicate; ++k)
+			if (endlessCourseMod[k] == endlessCourseMod[c])
+				duplicate = true;
+		if (!duplicate)
+			continue;
+
+		for (unsigned t = 0; t < COUNTOF(endlessHostileThemes); ++t)
+		{
+			const unsigned m = endlessHostileThemes[idx[t]].mods;  // idx[] = the shuffled theme order
+			bool used = false;
+			for (int k = 0; k < endlessCourseCnt && !used; ++k)
+				if (k != c && endlessCourseMod[k] == m)
+					used = true;
+			if (!used)
+			{
+				endlessCourseMod[c] = m;
+				break;
+			}
+		}
+	}
+
+	// --- Rare whole-visit flavors: Jackpot / Gauntlet / Ambush (mutually exclusive) ----------
+	// Jackpot (~1/25) all boons; Ambush (~1/20) one forced dangerous sector; Gauntlet (~1/7)
+	// all hostile. All three dice roll up front UNCONDITIONALLY so the seed stream stays
+	// aligned; precedence Jackpot > Ambush > Gauntlet; none fire at depth 0.
+	const bool jackpotRoll  = ((endlessRand() % 25) == 0);
+	const bool gauntletRoll = ((endlessRand() % 7)  == 0);
+	const bool ambushRoll   = ((endlessRand() % 20) == 0);
+	const bool doJackpot  = jackpotRoll && (endlessRunDepth > 0);
+	const bool doAmbush   = !doJackpot && ambushRoll && (endlessRunDepth > 0);
+	const bool doGauntlet = !doJackpot && !doAmbush && gauntletRoll && (endlessRunDepth > 0);
+
+	if (doJackpot)
+	{
+		// Every course a pure boon. Deal DISTINCT boon themes (shuffle the table, take one per
+		// course), skipping the Cursed entries -- those read as Traps, not clean boons -- so the
+		// jackpot is all upside.
+		int bidx[COUNTOF(endlessBoonThemes)];
+		int bn = 0;
+		for (unsigned i = 0; i < COUNTOF(endlessBoonThemes); ++i)
+			if ((endlessBoonThemes[i].mods & ENDLESS_MOD_CURSED) == 0)
+				bidx[bn++] = (int)i;
+		for (int i = bn - 1; i > 0; --i)
+		{
+			const int j = endlessRand() % (i + 1);
+			const int t = bidx[i]; bidx[i] = bidx[j]; bidx[j] = t;
+		}
+		for (int c = 0; c < endlessCourseCnt && c < bn; ++c)
+			endlessCourseMod[c] = endlessBoonThemes[bidx[c]].mods;
+	}
+	else if (doGauntlet)
+	{
+		// No Calm route and no boon: turn every non-hostile course (the clean course 0 and any boon
+		// slot) into a fresh, distinct hostile theme. Courses already carrying a hostile bit
+		// (including a rare injected Apex / Kamikaze / Overload / etc.) keep their theme, so the
+		// gauntlet still fans out into varied dangers. Consumes no RNG (a deterministic pick from the
+		// already-shuffled idx[] order), so the stream stays aligned.
+		for (int c = 0; c < endlessCourseCnt; ++c)
+		{
+			if (endlessCourseMod[c] & ENDLESS_HOSTILE_MASK)
+				continue;  // already a danger -- leave it be
+			for (unsigned t = 0; t < COUNTOF(endlessHostileThemes); ++t)
+			{
+				const unsigned m = endlessHostileThemes[idx[t]].mods;
+				bool used = false;
+				for (int k = 0; k < endlessCourseCnt && !used; ++k)
+					if (k != c && endlessCourseMod[k] == m)
+						used = true;
+				if (!used)
+				{
+					endlessCourseMod[c] = m;
+					break;
+				}
+			}
+		}
+	}
+
+	endlessForced = doAmbush;
+	if (endlessForced)
+	{
+		endlessCourseCnt = 1;  // collapse to a single sector (keeps course 0's level)
+		static const unsigned combos[] = {
+			ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY,
+			ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,
+			ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,
+			ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,
+			ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,
+			ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,
+			ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,
+			ENDLESS_MOD_HOMING | ENDLESS_MOD_DEVASTATING,   // homing, not full kamikaze: an ambush is unavoidable, so keep it fair
+			ENDLESS_MOD_HOMING | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,
+			ENDLESS_MOD_GRAVITY | ENDLESS_MOD_SWIFT,
+			ENDLESS_MOD_ENRAGE | ENDLESS_MOD_DEVASTATING,
+			ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_DEVASTATING,
+			ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING,
+			ENDLESS_MOD_HOMING | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,
+		};
+		endlessCourseMod[0] = combos[endlessRand() % COUNTOF(combos)];
+	}
+
+	// Present the courses from lowest danger to highest, so Chart-a-Course always reads as a left-
+	// to-right safety ramp (the clean/boon route first, the deadliest sector last). Sort the three
+	// parallel course arrays together by hostile danger score, the same metric that drives the
+	// Low/Moderate/.../NIGHTMARE tier word. A stable insertion sort over this tiny list keeps equal-
+	// danger courses in their generated order and consumes no RNG (it runs after every draw), so the
+	// seed's structure is unchanged. Ambush already collapsed to one course above, so it's a no-op there.
+	for (int i = 1; i < endlessCourseCnt; ++i)
+	{
+		const int      ep   = endlessCourseEp[i];
+		const JE_byte  sec  = endlessCourseSec[i];
+		const JE_byte  file = endlessCourseFile[i];
+		const unsigned mod  = endlessCourseMod[i];
+		const int      key  = endlessDangerScore(mod);
+		int j = i - 1;
+		while (j >= 0 && endlessDangerScore(endlessCourseMod[j]) > key)
+		{
+			endlessCourseEp[j + 1]   = endlessCourseEp[j];
+			endlessCourseSec[j + 1]  = endlessCourseSec[j];
+			endlessCourseFile[j + 1] = endlessCourseFile[j];
+			endlessCourseMod[j + 1]  = endlessCourseMod[j];
+			--j;
+		}
+		endlessCourseEp[j + 1]   = ep;
+		endlessCourseSec[j + 1]  = sec;
+		endlessCourseFile[j + 1] = file;
+		endlessCourseMod[j + 1]  = mod;
+	}
+}
+
+int endlessCourseCount(void)
+{
+	return endlessCourseCnt;
+}
+
+const char *endlessCourseName(int i)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		return "";
+	if (endlessForced && i == 0)
+		return "Ambush!";
+	return endlessComboName(endlessCourseMod[i]);
+}
+
+// The help line is a short RISK SUMMARY only -- the itemized threats/boons are drawn on the
+// planet monitor itself (endlessCourseModRows + game_menu.c's overlay), so the old generated
+// "A, B and more" listing would just duplicate them.
+const char *endlessCourseHelp(int i)
+{
+	static char buf[64];
+	if (i < 0 || i >= endlessCourseCnt)
+		return "";
+	if (endlessForced && i == 0)
+	{
+		snprintf(buf, sizeof buf, "Ambush! %s - no way around it",
+		         endlessDangerTier(endlessCourseMod[0]));
+		return buf;
+	}
+	const unsigned mods = endlessCourseMod[i];
+	// The letter rank (F easiest .. S+++ hardest) is drawn separately, on the planet monitor's
+	// RANK field (endlessCourseRank + game_menu.c's overlay), so the help line is just the tier.
+	if (mods == 0)
+		snprintf(buf, sizeof buf, "Calm: clear skies ahead");
+	else if (mods & ENDLESS_MOD_CURSED)
+		snprintf(buf, sizeof buf, "Trap: rich now, barren shop next");
+	else if ((mods & ENDLESS_HOSTILE_MASK) == 0)
+		snprintf(buf, sizeof buf, "Boon: no danger here");
+	else
+		snprintf(buf, sizeof buf, "Danger: %s", endlessDangerTier(mods));
+	return buf;
+}
+
+// The highlighted course's letter danger grade (F easiest .. S+++ hardest) for the monitor's
+// RANK field -- moved off the help line so it reads ON the planet monitor. Delegates to the
+// same endlessDangerRank/score/thresholds as the "Danger:" word, so the two never disagree.
+const char *endlessCourseRank(int i)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		return "";
+	return endlessDangerRank(endlessCourseMod[i]);
+}
+
+// Numeric danger level 0 (F) .. 9 (S+++) for course i, or -1 if out of range. The monitor uses
+// it to pick the letter's green->red tint; it maps the same letter endlessCourseRank returns.
+int endlessCourseRankLevel(int i)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		return -1;
+	return endlessDangerRankLevel(endlessCourseMod[i]);
+}
+
+// The highlighted course's individual modifiers for the monitor overlay, worst-first. The
+// weight is the modifier's endlessModTable reward (the same tenths endlessDangerScore sums),
+// so the overlay's darkest-red tints land on exactly the bits that drive the tier word.
+// Cursed lists on the hostile side -- it's a trap, and deep red is the right warning.
+int endlessCourseModRows(int i, EndlessCourseModRow *rows, int max)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		return 0;
+	const unsigned mods = endlessCourseMod[i];
+	int n = 0;
+	for (unsigned t = 0; t < COUNTOF(endlessModTable) && n < max; ++t)
+	{
+		if ((mods & endlessModTable[t].bit) == 0)
+			continue;
+		rows[n].word    = endlessModTable[t].word;
+		rows[n].weight  = endlessModTable[t].reward;
+		rows[n].hostile = (endlessModTable[t].bit & (ENDLESS_HOSTILE_MASK | ENDLESS_MOD_CURSED)) != 0;
+		++n;
+	}
+	for (int a = 1; a < n; ++a)  // insertion sort, worst first; n is tiny
+	{
+		const EndlessCourseModRow key = rows[a];
+		int b = a - 1;
+		while (b >= 0 && rows[b].weight < key.weight)
+		{
+			rows[b + 1] = rows[b];
+			--b;
+		}
+		rows[b + 1] = key;
+	}
+	return n;
+}
+
+JE_byte endlessCoursePlanet(int i)
+{
+	// Distinct valid star-map planets (1..21) so the monitor shows a different world per
+	// course. Purely cosmetic.
+	static const JE_byte planets[ENDLESS_MAX_COURSES] = { 4, 9, 13, 17, 21 };
+	return planets[(i < 0 || i >= ENDLESS_MAX_COURSES) ? 0 : i];
+}
+
+JE_byte endlessCourseSection(int i)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		i = 0;
+	return endlessCourseSec[i];
+}
+
+JE_byte endlessSelectCourse(int i)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		i = 0;
+
+	// Stash the one-shots this pick is about to consume, so a non-hardcore mid-zone bail (which
+	// reopens the outpost unlocked and re-picks a course through here) can restore them first;
+	// otherwise a bought E-Shop buff would be silently forfeit. Hardcore relaunches the committed
+	// level directly, never re-entering this, so its stash is simply never read (see
+	// endlessRestoreSortie).
+	endlessSortiePrePurchased = endlessPurchasedMods;
+	endlessSortiePreCleanse   = endlessCleanseChargeCount;
+	endlessSortiePreLongCon   = endlessLongCon;
+
+	if (endlessCourseEp[i] != episodeNum)
+		JE_initEpisode(endlessCourseEp[i]);  // load that episode's data (arsenal is shared)
+	forcedLvlFileNum = endlessCourseFile[i];  // load this course's exact level file (see JE_loadMap)
+	endlessActiveMods = endlessCourseMod[i] | endlessPurchasedMods;  // fold in E-Shop buffs
+	endlessPurchasedMods = 0;                                        // consumed by this sector
+	for (int c = 0; c < endlessCleanseChargeCount; ++c)  // Sabotage: strip the worst hostile bit per charge
+		endlessActiveMods = endlessStripWorstMod(endlessActiveMods);
+	endlessCleanseChargeCount = 0;
+	// The Long Con: an APEX ambush the player gambled for and forgot, added after the cleanse pass so
+	// no queued sabotage charge can strip it -- you paid to not see this coming, and you don't.
+	if (endlessLongCon > 0 && --endlessLongCon == 0)
+		endlessActiveMods |= ENDLESS_MOD_APEX;
+	endlessLastEp = endlessCourseEp[i];
+	endlessLastSec = endlessCourseSec[i];
+	return endlessCourseSec[i];
+}
+
+// Draw a glowing line horizontally centred on the widescreen surface (vga_width), so the
+// run-end screen respects the widescreen edit instead of hugging the left.
+static void endlessGlowCentered(int y, unsigned int font, const char *s)
+{
+	textGlowFont = font;
+	JE_outTextGlow(VGAScreen, (vga_width - JE_textWidth(s, font)) / 2, y, s);
+}
+
+void endlessOnRunEnd(void)
+{
+	// Run-over summary, styled like the level-end tally: glowing stat lines (the same
+	// JE_outTextGlow effect JE_endLevelAni uses), centred on the widescreen. The caller has
+	// already faded to black, so we clear to black, fade the (untouched) game palette back
+	// in, glow the lines in, wait for a key, then fade out. Returns to the title screen.
+	VGAScreen = VGAScreenSeg;
+	JE_clr256(VGAScreen);
+	JE_showVGA();
+	fade_palette(colors, 15, 0, 255);
+
+	JE_wipeKey();
+	frameCountMax = 4;
+	SDL_Color white = { 255, 255, 255 };
+	set_colors(white, 254, 254);
+
+	char buf[128];
+	endlessGlowCentered(22, FONT_SHAPES, "RUN OVER");
+
+	int y = 54;
+
+	snprintf(buf, sizeof(buf), "You fell in Zone %d", endlessRunDepth + 1);
+	endlessGlowCentered(y, SMALL_FONT_SHAPES, buf);  y += 18;
+
+	snprintf(buf, sizeof(buf), "Zones cleared:   %d", endlessRunDepth);
+	endlessGlowCentered(y, SMALL_FONT_SHAPES, buf);  y += 18;
+
+	snprintf(buf, sizeof(buf), "Enemies destroyed:   %d", endlessRunKills);
+	endlessGlowCentered(y, SMALL_FONT_SHAPES, buf);  y += 18;
+
+	snprintf(buf, sizeof(buf), "Bosses slain:   %d", endlessRunBossKills);
+	endlessGlowCentered(y, SMALL_FONT_SHAPES, buf);  y += 18;
+
+	snprintf(buf, sizeof(buf), "Cash amassed:   $%lu", (unsigned long)player[0].cash);
+	endlessGlowCentered(y, SMALL_FONT_SHAPES, buf);  y += 18;
+
+	if (endlessArmorBonus > 0)
+	{
+		snprintf(buf, sizeof(buf), "Hull reinforced:   +%d", endlessArmorBonus);
+		endlessGlowCentered(y, SMALL_FONT_SHAPES, buf);  y += 18;
+	}
+
+	endlessGlowCentered(y + 10, SMALL_FONT_SHAPES, endlessMilestoneLine(endlessRunDepth + 1));
+
+	// Require inputs released first (the player may have died mid-fire), then wait for a
+	// fresh key/button so the summary can't flash past.
+	wait_noinput(true, true, true);
+	do
+	{
+		setDelay(1);
+		wait_delay();
+	} while (!JE_anyButton());
+
+	wait_noinput(false, false, true);
+	fade_black(15);
+	JE_clr256(VGAScreen);
+}
+
+void endlessEndRunToTitle(void)
+{
+	// Voluntarily quitting an in-progress run back to the title. In HARDCORE this is as final as
+	// dying -- there's no save to resume -- so it gets the same Run Over summary the death path shows
+	// (the shop has already faded to black on Quit, so endlessOnRunEnd fades its summary in cleanly).
+	// In non-hardcore a quit stays silent: the run may have a save to come back to, so it isn't over.
+	if (endlessHardcore)
+	{
+		fade_song();       // silence the shop track so the summary plays clean, like the death path
+		endlessOnRunEnd();
+	}
+	endlessMode = false;
+}
+
+// --- Save / resume (endless.sav sidecar) ---------------------------------------------------
+// tyrian.sav can't be extended (fixed checksummed layout), so the run lives in an endless.sav sidecar keyed
+// by the same slot; restoring the snapshot rather than regenerating stops reload rerolling the shop. notes.md §Save / resume.
+
+#define ENDLESS_SAVE_FILE    "endless.sav"
+#define ENDLESS_SAVE_VERSION 6      // v1 run-state only; v2 added the outpost snapshot; v3 adds the run seed; v4 adds the locked-sortie retry; v5 adds the kill-fire buff recharge; v6 adds the anti-repeat recent-level ring
+#define ENDLESS_SAVE_PERKS   16     // fixed perk-array width on disk (>= PERK_COUNT; headroom for new perks)
+
+typedef struct {
+	bool used;
+
+	// --- run-persistent ---
+	Sint32 runDepth, armorBonus, runKills, runBossKills;
+	Sint32 buffCharge, revivesUsed, shopTax, longCon, perkDepthDone, superbombs;
+	Uint8  reviveHeld, gambleRigged;
+	Uint8  perkOwned[ENDLESS_SAVE_PERKS];
+
+	// --- outpost snapshot: prices + pending buys ---
+	Sint32 rerollCost, hullCost, bombCost, extraPerkCost, cleanseCost, shopEntryCash;
+	Uint32 purchasedMods;
+	Sint32 buffKind, cleanseCharges;
+	Uint8  gamblePerkWon, perkPending;
+	char   gambleMsg[48];
+	char   lastSpecialName[31];
+
+	// --- outpost snapshot: this visit's perk offer ---
+	Sint32 perkChoiceN;
+	Sint32 perkChoice[3];
+
+	// --- outpost snapshot: this visit's courses ---
+	Sint32 courseCnt;
+	Sint32 courseEp[ENDLESS_MAX_COURSES];
+	Uint8  courseSec[ENDLESS_MAX_COURSES];
+	Uint32 courseMod[ENDLESS_MAX_COURSES];
+	Sint32 lastEp;
+	Uint8  lastSec, forced;
+
+	// --- outpost snapshot: this visit's shop stock ---
+	Uint8  itemAvail[9][10];
+	Uint8  itemAvailMax[9];
+
+	// --- run seed (v3) ---
+	char   seed[ENDLESS_SEED_MAXLEN];
+
+	// --- locked sortie (v4): a "gave up the level" outpost, locked to the launch-time choices ---
+	Uint8  lockedSortie;  // 1 = this save reopens the locked retry outpost (else a normal outpost)
+	Uint32 sortieMods;    // endlessActiveMods of the committed level
+	Uint8  sortieSec;     // committed level section
+	Sint32 sortieEp;      // committed episode
+	Uint8  sortieFile;    // committed lvl file number
+
+	// --- kill-fire buff recharge (v5) ---
+	Sint32 buffCooldownUntil;  // run depth at which the E-Shop kill-fire buys unlock again (0 = no lock)
+
+	// --- anti-repeat recent-level ring (v6): the last few played (ep, sec), [0] = newest ---
+	Uint8  recentCount;
+	Sint32 recentEp[ENDLESS_LEVEL_HISTORY];
+	Uint8  recentSec[ENDLESS_LEVEL_HISTORY];
+} EndlessSlotRec;
+
+// One record per save slot, mirrored to endless.sav. Read-modify-write on each save keeps the
+// other slots' records intact.
+static EndlessSlotRec endlessSlotCache[SAVE_FILES_NUM];
+
+// Little-endian field I/O over a FILE*. The write side is fire-and-forget; the read side never
+// dies -- any short/failed read just aborts the load, so a missing or corrupt sidecar simply
+// means "no endless save".
+static void endlessPutU8(FILE *f, unsigned v)                 { Uint8 b = (Uint8)v; fwrite(&b, 1, 1, f); }
+static void endlessPutU32(FILE *f, Uint32 v)                  { v = SDL_SwapLE32(v); fwrite(&v, 4, 1, f); }
+static void endlessPutBytes(FILE *f, const void *p, size_t n) { fwrite(p, 1, n, f); }
+static bool endlessGetU8(FILE *f, Uint8 *v)                   { return fread(v, 1, 1, f) == 1; }
+static bool endlessGetU32(FILE *f, Uint32 *v)                 { Uint32 b; if (fread(&b, 4, 1, f) != 1) return false; *v = SDL_SwapLE32(b); return true; }
+static bool endlessGetBytes(FILE *f, void *p, size_t n)       { return fread(p, 1, n, f) == n; }
+
+static void endlessWriteRec(FILE *f, const EndlessSlotRec *r)
+{
+	endlessPutU8(f, r->used ? 1 : 0);
+
+	const Sint32 s32[] = {
+		r->runDepth, r->armorBonus, r->runKills, r->runBossKills, r->buffCharge, r->revivesUsed,
+		r->shopTax, r->longCon, r->perkDepthDone, r->superbombs,
+		r->rerollCost, r->hullCost, r->bombCost, r->extraPerkCost, r->cleanseCost, r->shopEntryCash,
+		r->buffKind, r->cleanseCharges, r->perkChoiceN, r->courseCnt, r->lastEp,
+	};
+	for (unsigned i = 0; i < COUNTOF(s32); ++i)
+		endlessPutU32(f, (Uint32)s32[i]);
+
+	endlessPutU32(f, r->purchasedMods);
+	endlessPutU8(f, r->reviveHeld);
+	endlessPutU8(f, r->gambleRigged);
+	endlessPutU8(f, r->gamblePerkWon);
+	endlessPutU8(f, r->perkPending);
+	endlessPutU8(f, r->lastSec);
+	endlessPutU8(f, r->forced);
+
+	endlessPutBytes(f, r->perkOwned, ENDLESS_SAVE_PERKS);
+	endlessPutBytes(f, r->gambleMsg, sizeof(r->gambleMsg));
+	endlessPutBytes(f, r->lastSpecialName, sizeof(r->lastSpecialName));
+
+	for (unsigned i = 0; i < COUNTOF(r->perkChoice); ++i)
+		endlessPutU32(f, (Uint32)r->perkChoice[i]);
+	for (unsigned i = 0; i < ENDLESS_MAX_COURSES; ++i)
+		endlessPutU32(f, (Uint32)r->courseEp[i]);
+	for (unsigned i = 0; i < ENDLESS_MAX_COURSES; ++i)
+		endlessPutU32(f, r->courseMod[i]);
+	endlessPutBytes(f, r->courseSec, ENDLESS_MAX_COURSES);
+
+	endlessPutBytes(f, r->itemAvail, sizeof(r->itemAvail));
+	endlessPutBytes(f, r->itemAvailMax, sizeof(r->itemAvailMax));
+	endlessPutBytes(f, r->seed, sizeof(r->seed));
+
+	endlessPutU8(f, r->lockedSortie);        // v4 locked-sortie block
+	endlessPutU32(f, r->sortieMods);
+	endlessPutU8(f, r->sortieSec);
+	endlessPutU32(f, (Uint32)r->sortieEp);
+	endlessPutU8(f, r->sortieFile);
+
+	endlessPutU32(f, (Uint32)r->buffCooldownUntil);  // v5 kill-fire recharge
+
+	endlessPutU8(f, r->recentCount);                 // v6 anti-repeat recent-level ring
+	for (unsigned i = 0; i < ENDLESS_LEVEL_HISTORY; ++i)
+		endlessPutU32(f, (Uint32)r->recentEp[i]);
+	endlessPutBytes(f, r->recentSec, ENDLESS_LEVEL_HISTORY);
+}
+
+static bool endlessReadRec(FILE *f, EndlessSlotRec *r, int version)
+{
+	memset(r, 0, sizeof(*r));
+
+	Uint8 used;
+	if (!endlessGetU8(f, &used))
+		return false;
+	r->used = used != 0;
+
+	Sint32 *const s32[] = {
+		&r->runDepth, &r->armorBonus, &r->runKills, &r->runBossKills, &r->buffCharge, &r->revivesUsed,
+		&r->shopTax, &r->longCon, &r->perkDepthDone, &r->superbombs,
+		&r->rerollCost, &r->hullCost, &r->bombCost, &r->extraPerkCost, &r->cleanseCost, &r->shopEntryCash,
+		&r->buffKind, &r->cleanseCharges, &r->perkChoiceN, &r->courseCnt, &r->lastEp,
+	};
+	for (unsigned i = 0; i < COUNTOF(s32); ++i)
+	{
+		Uint32 t;
+		if (!endlessGetU32(f, &t))
+			return false;
+		*s32[i] = (Sint32)t;
+	}
+
+	if (!endlessGetU32(f, &r->purchasedMods)
+	    || !endlessGetU8(f, &r->reviveHeld) || !endlessGetU8(f, &r->gambleRigged)
+	    || !endlessGetU8(f, &r->gamblePerkWon) || !endlessGetU8(f, &r->perkPending)
+	    || !endlessGetU8(f, &r->lastSec) || !endlessGetU8(f, &r->forced))
+		return false;
+
+	if (!endlessGetBytes(f, r->perkOwned, ENDLESS_SAVE_PERKS)
+	    || !endlessGetBytes(f, r->gambleMsg, sizeof(r->gambleMsg))
+	    || !endlessGetBytes(f, r->lastSpecialName, sizeof(r->lastSpecialName)))
+		return false;
+
+	for (unsigned i = 0; i < COUNTOF(r->perkChoice); ++i)
+	{
+		Uint32 t;
+		if (!endlessGetU32(f, &t))
+			return false;
+		r->perkChoice[i] = (Sint32)t;
+	}
+	for (unsigned i = 0; i < ENDLESS_MAX_COURSES; ++i)
+	{
+		Uint32 t;
+		if (!endlessGetU32(f, &t))
+			return false;
+		r->courseEp[i] = (Sint32)t;
+	}
+	for (unsigned i = 0; i < ENDLESS_MAX_COURSES; ++i)
+		if (!endlessGetU32(f, &r->courseMod[i]))
+			return false;
+	if (!endlessGetBytes(f, r->courseSec, ENDLESS_MAX_COURSES))
+		return false;
+
+	if (!endlessGetBytes(f, r->itemAvail, sizeof(r->itemAvail))
+	    || !endlessGetBytes(f, r->itemAvailMax, sizeof(r->itemAvailMax))
+	    || !endlessGetBytes(f, r->seed, sizeof(r->seed)))
+		return false;
+
+	// Never trust a terminator off disk.
+	r->gambleMsg[sizeof(r->gambleMsg) - 1] = '\0';
+	r->lastSpecialName[sizeof(r->lastSpecialName) - 1] = '\0';
+	r->seed[sizeof(r->seed) - 1] = '\0';
+
+	// v4 locked-sortie block. Older (v3) records don't carry it -- the memset above already left
+	// lockedSortie = 0, so they simply read as "not a locked outpost".
+	if (version >= 4)
+	{
+		Uint8  u8;
+		Uint32 u32;
+		if (!endlessGetU8(f, &u8))
+			return false;
+		r->lockedSortie = u8;
+		if (!endlessGetU32(f, &u32))
+			return false;
+		r->sortieMods = u32;
+		if (!endlessGetU8(f, &u8))
+			return false;
+		r->sortieSec = u8;
+		if (!endlessGetU32(f, &u32))
+			return false;
+		r->sortieEp = (Sint32)u32;
+		if (!endlessGetU8(f, &u8))
+			return false;
+		r->sortieFile = u8;
+	}
+
+	// v5 kill-fire buff recharge. Older (v3/v4) records lack it -- the memset above left
+	// buffCooldownUntil = 0 ("no lock"), so a resumed pre-v5 run can buy immediately.
+	if (version >= 5)
+	{
+		Uint32 u32;
+		if (!endlessGetU32(f, &u32))
+			return false;
+		r->buffCooldownUntil = (Sint32)u32;
+	}
+
+	// v6 anti-repeat recent-level ring. Older records lack it -- the memset above left recentCount = 0,
+	// so a resumed pre-v6 run just starts with an empty window (it refills as zones are played).
+	if (version >= 6)
+	{
+		if (!endlessGetU8(f, &r->recentCount))
+			return false;
+		for (unsigned i = 0; i < ENDLESS_LEVEL_HISTORY; ++i)
+		{
+			Uint32 u32;
+			if (!endlessGetU32(f, &u32))
+				return false;
+			r->recentEp[i] = (Sint32)u32;
+		}
+		if (!endlessGetBytes(f, r->recentSec, ENDLESS_LEVEL_HISTORY))
+			return false;
+		if (r->recentCount > ENDLESS_LEVEL_HISTORY)
+			r->recentCount = ENDLESS_LEVEL_HISTORY;
+	}
+	return true;
+}
+
+// Load every slot's record into the cache (all-unused on a missing / short / corrupt / wrong-
+// version file -- this is optional data, so any problem just means "no endless save").
+static void endlessReadAllSlots(void)
+{
+	memset(endlessSlotCache, 0, sizeof(endlessSlotCache));
+
+	FILE *f = dir_fopen(get_user_directory(), ENDLESS_SAVE_FILE, "rb");
+	if (f == NULL)
+		return;
+
+	Uint8 hdr[6];
+	if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)
+	    || memcmp(hdr, "OTES", 4) != 0 || hdr[4] < 3 || hdr[4] > ENDLESS_SAVE_VERSION)
+	{
+		fclose(f);  // accept v3 (pre-locked-sortie), v4 and v5; anything else is "no endless save"
+		return;
+	}
+
+	const int count = hdr[5];
+	for (int s = 0; s < count; ++s)
+	{
+		EndlessSlotRec rec;
+		if (!endlessReadRec(f, &rec, hdr[4]))
+			break;  // truncated: keep the full records already read
+		if (s < SAVE_FILES_NUM)
+			endlessSlotCache[s] = rec;
+	}
+
+	fclose(f);
+}
+
+// Write the whole cache back to disk (fixed record layout, so a slot is simply overwritten).
+static void endlessWriteAllSlots(void)
+{
+	FILE *f = dir_fopen_warn(get_user_directory(), ENDLESS_SAVE_FILE, "wb");
+	if (f == NULL)
+		return;
+
+	const Uint8 hdr[6] = { 'O', 'T', 'E', 'S', ENDLESS_SAVE_VERSION, (Uint8)SAVE_FILES_NUM };
+	fwrite(hdr, 1, sizeof(hdr), f);
+	for (int s = 0; s < SAVE_FILES_NUM; ++s)
+		endlessWriteRec(f, &endlessSlotCache[s]);
+
+	fclose(f);
+}
+
+// Snapshot the live run AND the current outpost into a record.
+static void endlessCaptureCurrent(EndlessSlotRec *r)
+{
+	memset(r, 0, sizeof(*r));
+	r->used = true;
+
+	r->runDepth      = endlessRunDepth;
+	r->armorBonus    = endlessArmorBonus;
+	r->runKills      = endlessRunKills;
+	r->runBossKills  = endlessRunBossKills;
+	r->buffCharge    = endlessBuffCharge;
+	r->buffCooldownUntil = endlessBuffCooldownUntil;
+	r->revivesUsed   = endlessRevivesUsed;
+	r->shopTax       = endlessShopTax;
+	r->longCon       = endlessLongCon;
+	r->perkDepthDone = endlessPerkDepthDone;
+	r->superbombs    = player[0].superbombs;
+	r->reviveHeld    = endlessReviveHeld ? 1 : 0;
+	r->gambleRigged  = endlessGambleRigged ? 1 : 0;
+	for (int i = 0; i < ENDLESS_SAVE_PERKS; ++i)
+		r->perkOwned[i] = (i < PERK_COUNT) ? endlessPerkOwned[i] : 0;
+
+	r->rerollCost    = (Sint32)endlessRerollCost;
+	r->hullCost      = endlessHullCost;
+	r->bombCost      = (Sint32)endlessBombCost;
+	r->extraPerkCost = (Sint32)endlessExtraPerkCost;
+	r->cleanseCost   = (Sint32)endlessCleanseCost;
+	r->shopEntryCash = (Sint32)endlessShopEntryCash;
+	r->purchasedMods = endlessPurchasedMods;
+	r->buffKind      = endlessBuffKind;
+	r->cleanseCharges= endlessCleanseChargeCount;
+	r->gamblePerkWon = endlessGamblePerkWon ? 1 : 0;
+	r->perkPending   = endlessPerkPending ? 1 : 0;
+	SDL_strlcpy(r->gambleMsg, endlessGambleMsg, sizeof(r->gambleMsg));
+	SDL_strlcpy(r->lastSpecialName, endlessLastSpecialName, sizeof(r->lastSpecialName));
+
+	r->perkChoiceN = endlessPerkChoiceN;
+	for (int i = 0; i < 3; ++i)
+		r->perkChoice[i] = endlessPerkChoice[i];
+
+	r->courseCnt = endlessCourseCnt;
+	for (int i = 0; i < ENDLESS_MAX_COURSES; ++i)
+	{
+		r->courseEp[i]  = endlessCourseEp[i];
+		r->courseSec[i] = endlessCourseSec[i];
+		r->courseMod[i] = endlessCourseMod[i];
+	}
+	r->lastEp  = endlessLastEp;
+	r->lastSec = endlessLastSec;
+	r->forced  = endlessForced ? 1 : 0;
+
+	memcpy(r->itemAvail, itemAvail, sizeof(r->itemAvail));
+	memcpy(r->itemAvailMax, itemAvailMax, sizeof(r->itemAvailMax));
+
+	SDL_strlcpy(r->seed, endlessRunSeed, sizeof(r->seed));
+
+	// Locked "gave up the level" outpost (v4): only meaningful when saving FROM the locked shop
+	// (endlessLockedSortie). memset(r,0) at the top leaves these cleared for a normal save.
+	r->lockedSortie = endlessLockedSortie ? 1 : 0;
+	r->sortieMods   = endlessSortieModsV;
+	r->sortieSec    = endlessSortieSec;
+	r->sortieEp     = endlessSortieEp;
+	r->sortieFile   = endlessSortieFile;
+
+	// Anti-repeat recent-level ring (v6).
+	r->recentCount = (Uint8)endlessRecentCount;
+	for (int i = 0; i < ENDLESS_LEVEL_HISTORY; ++i)
+	{
+		r->recentEp[i]  = endlessRecentEp[i];
+		r->recentSec[i] = endlessRecentSec[i];
+	}
+}
+
+// Lay a saved record back over the live state. endlessResetRun first, so per-zone/per-visit
+// transients we DON'T persist (combat timers, elite rolls, ...) start clean; then restore both
+// the run and the outpost snapshot, and arm endlessResumeVisit so the next outpost is the
+// SAVED one rather than a fresh (free) reroll.
+static void endlessApplyCurrent(const EndlessSlotRec *r)
+{
+	endlessResetRun();
+
+	endlessRunDepth      = r->runDepth;
+	endlessArmorBonus    = r->armorBonus;
+	endlessRunKills      = r->runKills;
+	endlessRunBossKills  = r->runBossKills;
+	endlessBuffCharge    = r->buffCharge;
+	endlessBuffCooldownUntil = r->buffCooldownUntil;
+	endlessRevivesUsed   = r->revivesUsed;
+	endlessShopTax       = r->shopTax;
+	endlessLongCon       = r->longCon;
+	endlessPerkDepthDone = r->perkDepthDone;
+	player[0].superbombs = (r->superbombs < 0) ? 0 : (r->superbombs > 10 ? 10 : r->superbombs);
+	endlessReviveHeld    = r->reviveHeld != 0;
+	endlessGambleRigged  = r->gambleRigged != 0;
+	for (int i = 0; i < PERK_COUNT && i < ENDLESS_SAVE_PERKS; ++i)
+	{
+		int v = r->perkOwned[i];
+		const int maxs = endlessPerkTable[i].maxStack;
+		endlessPerkOwned[i] = (JE_byte)(v < 0 ? 0 : (v > maxs ? maxs : v));
+	}
+
+	endlessRerollCost         = r->rerollCost;
+	endlessHullCost           = r->hullCost;
+	endlessBombCost           = r->bombCost;
+	endlessExtraPerkCost      = r->extraPerkCost;
+	endlessCleanseCost        = r->cleanseCost;
+	endlessShopEntryCash      = r->shopEntryCash;
+	endlessPurchasedMods      = r->purchasedMods;
+	endlessBuffKind           = r->buffKind;
+	endlessCleanseChargeCount = r->cleanseCharges;
+	endlessGamblePerkWon      = r->gamblePerkWon != 0;
+	endlessPerkPending        = r->perkPending != 0;
+	SDL_strlcpy(endlessGambleMsg, r->gambleMsg, sizeof(endlessGambleMsg));
+	SDL_strlcpy(endlessLastSpecialName, r->lastSpecialName, sizeof(endlessLastSpecialName));
+	endlessSetSeed(r->seed);  // restore the run seed (endlessResetRun blanked it); rehashes + primes the stream
+
+	endlessPerkChoiceN = r->perkChoiceN;
+	if (endlessPerkChoiceN < 0) endlessPerkChoiceN = 0;
+	if (endlessPerkChoiceN > 3) endlessPerkChoiceN = 3;
+	for (int i = 0; i < 3; ++i)
+		endlessPerkChoice[i] = r->perkChoice[i];
+
+	endlessCourseCnt = r->courseCnt;
+	if (endlessCourseCnt < 0) endlessCourseCnt = 0;
+	if (endlessCourseCnt > ENDLESS_MAX_COURSES) endlessCourseCnt = ENDLESS_MAX_COURSES;
+	for (int i = 0; i < ENDLESS_MAX_COURSES; ++i)
+	{
+		endlessCourseEp[i]  = r->courseEp[i];
+		endlessCourseSec[i] = r->courseSec[i];
+		// Course file isn't persisted (the rec predates it): a resumed outpost rerolls its courses
+		// before any pick, and the locked Quit-Level relaunch carries its file via sortieFile. Default
+		// to 0 (the section's first ']L') so a stale file can never leak into a restored course.
+		endlessCourseFile[i] = 0;
+		endlessCourseMod[i] = r->courseMod[i];
+	}
+	endlessLastEp  = r->lastEp;
+	endlessLastSec = r->lastSec;
+	endlessForced  = r->forced != 0;
+
+	// Anti-repeat recent-level ring (v6). endlessResetRun (above) already cleared it, so a pre-v6
+	// record (recentCount 0) simply resumes with an empty window.
+	endlessRecentCount = (r->recentCount > ENDLESS_LEVEL_HISTORY) ? ENDLESS_LEVEL_HISTORY : r->recentCount;
+	for (int i = 0; i < ENDLESS_LEVEL_HISTORY; ++i)
+	{
+		endlessRecentEp[i]  = r->recentEp[i];
+		endlessRecentSec[i] = r->recentSec[i];
+	}
+
+	memcpy(itemAvail, r->itemAvail, sizeof(itemAvail));
+	memcpy(itemAvailMax, r->itemAvailMax, sizeof(itemAvailMax));
+
+	// Locked-sortie retry (v4): a save made from the "gave up the level" outpost reopens locked and
+	// relaunches the same committed level. endlessResetRun (above) already cleared these to unlocked.
+	endlessLockedSortie = r->lockedSortie != 0;
+	if (endlessLockedSortie)
+	{
+		endlessSortieModsV = r->sortieMods;
+		endlessSortieSec   = (JE_byte)r->sortieSec;
+		endlessSortieEp    = r->sortieEp;
+		endlessSortieFile  = (JE_byte)r->sortieFile;
+		endlessSortieHave  = true;
+	}
+
+	endlessResumeVisit = true;  // next outpost: restore this snapshot, do not reroll
+}
+
+void endlessSaveSlot(JE_byte slot)
+{
+	if (slot < 1 || slot > SAVE_FILES_NUM)
+		return;
+
+	endlessReadAllSlots();
+	if (endlessMode)
+		endlessCaptureCurrent(&endlessSlotCache[slot - 1]);
+	else if (endlessSlotCache[slot - 1].used)
+		endlessSlotCache[slot - 1].used = false;  // a normal save over an endless slot drops its stale record
+	else
+		return;  // campaign save over a non-endless slot: nothing to store or clear
+	endlessWriteAllSlots();
+}
+
+bool endlessLoadSlot(JE_byte slot)
+{
+	if (slot < 1 || slot > SAVE_FILES_NUM)
+		return false;
+
+	endlessReadAllSlots();
+	if (!endlessSlotCache[slot - 1].used)
+		return false;
+
+	endlessApplyCurrent(&endlessSlotCache[slot - 1]);
+	endlessMode = true;  // JE_loadGame cleared it for a normal load; this slot is an endless run
+	return true;
+}
+
+// True from the moment a run is restored until its outpost reopens and consumes the snapshot.
+// The title-load path runs the outpost at JE_main's entry (flag already cleared by the time a
+// level starts); an in-shop load can't, so JE_main checks this after JE_loadMap and detours to
+// the outpost when it's still set (see tyrian2.c). Mirrors the endlessBetweenLevels gate.
+bool endlessResumePending(void) { return endlessResumeVisit; }
+
+// --- "Quit Level" -> locked-outpost retry ----------------------------------------------------
+// The endless run/outpost half of the launch-time snapshot (the loadout + committed-level half are
+// the endlessSortie* primitives up top). Reusing the save record means depth, perks, prices,
+// purchased mods, courses, shop stock and seed are all reverted by the tested capture/apply code.
+static EndlessSlotRec endlessSortieRec;
+
+void endlessCaptureSortie(void)
+{
+	if (!endlessMode)
+		return;
+
+	// We're about to run a level, so by definition we're no longer sitting in a locked "gave up"
+	// outpost. Clear it before the capture so the snapshot itself reads as unlocked.
+	endlessLockedSortie = false;
+
+	endlessCaptureCurrent(&endlessSortieRec);                          // endless run + outpost state
+	memcpy(endlessSortiePlayer, player, sizeof(endlessSortiePlayer));  // full loadout (cash / items / superbombs)
+	endlessSortieModsV = endlessActiveMods;   // the committed level's mutators...
+	endlessSortieSec   = mainLevel;           // ...its section (== the level being loaded)...
+	endlessSortieEp    = episodeNum;          // ...its episode...
+	endlessSortieFile  = lvlFileNum;          // ...and its level file
+	endlessSortieHave  = true;
+}
+
+void endlessRestoreSortie(void)
+{
+	if (!endlessSortieHave)
+		return;
+
+	// Grab run-scoped state before endlessApplyCurrent -> endlessResetRun clobbers it. A bail is a
+	// retry of the same run, so its hardcore mode must survive the reset (the reset is meant for the
+	// save/resume path, which starts a fresh non-hardcore run) -- otherwise the very first bail would
+	// silently un-lock the outpost AND re-enable saving for the rest of the run.
+	const bool     wasHardcore = endlessHardcore;
+	const unsigned preBuff     = endlessSortiePrePurchased;
+	const int      preCleanse  = endlessSortiePreCleanse;
+	const int      preLongCon  = endlessSortiePreLongCon;
+
+	endlessApplyCurrent(&endlessSortieRec);                           // revert endless state; arms endlessResumeVisit (also cleared endlessSortieHave via endlessResetRun)
+	memcpy(player, endlessSortiePlayer, sizeof(endlessSortiePlayer)); // revert loadout (wins over the superbombs field applyCurrent touched)
+	endlessActiveMods   = endlessSortieModsV;                         // the committed level's mutators (for the relaunch)
+	endlessSortieHave   = true;                                       // the committed-level statics are still valid -- keep the invariant
+	endlessHardcore     = wasHardcore;                                // keep the run's mode across the reset
+
+	if (endlessHardcore)
+	{
+		// Hardcore: the reopened outpost is LOCKED to the launch-time choices. The relaunch re-arms
+		// the committed level directly (endlessArmLockedRelaunch), so the post-pick snapshot's zeroed
+		// one-shots are correct -- leave them as endlessApplyCurrent restored them (no double-spend).
+		endlessLockedSortie = true;
+	}
+	else
+	{
+		// Non-hardcore: the outpost reopens UNLOCKED and the player re-picks a course through
+		// endlessSelectCourse, which re-consumes these one-shots. Restore their PRE-pick values so a
+		// bought buff / queued sabotage / Long Con carry to the next course instead of being lost.
+		endlessLockedSortie       = false;
+		endlessPurchasedMods      = preBuff;
+		endlessCleanseChargeCount = preCleanse;
+		endlessLongCon            = preLongCon;
+	}
+}
+
+bool endlessSortieValid(void) { return endlessSortieHave; }
+
+void endlessArmLockedRelaunch(void)
+{
+	// Re-arm the same level directly -- not via endlessSelectCourse, whose one-shot consumption
+	// (Long Con decrement, Sabotage/cleanse charges, purchased-mod fold-in) must not fire twice.
+	if (endlessSortieEp != episodeNum)
+		JE_initEpisode((JE_byte)endlessSortieEp);  // may reset mainLevel/lvlFileNum -- so set them after
+	endlessActiveMods = endlessSortieModsV;
+	mainLevel = endlessSortieSec;
+	if (endlessSortieFile != 0)
+		lvlFileNum = endlessSortieFile;
+	forcedLvlFileNum = endlessSortieFile;  // keep JE_loadMap's rescan from reverting to the section's first ']L'
+	nextLevel = mainLevel;
+	jumpSection = true;  // exits the shop loop; JE_loadMap then loads the committed level
+}

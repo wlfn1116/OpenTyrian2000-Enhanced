@@ -2,7 +2,7 @@
 #define OPENTYRIAN_VERSION_H
 
 #ifndef OPENTYRIAN_VERSION
-#define OPENTYRIAN_VERSION "v2.1.widescreen.3"
+#define OPENTYRIAN_VERSION "Enhanced v1.0"
 #endif
 
 #endif // OPENTYRIAN_VERSION_H

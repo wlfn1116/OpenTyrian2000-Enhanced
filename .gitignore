@@ -1,4 +1,5 @@
 /data/
+/originaldostyriandata/
 
 opentyrian.cfg
 tyrian.cfg
@@ -18,12 +19,19 @@ tyrian.sav
 /opentyrian.exe
 /SDL2.dll
 /SDL2_net.dll
+/libfluidsynth-3.dll
 
 # Windows runtime output
 /stderr.txt
 /stdout.txt
 
+# Crash / diagnostic log (crashlog.c)
+/opentyrian_log.log
+/endless_crash.log
+/endless_hang.log
+
 # MSVC build output and project
+/.vs/
 /opentyrian-*.exe
 /opentyrian-*.ilk
 /opentyrian-*.pdb
@@ -35,3 +43,21 @@ tyrian.sav
 
 # Doxygen output
 /doc/doxygen/
+
+# Nintendo Switch (devkitA64) build output
+/switch/build/
+/switch/build.log
+/switch/*.nro
+/switch/*.nso
+/switch/*.elf
+/switch/*.nacp
+# ...but keep the data files users drop into romfs/ out of the repo too
+/switch/romfs/*
+!/switch/romfs/PUT_DATA_FILES_HERE.txt
+
+# Sony PS Vita (VitaSDK) build output (eboot.bin, param.sfo, the VPK, CMake cache, staged tree)
+/vita/build/
+/vita/build.log
+
+# Collected deliverables (rebuild-all.bat copies the .exe/.pdb/.nro/.vpk here)
+/build/

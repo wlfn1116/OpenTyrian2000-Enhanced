@@ -25,12 +25,13 @@
 
 #include <ctype.h>
 
-#define starlib_MAX_STARS 1000
+#define starlib_MAX_STARS 2500  // warp-star field density for intros/interludes
 #define MAX_TYPES 14
 
 struct JE_StarType
 {
-	JE_integer spX, spY, spZ;
+	JE_integer spX, spY;
+	JE_real spZ;  // fractional so movement can be time-scaled per rendered frame
 	JE_integer lastX, lastY;
 };
 
@@ -59,50 +60,123 @@ static JE_shortint speedChange;
 
 static JE_byte pColor;
 
-void JE_starlib_main(void)
+// Fill a scale x scale block at hi-buffer pixel (hx, hy) with `col`, clipped to
+// the surface. Used to draw supersampled stars: each classic 1-pixel cell of the
+// star cross becomes an NxN block so the star keeps its on-screen size.
+static void star_fill_block(Uint8 *pixels, int pitch, int w, int h, int hx, int hy, int n, Uint8 col)
+{
+	int x0 = hx < 0 ? 0 : hx;
+	int y0 = hy < 0 ? 0 : hy;
+	int x1 = hx + n > w ? w : hx + n;
+	int y1 = hy + n > h ? h : hy + n;
+	for (int y = y0; y < y1; ++y)
+	{
+		Uint8 *row = pixels + y * pitch;
+		for (int x = x0; x < x1; ++x)
+			row[x] = col;
+	}
+}
+
+// Draw the classic star cross (centre + 2-pixel arms) supersampled by `scale`,
+// centred on the sub-pixel screen position (fx, fy). round(f*scale) places the
+// whole cross in 1/scale-pixel steps, so present_hi()'s downscale antialiases the
+// motion instead of stepping whole pixels. Colours match the 1x path: the centre
+// is `c0`, the inner arms c0+72, the outer arms c0+144 (Uint8 wrap, as before).
+static void draw_star_scaled(SDL_Surface *target, float fx, float fy, Uint8 c0, int scale)
+{
+	Uint8 *pixels = target->pixels;
+	const int pitch = target->pitch, w = target->w, h = target->h;
+	const int hx = (int)(fx * scale + 0.5f);
+	const int hy = (int)(fy * scale + 0.5f);
+	const Uint8 c1 = c0 + 72;
+	const Uint8 c2 = c0 + 144;
+
+	star_fill_block(pixels, pitch, w, h, hx, hy, scale, c0);
+
+	star_fill_block(pixels, pitch, w, h, hx - scale, hy, scale, c1);
+	star_fill_block(pixels, pitch, w, h, hx + scale, hy, scale, c1);
+	star_fill_block(pixels, pitch, w, h, hx, hy - scale, scale, c1);
+	star_fill_block(pixels, pitch, w, h, hx, hy + scale, scale, c1);
+
+	star_fill_block(pixels, pitch, w, h, hx - 2 * scale, hy, scale, c2);
+	star_fill_block(pixels, pitch, w, h, hx + 2 * scale, hy, scale, c2);
+	star_fill_block(pixels, pitch, w, h, hx, hy - 2 * scale, scale, c2);
+	star_fill_block(pixels, pitch, w, h, hx, hy + 2 * scale, scale, c2);
+}
+
+void JE_starlib_main(float step, SDL_Surface *target, int scale)  // step = fraction of a classic ~70Hz tick elapsed
 {
 	int off;
 	JE_word i;
-	JE_integer tempZ;
+	JE_real tempZ;
 	JE_byte tempCol;
 	struct JE_StarType *stars;
-	Uint8 *surf;
+	Uint8 *surf = target->pixels;
+
+	// Housekeeping that must stay at the classic tick rate; movement below is
+	// scaled by `step` directly so it stays smooth at any render rate.
+	static float tick_acc = 0.0f;
+	tick_acc += step;
+	for (; tick_acc >= 1.0f; tick_acc -= 1.0f)
+	{
+		starlib_speed += speedChange;
+
+		if (doChange)
+		{
+			stepCounter++;
+			if (stepCounter > changeTime)
+			{
+				JE_changeSetup(0);
+			}
+		}
+
+		if ((mt_rand() % 1000) == 1)
+		{
+			nspVarVarInc = mt_rand_1() * 0.01f - 0.005f;
+		}
+
+		nspVarInc += nspVarVarInc;
+	}
 
 	JE_wackyCol();
 
 	grayB = false;
 
-	starlib_speed += speedChange;
-
 	for (stars = star, i = starlib_MAX_STARS; i > 0; stars++, i--)
 	{
-		/* Make a pointer to the screen... */
-		surf = VGAScreen->pixels;
-
-		/* Calculate the offset to where we wish to draw */
-		off = (stars->lastX) + (stars->lastY) * vga_width;
-
-		/* We don't want trails in our star field.  Erase the old graphic */
-		if (off >= vga_width * 2 && off < (vga_width * vga_height) - vga_width * 2)
+		/* We don't want trails in our star field.  Erase the old graphic.
+		 * (Supersampled frames are drawn into a buffer the caller clears each
+		 * frame, so there is nothing to erase per-star.) */
+		if (scale == 1)
 		{
-			surf[off] = 0; /* Shade Level 0 */
+			off = (stars->lastX) + (stars->lastY) * vga_width;
+			if (off >= vga_width * 2 && off < (vga_width * vga_height) - vga_width * 2)
+			{
+				surf[off] = 0; /* Shade Level 0 */
 
-			surf[off - 1] = 0; /* Shade Level 1, 2 */
-			surf[off + 1] = 0;
-			surf[off - 2] = 0;
-			surf[off + 2] = 0;
+				surf[off - 1] = 0; /* Shade Level 1, 2 */
+				surf[off + 1] = 0;
+				surf[off - 2] = 0;
+				surf[off + 2] = 0;
 
-			surf[off - vga_width] = 0;
-			surf[off + vga_width] = 0;
-			surf[off - vga_width * 2] = 0;
-			surf[off + vga_width * 2] = 0;
+				surf[off - vga_width] = 0;
+				surf[off + vga_width] = 0;
+				surf[off - vga_width * 2] = 0;
+				surf[off + vga_width * 2] = 0;
+			}
 		}
 
 		/* Move star */
 		tempZ = stars->spZ;
-		tempX = (stars->spX / tempZ) + vga_width / 2;
-		tempY = (stars->spY / tempZ) + vga_height / 2;
-		tempZ -=  starlib_speed;
+		tempX = (int)(stars->spX / tempZ) + vga_width / 2;
+		tempY = (int)(stars->spY / tempZ) + vga_height / 2;
+
+		// Sub-pixel screen position (same projection, not truncated) for the
+		// supersampled draw; must use the pre-decrement z, like tempX/tempY.
+		const float fx = stars->spX / tempZ + vga_width / 2.0f;
+		const float fy = stars->spY / tempZ + vga_height / 2.0f;
+
+		tempZ -= starlib_speed * step;
 
 		/* If star is out of range, make a new one */
 		if (tempZ <= 0 ||
@@ -122,29 +196,36 @@ void JE_starlib_main(void)
 			stars->lastY = tempY;
 			stars->spZ = tempZ;
 
-			off = tempX + tempY * vga_width;
-
 			if (grayB)
-				tempCol = tempZ >> 1;
+				tempCol = (int)tempZ >> 1;
 			else
-				tempCol = pColor+((tempZ >> 4) & 31);
+				tempCol = pColor+(((int)tempZ >> 4) & 31);
 
-			/* Draw the pixel! */
-			if (off >= vga_width * 2 && off < (vga_width * vga_height) - vga_width * 2)
+			if (scale != 1)
 			{
-				surf[off] = tempCol;
+				draw_star_scaled(target, fx, fy, tempCol, scale);
+			}
+			else
+			{
+				off = tempX + tempY * vga_width;
 
-				tempCol += 72;
-				surf[off - 1] = tempCol;
-				surf[off + 1] = tempCol;
-				surf[off - vga_width] = tempCol;
-				surf[off + vga_width] = tempCol;
+				/* Draw the pixel! */
+				if (off >= vga_width * 2 && off < (vga_width * vga_height) - vga_width * 2)
+				{
+					surf[off] = tempCol;
 
-				tempCol += 72;
-				surf[off - 2] = tempCol;
-				surf[off + 2] = tempCol;
-				surf[off - vga_width * 2] = tempCol;
-				surf[off + vga_width * 2] = tempCol;
+					tempCol += 72;
+					surf[off - 1] = tempCol;
+					surf[off + 1] = tempCol;
+					surf[off - vga_width] = tempCol;
+					surf[off + vga_width] = tempCol;
+
+					tempCol += 72;
+					surf[off - 2] = tempCol;
+					surf[off + 2] = tempCol;
+					surf[off - vga_width * 2] = tempCol;
+					surf[off + vga_width * 2] = tempCol;
+				}
 			}
 		}
 	}
@@ -297,22 +378,6 @@ void JE_starlib_main(void)
 				break;
 		}
 	}
-
-	if (doChange)
-	{
-		stepCounter++;
-		if (stepCounter > changeTime)
-		{
-			JE_changeSetup(0);
-		}
-	}
-
-	if ((mt_rand() % 1000) == 1)
-	{
-		nspVarVarInc = mt_rand_1() * 0.01f - 0.005f;
-	}
-
-	nspVarInc += nspVarVarInc;
 }
 
 void JE_wackyCol(void)

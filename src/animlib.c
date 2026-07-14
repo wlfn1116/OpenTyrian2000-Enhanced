@@ -18,6 +18,7 @@
  */
 #include "animlib.h"
 
+#include "crashlog.h"
 #include "file.h"
 #include "keyboard.h"
 #include "network.h"
@@ -155,6 +156,8 @@ void JE_playAnim(const char *animfile, JE_byte startingframe, JE_byte speed)
 {
 	unsigned int i;
 	int pageNum;
+
+	crashlog_set_phase("cutscene / animation");
 
 	if (JE_loadAnim(animfile) != 0)
 		return; /* Failed to open or process file */

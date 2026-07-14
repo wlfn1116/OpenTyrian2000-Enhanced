@@ -167,13 +167,37 @@ void poll_joystick(int j)
 	
 	// indicates that an direction/action has been held long enough to fake a repeat press
 	bool repeat = joystick[j].joystick_delay < SDL_GetTicks();
-	
+
+#if defined(__SWITCH__) || defined(__vita__)
+	// Make the RIGHT analog stick drive the ship exactly like the LEFT one. Both consoles'
+	// SDL ports expose 4 axes (0/1 = left stick, 2/3 = right stick); the left-stick axis and
+	// the d-pad button already occupy both assignment slots of every direction, so the right
+	// stick can't be added as a normal binding -- fold its deflection into analog_direction[]
+	// (which feeds both the digital direction[] and the analog x/y) in the loop below.
+	const bool switch_right_stick = SDL_JoystickNumAxes(joystick[j].handle) >= 4;
+#endif
+
 	// update direction state
 	for (uint d = 0; d < COUNTOF(joystick[j].direction); d++)
 	{
 		bool old = joystick[j].direction[d];
-		
+
 		joystick[j].analog_direction[d] = check_assigned(joystick[j].handle, joystick[j].assignment[d]);
+
+#if defined(__SWITCH__) || defined(__vita__)
+		if (switch_right_stick)
+		{
+			// direction d: 0=up, 1=right, 2=down, 3=left. The left stick binds axis (d+1)%2,
+			// negated for up/left; the right stick is those same two axes + 2. Take whichever
+			// stick is pushed further (mirrors check_assigned's max-over-slots semantics).
+			int rs = SDL_JoystickGetAxis(joystick[j].handle, (d + 1) % 2 + 2);
+			if (d == 0 || d == 3)
+				rs = -rs;
+			if (rs > joystick[j].analog_direction[d])
+				joystick[j].analog_direction[d] = rs;
+		}
+#endif
+
 		joystick[j].direction[d] = joystick[j].analog_direction[d] > (joystick_analog_max / 2);
 		joydown |= joystick[j].direction[d];
 		
@@ -196,8 +220,11 @@ void poll_joystick(int j)
 		joystick[j].input_pressed |= joystick[j].action_pressed[d];
 	}
 	
-	joystick[j].confirm = joystick[j].action[0] || joystick[j].action[4];
-	joystick[j].cancel = joystick[j].action[1] || joystick[j].action[5];
+	// "menu" (action[4]) acts as BACK / cancel in menus (Escape) -- matching how it toggles
+	// the in-game menu closed and the B-is-back convention -- NOT as a second confirm. Only
+	// "fire" confirms/selects; change-fire / menu / pause all cancel.
+	joystick[j].confirm = joystick[j].action[0];
+	joystick[j].cancel = joystick[j].action[1] || joystick[j].action[4] || joystick[j].action[5];
 	
 	// if new input, reset press-repeat delay
 	if (joystick[j].input_pressed)
@@ -243,10 +270,16 @@ void push_joysticks_as_keyboard(void)
 		if (!joystick[j].input_pressed)
 			continue;
 		
-		if (joystick[j].confirm)
-			push_key(confirm);
+		// A single button bound to BOTH a confirm action (fire/menu) and a cancel action
+		// (change-fire/pause) -- e.g. the Switch B button left on its default "change fire"
+		// (=cancel) while also bound to "menu" (=confirm) -- would otherwise push Return AND
+		// Escape, making a menu select and go back at once (which can crash debug screens).
+		// Fire only one; prefer cancel (back), which is non-destructive and matches the
+		// B-is-back convention.
 		if (joystick[j].cancel)
 			push_key(cancel);
+		else if (joystick[j].confirm)
+			push_key(confirm);
 		
 		for (uint d = 0; d < COUNTOF(joystick[j].direction_pressed); d++)
 		{
@@ -272,6 +305,14 @@ void init_joysticks(void)
 	SDL_JoystickEventState(SDL_IGNORE);
 	
 	joysticks = SDL_NumJoysticks();
+
+#ifdef __SWITCH__
+	// switch-sdl2 always reports 8 slots but only slot 0 is real; saving the idle
+	// placeholders clobbers slot 0's shared bindings, so use only slot 0. notes.md §Console ports.
+	if (joysticks > 1)
+		joysticks = 1;
+#endif
+
 	joystick = malloc(joysticks * sizeof(*joystick));
 	
 	for (int j = 0; j < joysticks; j++)
@@ -282,11 +323,28 @@ void init_joysticks(void)
 		if (joystick[j].handle != NULL)
 		{
 			printf("joystick detected: %s ", SDL_JoystickName(joystick[j].handle));
-			printf("(%d axes, %d buttons, %d hats)\n", 
+			printf("(%d axes, %d buttons, %d hats)\n",
 			       SDL_JoystickNumAxes(joystick[j].handle),
 			       SDL_JoystickNumButtons(joystick[j].handle),
 			       SDL_JoystickNumHats(joystick[j].handle));
-			
+
+#if defined(__SWITCH__) || defined(__vita__)
+			// There is no visible stdout on the consoles; mirror the controller capabilities
+			// to a file in the user dir so mapping problems can be diagnosed. Harmless anywhere.
+			{
+				FILE *jl = dir_fopen(get_user_directory(), "joystick_info.txt", j == 0 ? "w" : "a");
+				if (jl)
+				{
+					fprintf(jl, "joystick %d: %s (%d axes, %d buttons, %d hats)\n",
+					        j, SDL_JoystickName(joystick[j].handle),
+					        SDL_JoystickNumAxes(joystick[j].handle),
+					        SDL_JoystickNumButtons(joystick[j].handle),
+					        SDL_JoystickNumHats(joystick[j].handle));
+					fclose(jl);
+				}
+			}
+#endif
+
 			if (!load_joystick_assignments(&opentyrian_config, j))
 				reset_joystick_assignments(j);
 		}
@@ -343,13 +401,48 @@ void reset_joystick_assignments(int j)
 				joystick[j].assignment[a][1].x_axis = (a == 1 || a == 3);
 				joystick[j].assignment[a][1].negative_axis = (a == 0 || a == 3);
 			}
+#if defined(__SWITCH__) || defined(__vita__)
+			// The consoles expose the d-pad as BUTTONS (they report 0 hats), so the hat
+			// default above never binds and the d-pad does nothing. Bind the d-pad buttons
+			// into the free second slot so it works out of the box.
+			// direction index a: 0=up, 1=right, 2=down, 3=left.
+			else
+			{
+#if defined(__SWITCH__)
+				// switch-sdl2 button order: 12=Left, 13=Up, 14=Right, 15=Down.
+				static const int dpad_btn[4] = { 13, 14, 15, 12 };  // up, right, down, left
+#else
+				// Vita SDL button order: 6=Down, 7=Left, 8=Up, 9=Right.
+				static const int dpad_btn[4] = { 8, 9, 6, 7 };      // up, right, down, left
+#endif
+				if (dpad_btn[a] < SDL_JoystickNumButtons(joystick[j].handle))
+				{
+					joystick[j].assignment[a][1].type = BUTTON;
+					joystick[j].assignment[a][1].num = dpad_btn[a];
+				}
+			}
+#endif
 		}
 		else
 		{
-			if (a - 4 < (unsigned)SDL_JoystickNumButtons(joystick[j].handle))
+			int btn = (int)(a - 4);
+#if defined(__SWITCH__)
+			// Buttons 4/5 are the analog-stick clicks on switch-sdl2 — poor defaults for
+			// "menu" and "pause". Use Plus (10) and Minus (11), the natural system buttons.
+			if (a == 8) btn = 10;       // assignment_names[8] = "menu"
+			else if (a == 9) btn = 11;  // assignment_names[9] = "pause"
+#elif defined(__vita__)
+			// Vita SDL button order: 0 triangle,1 circle,2 cross,3 square,4 L1,5 R1,
+			// 6 down,7 left,8 up,9 right,10 select,11 start. Map the actions (a-4) to a
+			// comfortable scheme: cross=fire, circle=change fire/cancel, L1/R1=left/right
+			// sidekick, start=menu, select=pause.
+			static const int vita_action_btn[6] = { 2, 1, 4, 5, 11, 10 };
+			btn = vita_action_btn[a - 4];
+#endif
+			if (btn < (int)SDL_JoystickNumButtons(joystick[j].handle))
 			{
 				joystick[j].assignment[a][0].type = BUTTON;
-				joystick[j].assignment[a][0].num = a - 4;
+				joystick[j].assignment[a][0].num = btn;
 			}
 		}
 	}
@@ -399,11 +492,57 @@ bool load_joystick_assignments(Config *config, int j)
 		{
 			if (i >= COUNTOF(joystick[j].assignment[a]))
 				break;
-			
+
 			code_to_assignment(&joystick[j].assignment[a][i], value);
 		}
 	}
-	
+
+	// Configs predating the "menu"/"pause" actions load them unbound, so the pause/setup
+	// menu is unreachable from a controller. Give any still-unbound one its default
+	// button (matching reset_joystick_assignments).
+	for (size_t a = 8; a <= 9; ++a)  // assignment_names: 8 = "menu", 9 = "pause"
+	{
+		bool bound = false;
+		for (unsigned int i = 0; i < COUNTOF(joystick[j].assignment[a]); ++i)
+			if (joystick[j].assignment[a][i].type != NONE)
+				bound = true;
+
+		if (!bound && (a - 4) < (unsigned)SDL_JoystickNumButtons(joystick[j].handle))
+		{
+			joystick[j].assignment[a][0].type = BUTTON;
+			joystick[j].assignment[a][0].num = (int)(a - 4);
+		}
+	}
+
+#if defined(__SWITCH__) || defined(__vita__)
+	// Same idea for the d-pad: the consoles have no hat, so a config saved by an earlier
+	// build (or first-run defaults) has only the analog-stick axis on each direction and
+	// the d-pad does nothing. If a direction has no digital (button/hat) binding, back-fill
+	// its matching d-pad button so the d-pad works without a manual reset.
+	// direction a: 0=up, 1=right, 2=down, 3=left.
+	{
+#if defined(__SWITCH__)
+		static const int dpad_btn[4] = { 13, 14, 15, 12 };  // switch-sdl2: 12=L,13=U,14=R,15=D
+#else
+		static const int dpad_btn[4] = { 8, 9, 6, 7 };      // Vita: 6=D,7=L,8=U,9=R
+#endif
+		for (size_t a = 0; a < 4; ++a)
+		{
+			bool has_digital = false;
+			for (unsigned int i = 0; i < COUNTOF(joystick[j].assignment[a]); ++i)
+				if (joystick[j].assignment[a][i].type == BUTTON || joystick[j].assignment[a][i].type == HAT)
+					has_digital = true;
+
+			if (!has_digital && joystick[j].assignment[a][1].type == NONE
+			    && dpad_btn[a] < SDL_JoystickNumButtons(joystick[j].handle))
+			{
+				joystick[j].assignment[a][1].type = BUTTON;
+				joystick[j].assignment[a][1].num = dpad_btn[a];
+			}
+		}
+	}
+#endif
+
 	return true;
 }
 
@@ -547,11 +686,18 @@ bool detect_joystick_assignment(int j, Joystick_assignment *assignment)
 		hat[i] = SDL_JoystickGetHat(joystick[j].handle, i);
 	
 	bool detected = false;
-	
+
+	// The controller "confirm" that opened this prompt pushed a synthetic RETURN
+	// (push_joysticks_as_keyboard) that is still queued. Without draining it, the first
+	// service_SDL_events() in the loop below sets newkey and aborts detection on frame 1,
+	// making it impossible to bind anything with a controller. Consume it first.
+	service_SDL_events(true);
+	newkey = newmouse = false;
+
 	do
 	{
 		setDelay(1);
-		
+
 		SDL_JoystickUpdate();
 		
 		for (int i = 0; i < axes; ++i)

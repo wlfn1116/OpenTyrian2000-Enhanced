@@ -35,11 +35,12 @@ extern JE_boolean performSave;
 extern JE_boolean jumpSection;
 extern JE_boolean useLastBank;
 
-extern bool pause_pressed, ingamemenu_pressed;
+extern bool pause_pressed, ingamemenu_pressed, changefire_pressed;
 
 /*void JE_textMenuWait(JE_word waittime, JE_boolean dogamma);*/
 
 void JE_drawTextWindow(const char *text);
+void JE_drawTextWindowSplit(const char *left, const char *right, int right_x);
 void JE_initPlayerData(void);
 void JE_highScoreScreen(void);
 void JE_gammaCorrect_func(JE_byte *col, JE_real r);
@@ -51,6 +52,7 @@ void JE_helpSystem(JE_byte startTopic);
 void JE_doInGameSetup(void);
 JE_boolean JE_inGameSetup(void);
 void JE_debugMenu(bool center);
+bool JE_extraMenu(void);
 void JE_inGameHelp(void);
 void JE_sortHighScores(void);
 void JE_highScoreCheck(void);

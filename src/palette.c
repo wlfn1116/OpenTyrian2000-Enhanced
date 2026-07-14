@@ -18,7 +18,9 @@
  */
 #include "palette.h"
 
+#include "config.h"
 #include "file.h"
+#include "keyboard.h"
 #include "nortsong.h"
 #include "opentyr.h"
 #include "video.h"
@@ -126,21 +128,69 @@ void step_fade_palette(int diff[256][3], int steps, unsigned int first_color, un
 	}
 }
 
+// Present a palette fade at display refresh rate: the framebuffer is static during a fade, so
+// 35 steps/sec stutters. The classic step is linear -> a per-frame lerp reproduces it exactly.
+// notes.md §Other render-rate presents.
+static void smooth_fade_to(const SDL_Color *target, int steps, unsigned int first_color, unsigned int last_color)
+{
+	SDL_Color start[256];
+	for (unsigned int i = first_color; i <= last_color; i++)
+		start[i] = palette[i];
+
+	const float duration = steps * get_delay_period();  // ms; == classic (steps x one delay unit)
+	const Uint64 freq = SDL_GetPerformanceFrequency();
+	const Uint64 begin = SDL_GetPerformanceCounter();
+	const float counter_to_ms = 1000.0f / (float)freq;
+
+	for (;;)
+	{
+		float frac = (float)(SDL_GetPerformanceCounter() - begin) * counter_to_ms / duration;
+		const bool done = frac >= 1.0f;
+		if (done)
+			frac = 1.0f;  // land exactly on the target palette
+
+		for (unsigned int i = first_color; i <= last_color; i++)
+		{
+			palette[i].r = start[i].r + (int)((target[i].r - start[i].r) * frac);
+			palette[i].g = start[i].g + (int)((target[i].g - start[i].g) * frac);
+			palette[i].b = start[i].b + (int)((target[i].b - start[i].b) * frac);
+
+			rgb_palette[i] = SDL_MapRGB(main_window_tex_format, palette[i].r, palette[i].g, palette[i].b);
+			yuv_palette[i] = rgb_to_yuv(palette[i].r, palette[i].g, palette[i].b);
+		}
+
+		JE_showVGA();
+
+		if (done)
+			break;
+
+		if (!output_vsync)
+			limit_render_fps();
+		service_SDL_events(false);
+	}
+}
+
 void fade_palette(Palette colors, int steps, unsigned int first_color, unsigned int last_color)
 {
 	assert(steps > 0);
-	
+
+	if (smoothMotion)
+	{
+		smooth_fade_to(colors, steps, first_color, last_color);
+		return;
+	}
+
 	static int diff[256][3];
 	init_step_fade_palette(diff, colors, first_color, last_color);
-	
+
 	for (; steps > 0; steps--)
 	{
 		setDelay(1);
-		
+
 		step_fade_palette(diff, steps, first_color, last_color);
-		
+
 		JE_showVGA();
-		
+
 		service_wait_delay();
 	}
 }
@@ -148,18 +198,27 @@ void fade_palette(Palette colors, int steps, unsigned int first_color, unsigned 
 void fade_solid(SDL_Color color, int steps, unsigned int first_color, unsigned int last_color)
 {
 	assert(steps > 0);
-	
+
+	if (smoothMotion)
+	{
+		SDL_Color target[256];
+		for (unsigned int i = first_color; i <= last_color; i++)
+			target[i] = color;
+		smooth_fade_to(target, steps, first_color, last_color);
+		return;
+	}
+
 	static int diff[256][3];
 	init_step_fade_solid(diff, color, first_color, last_color);
-	
+
 	for (; steps > 0; steps--)
 	{
 		setDelay(1);
-		
+
 		step_fade_palette(diff, steps, first_color, last_color);
-		
+
 		JE_showVGA();
-		
+
 		service_wait_delay();
 	}
 }

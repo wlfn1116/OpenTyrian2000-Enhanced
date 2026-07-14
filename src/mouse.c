@@ -35,8 +35,27 @@ JE_byte mouseCursor;
 JE_word mouseX, mouseY, mouseButton;
 JE_word mouseXB, mouseYB;
 
+// On the consoles (Switch / Vita) the pointer is the touchscreen; an on-screen cursor
+// sprite misleads (it's absolute in menus and irrelevant to the relative "trackpad" ship
+// control), so the sprite is suppressed there. Pixel grab/restore still runs, so nothing smears.
+#if defined(__SWITCH__) || defined(__vita__)
+#define MOUSE_CURSOR_HIDDEN 1
+#else
+#define MOUSE_CURSOR_HIDDEN 0
+#endif
+
 static JE_word mouseGrabX, mouseGrabY;
 static JE_byte mouseGrabShape[24 * 28];
+
+// True when JE_mouseStart/Filter grabbed the pixels under the cursor on VGAScreen, so
+// JE_mouseReplace must restore them. False in centered-menu mode.
+static bool mouseGrabbed = false;
+
+// Set in centered-menu mode: the next JE_showVGA composites the cursor onto the
+// pillarboxed frame (JE_drawMouseToMenuScreen). filter 0 means unfiltered.
+static bool cursorPresentPending = false;
+static bool cursorPresentFiltered = false;
+static Uint8 cursorPresentFilter = 0;
 
 static void JE_drawShapeTypeOne(JE_word x, JE_word y, JE_byte *shape)
 {
@@ -120,14 +139,26 @@ void JE_mouseStart(void)
 
 		mouseButton = mousedown ? lastmouse_but : 0; /* incorrect, possibly unimportant */
 
+		// Pillarboxed menus build a side gradient from the frame's edge columns; a cursor
+		// drawn into VGAScreen here would smear into it near an edge. So defer: JE_showVGA
+		// composites the cursor after the gradient is built from clean content.
+		if (video_get_menu_x_offset() != 0)
+		{
+			mouseGrabbed = false;
+			cursorPresentPending = true;
+			cursorPresentFiltered = false;
+			return;
+		}
+
 		const MousePointerSpriteInfo *spriteInfo = &mousePointerSprites[mouseCursor];
 
 		mouseGrabX = MIN(MAX(spriteInfo->fx, mouse_x), vga_width - (spriteInfo->w - spriteInfo->fx)) - spriteInfo->fx;
 		mouseGrabY = MIN(MAX(spriteInfo->fy, mouse_y), vga_height - (spriteInfo->h - spriteInfo->fy)) - spriteInfo->fy;
 
 		JE_grabShapeTypeOne(mouseGrabX, mouseGrabY, mouseGrabShape);
+		mouseGrabbed = true;
 
-		if (!mouseInactive)
+		if (!mouseInactive && !MOUSE_CURSOR_HIDDEN)
 		{
 			const Sint32 x = mouse_x - spriteInfo->x - spriteInfo->fx;
 			const Sint32 y = mouse_y - spriteInfo->y - spriteInfo->fy;
@@ -136,11 +167,43 @@ void JE_mouseStart(void)
 	 }
 }
 
+// Composite the cursor onto the final pillarboxed menu frame (dst) at the live pointer
+// position shifted by the centering offset. Called by JE_showVGA after the side gradient
+// is built, so the cursor draws cleanly over the full width.
+void JE_drawMouseToMenuScreen(SDL_Surface *dst, int x_offset)
+{
+	if (!has_mouse || !cursorPresentPending)
+		return;
+	cursorPresentPending = false;
+
+	if (mouseInactive || MOUSE_CURSOR_HIDDEN)
+		return;
+
+	const MousePointerSpriteInfo *spriteInfo = &mousePointerSprites[mouseCursor];
+	const Sint32 x = mouse_x - spriteInfo->x - spriteInfo->fx + x_offset;
+	const Sint32 y = mouse_y - spriteInfo->y - spriteInfo->fy;
+	if (cursorPresentFiltered)
+		blit_sprite2x2_filter_clip(dst, x, y, shopSpriteSheet, spriteInfo->index, cursorPresentFilter);
+	else
+		blit_sprite2x2_clip(dst, x, y, shopSpriteSheet, spriteInfo->index);
+}
+
 void JE_mouseStartFilter(Uint8 filter)
 {
 	if (has_mouse)
 	{
 		mouseButton = mousedown ? lastmouse_but : 0; /* incorrect, possibly unimportant */
+
+		// Same pillarbox deferral as JE_mouseStart, carrying the darken filter
+		// (the title screen uses this variant).
+		if (video_get_menu_x_offset() != 0)
+		{
+			mouseGrabbed = false;
+			cursorPresentPending = true;
+			cursorPresentFiltered = true;
+			cursorPresentFilter = filter;
+			return;
+		}
 
 		const MousePointerSpriteInfo *spriteInfo = &mousePointerSprites[mouseCursor];
 
@@ -148,8 +211,9 @@ void JE_mouseStartFilter(Uint8 filter)
 		mouseGrabY = MIN(MAX(spriteInfo->fy, mouse_y), vga_height - (spriteInfo->h - spriteInfo->fy)) - spriteInfo->fy;
 
 		JE_grabShapeTypeOne(mouseGrabX, mouseGrabY, mouseGrabShape);
+		mouseGrabbed = true;
 
-		if (!mouseInactive)
+		if (!mouseInactive && !MOUSE_CURSOR_HIDDEN)
 		{
 			const Sint32 x = mouse_x - spriteInfo->x - spriteInfo->fx;
 			const Sint32 y = mouse_y - spriteInfo->y - spriteInfo->fy;
@@ -160,6 +224,11 @@ void JE_mouseStartFilter(Uint8 filter)
 
 void JE_mouseReplace(void)
 {
-	if (has_mouse)
+	// Only restore when JE_mouseStart/Filter grabbed on VGAScreen; in centered-menu
+	// mode the cursor lives on the composited frame instead.
+	if (has_mouse && mouseGrabbed)
+	{
 		JE_drawShapeTypeOne(mouseGrabX, mouseGrabY, mouseGrabShape);
+		mouseGrabbed = false;
+	}
 }
