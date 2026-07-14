@@ -15,6 +15,8 @@ additions below are optional; where noted, they can be turned off.
 
 ## What this fork adds
 
+Basically a bunch of stuff that I thought would be cool and also wouldn't really take that much away from the actual game.
+
 ### Widescreen
 
 - The playfield renders at 356x200 (16:9 with square pixels) instead of the
