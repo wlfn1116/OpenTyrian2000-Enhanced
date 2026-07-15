@@ -155,10 +155,9 @@ devkitPro and VitaSDK; see the README in each folder.
 
 Run `.\build-all.ps1 -Help` for every option.
 
-Collected artifacts use the version from `src/opentyrian_version.h` and include
-their platform in the filename, for example
-`OpenTyrian2000-Engaged-1.0.0-Win64.exe`. Switch and Vita builds use the
-corresponding `-Switch.nro` and `-Vita.vpk` suffixes.
+Collected artifacts include their platform in the filename, for example
+`OpenTyrian2000-Engaged-Win64.exe`. Switch and Vita builds use the corresponding
+`-Switch.nro` and `-Vita.vpk` suffixes.
 
 ## More detail
 

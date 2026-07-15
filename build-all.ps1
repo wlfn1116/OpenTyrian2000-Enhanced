@@ -85,37 +85,8 @@ Tool overrides:
 $RepoRoot = $PSScriptRoot
 $CollectionDirectory = Join-Path $RepoRoot 'build'
 $Project = Join-Path $RepoRoot 'visualc\opentyrian.vcxproj'
-$VersionHeader = Join-Path $RepoRoot 'src\opentyrian_version.h'
 $PcBaseName = "opentyrian-$Platform-$Configuration"
-
-function Get-ProjectVersion {
-    if (-not (Test-Path -LiteralPath $VersionHeader -PathType Leaf)) {
-        throw "Version header not found: $VersionHeader"
-    }
-
-    $content = Get-Content -Raw -LiteralPath $VersionHeader
-    $definition = [regex]::Match(
-        $content,
-        '(?m)^\s*#\s*define\s+OPENTYRIAN_VERSION\s+"([^"]+)"'
-    )
-    if (-not $definition.Success) {
-        throw "OPENTYRIAN_VERSION was not found in $VersionHeader"
-    }
-
-    # Accept strings such as "v1.0.0" or "Engaged v1.0.0" while keeping the
-    # filename version free of display-name text and a leading "v".
-    $version = [regex]::Match(
-        $definition.Groups[1].Value,
-        '(?i)\bv?(\d+\.\d+\.\d+(?:[-+][0-9a-z.-]+)?)\b'
-    )
-    if (-not $version.Success) {
-        throw "Could not extract a semantic version from OPENTYRIAN_VERSION: $($definition.Groups[1].Value)"
-    }
-    return $version.Groups[1].Value
-}
-
-$BuildVersion = Get-ProjectVersion
-$PackageBaseName = "OpenTyrian2000-Engaged-$BuildVersion"
+$PackageBaseName = 'OpenTyrian2000-Engaged'
 $PcPackagePlatform = if ($Platform -eq 'x64') { 'Win64' } else { 'Win32' }
 
 function Get-EnvironmentOverride {
@@ -306,12 +277,22 @@ function Copy-Artifact {
     Copy-Item -LiteralPath $Path -Destination $destination -Force
     Write-Host "  Collected: $destination" -ForegroundColor DarkGray
 
-    # Remove only the obsolete unversioned copy created by older build-all.ps1
-    # versions. Other versioned releases remain side-by-side in build\.
+    # Remove obsolete names created by earlier versions of this build script.
     $legacyDestination = Join-Path $CollectionDirectory (Split-Path $Path -Leaf)
     if ($legacyDestination -ne $destination -and
         (Test-Path -LiteralPath $legacyDestination -PathType Leaf)) {
         Remove-Item -LiteralPath $legacyDestination -Force
+    }
+
+    $destinationStem = [IO.Path]::GetFileNameWithoutExtension($DestinationName)
+    $platformSeparator = $destinationStem.LastIndexOf('-')
+    if ($platformSeparator -gt 0) {
+        $productName = $destinationStem.Substring(0, $platformSeparator)
+        $platformName = $destinationStem.Substring($platformSeparator + 1)
+        $versionedPattern = "$productName-*-$platformName$([IO.Path]::GetExtension($DestinationName))"
+        Get-ChildItem -LiteralPath $CollectionDirectory -Filter $versionedPattern -File |
+            Where-Object { $_.FullName -ne $destination } |
+            Remove-Item -Force
     }
 }
 
@@ -383,7 +364,6 @@ if (-not $NoCollect) {
 
 Write-Host ''
 Write-Host 'OpenTyrian 2000 Engaged build' -ForegroundColor Cyan
-Write-Host "  Version:       $BuildVersion"
 Write-Host "  Targets:       $($selectedTargets -join ', ')"
 Write-Host "  PC variant:    $Platform $Configuration"
 Write-Host "  Clean rebuild: $([bool]$Clean)"

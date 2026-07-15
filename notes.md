@@ -12,9 +12,9 @@ reasoning lives here. Code comments reference these sections as `notes.md §Name
   deliverables into `build\`. Targets can be selected individually, `-Clean`
   performs a clean rebuild, and one target failing does not stop the others
   unless `-FailFast` is used.
-- Collected filenames use the semantic version from `src/opentyrian_version.h`
-  and a platform suffix (`Win64`, `Win32`, `Switch`, or `Vita`). The source
-  outputs retain the names expected by their toolchains.
+- Collected filenames use a platform suffix (`Win64`, `Win32`, `Switch`, or
+  `Vita`) without embedding the version. The source outputs retain the names
+  expected by their toolchains.
 - The PC `.exe` must live next to `data\` to run. `build\` is a collection of
   deliverables, not a runtime layout.
 - Switch: `DEVKITPRO` must be in msys form (`/opt/devkitpro`); the build entry
