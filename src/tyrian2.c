@@ -3187,8 +3187,11 @@ draw_player_shot_loop_end:
 	/* Draw Top Enemy */
 	if (topEnemyOver)
 	{
-		tempMapXOfs = ((background3x1 == 0) ? oldMapX3Ofs : oldMapXOfs) + PLAYFIELD_X_SHIFT;
-		tempMapXOfs_frac = (background3x1 == 0) ? (oldMapX3Ofs_f - oldMapX3Ofs) : (oldMapXOfs_f - oldMapXOfs);
+		// This bank and layer 3 are both drawn after JE_mainGamePlayerFunctions updates
+		// parallax. Use that same current anchor so foreground-mounted enemies (notably
+		// EP1 DELIANI) do not trail the terrain by the player's variable per-tick pan.
+		tempMapXOfs = ((background3x1 == 0) ? mapX3Ofs : mapXOfs) + PLAYFIELD_X_SHIFT;
+		tempMapXOfs_frac = (background3x1 == 0) ? (mapX3Ofs_f - mapX3Ofs) : (mapXOfs_f - mapXOfs);
 		tempMapXOfs_layer = 3;
 		tempBackMove = backMove3;
 		tempScrollExtraPx  = endlessScrollExtraPx3;  // this batch rides layer 3
