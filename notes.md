@@ -272,13 +272,19 @@ mutable `last`, so a Quit-Level retry replays the same track.
   hostile themes; a ~50% "widen" that swaps in a random 1-5 bit combo of the
   `combinable[]` hostiles (weights lean toward 2-4 bits); a ~1/3 boon course
   (60% a named boon theme, 40% an emergent 2-3 bit boon combo from
-  `endlessMakeBoonCombo`); and MIXED "gambit" sectors — after the boon roll,
+  `endlessMakeBoonCombo`). Pure-boon and Jackpot generation swap the
+  Turbodrive/Overblast rarity slots, making Overblast the common roll while the
+  theme table remains the canonical name dictionary. MIXED "gambit" sectors —
+  after the boon roll,
   ~35% of each ORDINARY hostile course gains one compatible boon
-  (`endlessPickMixBoon`), welding reward onto danger. Compatibility avoids
-  same-lever cancels (no frail+fortified, no dilation+swift/overclock) and keeps
-  the one-kill-fire rule (only one boon added). Un-named combos read with the
-  right tone via three generic-name pools (ominous / fortunate / gambit), chosen
-  in `endlessComboName` off `ENDLESS_HOSTILE_MASK` vs `ENDLESS_BOON_MASK`.
+  (`endlessPickMixBoon`), welding reward onto danger. Kill-fire boons get a
+  separate 4% roll within those gambits instead of ordinary candidate weight,
+  keeping Turbodrive/Overblast rare in hostile+boon combinations.
+  Compatibility avoids same-lever cancels (no frail+fortified, no
+  dilation+swift/overclock) and keeps the one-kill-fire rule (only one boon
+  added). Un-named combos read with the right tone via three generic-name pools
+  (ominous / fortunate / gambit), chosen in `endlessComboName` off
+  `ENDLESS_HOSTILE_MASK` vs `ENDLESS_BOON_MASK`.
 - `endlessMixedThemes[]` supplies cosmetic names for the common gambit combos
   (pairs→quads + a few double-boon rares); `FRAGILE|DEVASTATING` is intentionally
   absent (it's the hostile table's "Glass Cannon"). The single-danger guarantee

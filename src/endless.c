@@ -3973,15 +3973,20 @@ long endlessCoursePayout(int i)
 // Pick a random BOON bit safe to weld onto a hostile course that already carries `hostiles`, turning it
 // into a MIXED "gambit" sector (real reward on real danger). Boons that would fight an existing threat on
 // the SAME lever are held back -- frail foes vs +HP (Fortified), crawling shots vs faster shots
-// (Swift/Overclock) -- so the sector's red/green monitor rows never contradict. Only one boon is added, so
-// the one-kill-fire-mod rule holds. The first five are always eligible, so this never returns 0.
+// (Swift/Overclock) -- so the sector's red/green monitor rows never contradict. The overpowered kill-fire
+// boons get a small roll of their own instead of two full shares in the ordinary candidate pool; this keeps
+// them uncommon in gambits while preserving the named pure-boon courses. Only one boon is added, so the
+// one-kill-fire-mod rule holds. The first three ordinary boons are always eligible, so this never returns 0.
 static Uint64 endlessPickMixBoon(Uint64 hostiles)
 {
-	Uint64 cand[8];
+	// Split evenly between the two kill-fire boons allowed on mixed courses. Overdrive remains a
+	// pure-boon/shop effect: a hostile course should not casually roll the strongest version.
+	if (endlessRand() % 100 < 4)
+		return (endlessRand() % 2) ? ENDLESS_MOD_TURBODRIVE : ENDLESS_MOD_OVERBLAST;
+
+	Uint64 cand[6];
 	int n = 0;
 	cand[n++] = ENDLESS_MOD_OVERCHARGE;   // more player damage -- always safe
-	cand[n++] = ENDLESS_MOD_TURBODRIVE;   // kills quicken your guns -- always safe
-	cand[n++] = ENDLESS_MOD_OVERBLAST;    // kills stack your damage -- always safe
 	cand[n++] = ENDLESS_MOD_BOUNTY;       // pure cash, no safety -- always safe
 	cand[n++] = ENDLESS_MOD_FAVOR;        // cheaper next shop -- always safe
 	if (!(hostiles & ENDLESS_MOD_FORTIFIED))                        // frail vs +HP would cancel
@@ -3993,14 +3998,31 @@ static Uint64 endlessPickMixBoon(Uint64 hostiles)
 	return cand[endlessRand() % n];
 }
 
+// The boon table doubles as the canonical name dictionary, so keep its semantic bitsets intact.
+// At generation time, swap the Turbodrive and Overblast rarity slots instead: Overblast inherits
+// Turbodrive's many common theme slots, while Turbodrive inherits Overblast's few rare ones. This is
+// an involution, so distinct Jackpot themes remain distinct after the mapping. Mixed gambits already
+// split the two evenly; Reactor Redline deliberately stays Turbodrive because it promises fast guns.
+static Uint64 endlessSwapTurbodriveOverblast(Uint64 mods)
+{
+	const bool hadTurbodrive = (mods & ENDLESS_MOD_TURBODRIVE) != 0;
+	const bool hadOverblast  = (mods & ENDLESS_MOD_OVERBLAST) != 0;
+	mods &= ~(ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERBLAST);
+	if (hadTurbodrive)
+		mods |= ENDLESS_MOD_OVERBLAST;
+	if (hadOverblast)
+		mods |= ENDLESS_MOD_TURBODRIVE;
+	return mods;
+}
+
 // Build a random emergent PURE-BOON combo (2, sometimes 3 bits) for a boon course -- more variety than
-// the named boon themes alone. The pool holds only ONE kill-fire boon (Turbodrive), so two can never
+// the named boon themes alone. The pool holds only ONE kill-fire boon (Overblast), so two can never
 // stack, and every pair is on an independent lever, so nothing cancels.
 static Uint64 endlessMakeBoonCombo(void)
 {
 	static const Uint64 pool[] = {
 		ENDLESS_MOD_FRAGILE, ENDLESS_MOD_BOUNTY, ENDLESS_MOD_OVERCHARGE, ENDLESS_MOD_DILATION,
-		ENDLESS_MOD_FAVOR, ENDLESS_MOD_SLIPSTREAM, ENDLESS_MOD_TURBODRIVE,
+		ENDLESS_MOD_FAVOR, ENDLESS_MOD_SLIPSTREAM, ENDLESS_MOD_OVERBLAST,
 	};
 	int ord[COUNTOF(pool)];
 	for (unsigned k = 0; k < COUNTOF(pool); ++k)
@@ -4120,7 +4142,8 @@ void endlessGenerateCourses(void)
 		if (endlessRand() % 100 < 40)
 			endlessCourseMod[slot] = endlessMakeBoonCombo();
 		else
-			endlessCourseMod[slot] = endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, ENDLESS_MOD_WARP);
+			endlessCourseMod[slot] = endlessSwapTurbodriveOverblast(
+				endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, ENDLESS_MOD_WARP));
 	}
 
 	// MIXED "gambit" sectors: graft a compatible boon onto some ORDINARY hostile courses, welding a real
@@ -4299,7 +4322,7 @@ void endlessGenerateCourses(void)
 			const int t = bidx[i]; bidx[i] = bidx[j]; bidx[j] = t;
 		}
 		for (int c = 0; c < endlessCourseCnt && c < bn; ++c)
-			endlessCourseMod[c] = endlessBoonThemes[bidx[c]].mods;
+			endlessCourseMod[c] = endlessSwapTurbodriveOverblast(endlessBoonThemes[bidx[c]].mods);
 	}
 	else if (doGauntlet)
 	{
