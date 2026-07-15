@@ -1,4 +1,4 @@
-# OpenTyrian 2000 Engaged — developer notes
+# OpenTyrian2000 Engaged developer notes
 
 Design notes and known pitfalls for the systems this fork adds on top of upstream
 OpenTyrian2000. The source keeps short comments at the relevant sites; the full
