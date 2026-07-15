@@ -369,7 +369,7 @@ float endlessGravityDriftY(void);       // GRAVITY: vertical drag component in p
 float endlessMoveScale(void);           // SLUGGISH: ship traverse-speed scale, 1.0 = normal; scales ALL input (keyboard/mouse/touch/stick) in both ship paths
 bool  endlessShieldRegenOff(void);      // SHIELDLESS or DEADGEN: true when the shield must not recharge (gate the shield-regen step in tyrian2.c)
 unsigned endlessGeneratorPowerAdd(unsigned normalAdd); // DEADGEN: generator charge per tick, throttled to a trickle (else the passed-in normal rate)
-int  endlessExtraScrollSteps(void);     // OVERCLOCK/SLIPSTREAM/OVERLOAD/WARP: extra scroll steps this tick
+int  endlessScrollBoostPercent(void); // 0/70/220 for the active scroll modifier; single source for layers and bound scripted motion
 bool endlessScrollBoostActive(void);    // true while any scroll-speed modifier is active (stable across the tick, unlike the fractional step count)
 int  endlessScrollExtraPx(int channel, int fireStep, int delayMax, int baseThisTick, float *rateOut, float *fracOut); // SMOOTH boost: extra scroll px this tick for layer `channel` (0/1/2); call once/channel/tick (notes.md §Endless scroll boost)
 int  endlessShipTintFilter(void);       // player-ship blit filter: electric yellow while the TURBODRIVE buff is active (0 = none)

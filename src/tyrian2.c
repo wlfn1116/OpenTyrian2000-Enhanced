@@ -901,11 +901,20 @@ static void copy_buffer_to_screen(const Uint8* buffer)
 // Sub-pixel fraction of tempMapXOfs, set beside every tempMapXOfs assignment so enemies float
 // their parallax onto the background layer's sub-pixel offset. notes.md §Sub-pixel parallax.
 static float tempMapXOfs_frac = 0.0f;
+// Background layer whose horizontal anchor tempMapXOfs represents (1..3). The render list uses
+// this to resolve legacy draw-order cases where the entity and layer straddle the parallax update.
+static int tempMapXOfs_layer = 0;
 
-// Vertical sub-pixel frac of the layer the current enemy scroll-tracks. TWO variants: the
-// sprite draws before the ey advance (lagged frac), the bar after. notes.md §Sub-pixel parallax.
-static float tempScrollYfrac    = 0.0f;
-static float tempScrollYfracNow = 0.0f;
+// Vertical presentation phase of the layer the current enemy scroll-tracks. Sprites and HP bars
+// can be recorded on opposite sides of the integer ey advance, so each gets an explicit whole-
+// pixel phase correction plus the layer's fractional phase. Keeping them separate prevents the
+// scale-1 .5 rounding mismatch between negative background rows and positive enemy coordinates.
+static int   tempScrollYBase = 0, tempScrollYBaseBar = 0;
+static float tempScrollYfrac = 0.0f, tempScrollYfracBar = 0.0f;
+static int   tempScrollYLayer = 0;
+// Normal layer step/delay behind the current batch. Full-speed fixedmovey scripts can be
+// scaled from the layer's exact integer delta; delay-gated scripts use a percentage carry.
+static int   tempScrollBaseStep = 0, tempScrollDelayMax = 1;
 
 // This batch's endless smooth-overclock extra scroll px (the endlessScrollExtraPxN of the layer
 // these enemies ride), set beside tempBackMove so the enemy scrolls at its layer's true pace. The
@@ -914,6 +923,83 @@ static float tempScrollYfracNow = 0.0f;
 // makes backMove == backMove3, which sent layer-3 enemies onto layer 1's much smaller delay-gated
 // extra px, so they drifted off the terrain). notes.md §Endless scroll boost / §Slow-scroll smoothing.
 static int tempScrollExtraPx = 0;
+
+// Event records are keyed to layer-1's absolute scroll coordinate (curLoc). A boosted layer can
+// cross two or more event coordinates in one simulation tick, so some records are first processed
+// at curLoc > eventtime. Remember the interval crossed by the previous tick: newly-created bound
+// enemies can then be advanced through just the missed fraction instead of spawning one or more
+// pixels behind their terrain. The layer/base fields also let fixedmovey cancellation participate
+// in that partial advance (BRAINIAC's fixed -1 shootables must remain screen-stationary).
+static bool eventScrollCatchupValid = false;
+static int eventScrollFrom = 0, eventScrollTo = 0;
+static int eventScrollLayerDelta[4] = { 0, 0, 0, 0 };
+static int eventScrollBaseStep[4] = { 0, 0, 0, 0 };
+static int eventScrollDelayMax[4] = { 1, 1, 1, 1 };
+static int eventScrollBoost = 0;
+
+// Only the part of fixedmovey left after it cancels an opposing eyc is scroll-relative. BRAINIAC,
+// for example, pairs fixed=-1 with eyc=+1 to make a zero local velocity; scaling fixed alone would
+// turn that exact cancellation into a speed-dependent drift. Any excess fixed component still
+// modifies the layer advance and is therefore the part that must scale with it.
+static int enemy_scalable_fixed_y(int fixed_move, int own_move)
+{
+	if (fixed_move < 0 && own_move > 0)
+		return fixed_move + own_move < 0 ? fixed_move + own_move : 0;
+	if (fixed_move > 0 && own_move < 0)
+		return fixed_move + own_move > 0 ? fixed_move + own_move : 0;
+	return fixed_move;
+}
+
+// Scale a layer-bound fixed-motion residual in the SAME integer phase as its layer. This matters
+// for the common residual == -baseStep case: those shootable/map pieces cancel the normal layer
+// advance and must cancel every boosted pixel too, rather than merely averaging out later. Sky
+// enemies are not layer-bound and retain stock motion. Delay-gated sections have no single
+// per-tick base divisor, so they use an exact signed percentage carry instead.
+static int enemy_fixed_move_y(unsigned int i)
+{
+	struct JE_SingleEnemyType *const e = &enemy[i];
+	const int move = e->fixedmovey;
+	const int scalable = enemy_scalable_fixed_y(move, e->eyc);
+	const int boost = endlessScrollBoostPercent();
+
+	if (scalable == 0 || tempScrollYLayer == 0 || boost == 0 || tempScrollBaseStep <= 0)
+	{
+		e->fixedmovey_carry = 0;
+		e->fixedmovey_carry_base = 0;
+		e->fixedmovey_carry_move = 0;
+		return move;
+	}
+
+	int divisor, carry_base, numerator;
+	if (tempScrollDelayMax == 1)
+	{
+		// Scale by the layer's ACTUAL base+extra delta this tick. For move == -baseStep,
+		// integer division is exact and the sprite remains pixel-locked to the terrain.
+		divisor = tempScrollBaseStep;
+		carry_base = divisor;
+		numerator = scalable * (tempBackMove + tempScrollExtraPx);
+	}
+	else
+	{
+		// Stock fixedmovey runs every tick even when the layer's delay gate is closed.
+		// Preserve that behavior while scaling its average by the modifier exactly.
+		divisor = 100;
+		carry_base = -100;  // distinct from a full-speed layer whose step happens to be 100
+		numerator = scalable * (100 + boost);
+	}
+
+	if (e->fixedmovey_carry_base != carry_base || e->fixedmovey_carry_move != scalable)
+	{
+		e->fixedmovey_carry = 0;
+		e->fixedmovey_carry_base = carry_base;
+		e->fixedmovey_carry_move = scalable;
+	}
+
+	numerator += e->fixedmovey_carry;
+	const int scaled = numerator / divisor;  // signed truncation keeps carry bounded around zero
+	e->fixedmovey_carry = numerator - scaled * divisor;
+	return (move - scalable) + scaled;
+}
 
 inline static void blit_enemy(SDL_Surface *surface, unsigned int i, signed int x_offset, signed int y_offset, signed int sprite_offset)
 {
@@ -937,14 +1023,22 @@ inline static void blit_enemy(SDL_Surface *surface, unsigned int i, signed int x
 
 	rl_current_id = RL_ID_ENEMY_BASE + (int)i;  // tag for cross-frame interpolation
 	rl_current_par_frac = tempMapXOfs_frac;     // float the parallax to match the background
-	rl_current_par_yfrac = tempScrollYfrac;     // float the vertical scroll to match the background
+	rl_current_par_layer = tempMapXOfs_layer;
+	rl_current_par_anchor = (float)(tempMapXOfs - PLAYFIELD_X_SHIFT) + tempMapXOfs_frac;
+	rl_current_par_ybase = tempScrollYBase;
+	rl_current_par_yfrac = tempScrollYfrac;
+	rl_current_par_ylayer = tempScrollYLayer;
 	if (enemy[i].filter != 0)
 		blit_sprite2_filter(surface, x, y, *enemy[i].sprite2s, index, enemy[i].filter);
 	else
 		blit_sprite2(surface, x, y, *enemy[i].sprite2s, index);
 	rl_current_id = 0;
 	rl_current_par_frac = 0.0f;
+	rl_current_par_layer = 0;
+	rl_current_par_anchor = 0.0f;
+	rl_current_par_ybase = 0;
 	rl_current_par_yfrac = 0.0f;
+	rl_current_par_ylayer = 0;
 }
 
 // Extra off-screen margin for the enemy-draw visibility tests: the interpolated position lags
@@ -986,7 +1080,9 @@ void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just d
 		{
 			enemy[i].mapoffset = tempMapXOfs;
 			enemy[i].mapoffset_frac = tempMapXOfs_frac;  // for the health bar's smooth-H match
-			enemy[i].scroll_yfrac = tempScrollYfracNow;  // for the health bar's smooth-V match (bar is drawn post-advance -> this-tick frac, unlike the pre-advance sprite)
+			enemy[i].scroll_ybase = tempScrollYBaseBar;
+			enemy[i].scroll_yfrac = tempScrollYfracBar;
+			enemy[i].scroll_ylayer = (JE_byte)tempScrollYLayer;
 
 			// Endless: decide once (per linkgroup) this enemy's tier -- 0 undecided, 1 normal,
 			// 2 elite, 3 champion; score pickups and invincible (255-armor) enemies excluded.
@@ -1117,10 +1213,10 @@ void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just d
 				}
 			}
 
-			// Scroll-tracking (background attach): scale by the endless overclock so the enemy keeps
-			// up with the faster-scrolling terrain. The enemy's own velocity (eyc, below) is not
-			// scaled, so flight/attack speed stays normal -- only the "ride the scroll" part speeds up.
-			enemy[i].ey += enemy[i].fixedmovey * (1 + endlessScrollExtraThisTick);
+			// Fixed movement has mixed level-script semantics: sky values are local motion, while
+			// layer-bound values often cancel/modify the normal layer advance. Scale only the latter,
+			// directly from this batch's exact layer delta (never from an independent boost pulse).
+			enemy[i].ey += enemy_fixed_move_y(i);
 
 			enemy[i].ex += enemy[i].exc;
 			if (enemy[i].ex < -80 || enemy[i].ex > vga_width + 20)
@@ -1822,6 +1918,7 @@ start_level_first:
 	firstGameOver = true;
 	eventLoc = 1;
 	curLoc = 0;
+	eventScrollCatchupValid = false;
 	backMove = 1;
 	backMove2 = 2;
 	backMove3 = 3;
@@ -2316,6 +2413,9 @@ level_loop:
 
 	if (forceEvents && !backMove)
 		curLoc++;
+	// Any forceEvents-only increment is a script-timeline step, not terrain movement. Start the
+	// catch-up interval after it so a later spawn is never shifted by a stationary background.
+	const int eventScrollStartThisTick = (int)curLoc;
 
 	if (map1YDelayMax > 1 && backMove < 2)
 		backMove = (map1YDelay == 1) ? 1 : 0;
@@ -2348,10 +2448,6 @@ level_loop:
 		}
 	}
 
-	// Endless scroll boost: cache the per-tick extra-step count once (the accumulator must be
-	// consumed exactly once) so backgrounds 2/3 and enemy scroll-tracking apply the same boost as
-	// the event pointer, keeping enemies and scripted bosses in sync. notes.md §Endless scroll boost.
-	endlessScrollExtraThisTick = endlessMode ? endlessExtraScrollSteps() : 0;
 	// Publish the PREVIOUS tick's smooth vertical scroll rate + sub-pixel fraction for the render
 	// list (the present loop shows this tick's list at its pre-advance position, so the data lags
 	// one tick, matching bgScrollDeltaY). notes.md §Slow-scroll smoothing.
@@ -2373,6 +2469,8 @@ level_loop:
 		int fire1 = (map1YDelayMax > 1 && backMove < 2) ? 1 : (int)backMove;
 		endlessScrollExtraPx1 = endlessScrollExtraPx(0, fire1, map1YDelayMax, base1ScrollPx,
 		                                             &bgSmoothRatePend[1], &bgSmoothFracPend[1]);
+		eventScrollBaseStep[1] = fire1;
+		eventScrollDelayMax[1] = map1YDelayMax;
 
 		int fire2 = (map2YDelayMax > 1 && backMove2 < 2) ? 1 : (int)backMove2;
 		int base2 = (map2YDelay == 1) ? fire2 : 0;
@@ -2381,13 +2479,14 @@ level_loop:
 
 		endlessScrollExtraPx3 = endlessScrollExtraPx(2, (int)backMove3, 1, (int)backMove3,
 		                                             &bgSmoothRatePend[3], &bgSmoothFracPend[3]);
+		eventScrollBaseStep[3] = (int)backMove3;
+		eventScrollDelayMax[3] = 1;
 	}
 	bgSmoothActivePend = true;
 
-	// Publish this tick's (non-lagged) rate + fraction for things recorded AFTER this tick's scroll
-	// advance: scroll-tracked entities (enemies + HP bars) drawn later this tick, and background
-	// layer 3 (draw_background_3 advances before it records, unlike layers 1/2). They need rate_T /
-	// frac_T, not the one-tick-lagged bg_layer_dy/bg_layer_yfrac the pre-advance layers 1/2 use.
+	// Publish this tick's (non-lagged) rate + fraction for background layer 3, which advances before
+	// it records its rows (unlike layers 1/2). Enemy banks preserve their common pre-advance phase
+	// and use the lagged bg_layer_dy/bg_layer_yfrac values even when bound to layer 3.
 	// notes.md §Sub-pixel parallax / §Slow-scroll smoothing.
 	for (int L = 1; L <= 3; ++L)
 	{
@@ -2398,6 +2497,12 @@ level_loop:
 	// Layer 1 (+ the event pointer, which must ride the identical delta so scripted stops stay
 	// aligned to the terrain). One combined advance; the wrap can cross more than one tile.
 	curLoc += endlessScrollExtraPx1;
+	eventScrollFrom = eventScrollStartThisTick;
+	eventScrollTo = (int)curLoc;
+	eventScrollLayerDelta[1] = eventScrollTo - eventScrollFrom;
+	eventScrollLayerDelta[3] = (int)backMove3 + endlessScrollExtraPx3;
+	eventScrollBoost = endlessScrollBoostPercent();
+	eventScrollCatchupValid = eventScrollBoost > 0 && eventScrollTo > eventScrollFrom;
 	backPos += endlessScrollExtraPx1;
 	while (backPos > 27)
 	{
@@ -2456,10 +2561,19 @@ level_loop:
 
 	tempMapXOfs = mapXOfs + PLAYFIELD_X_SHIFT;
 	tempMapXOfs_frac = mapXOfs_f - mapXOfs;
+	tempMapXOfs_layer = 1;
 	tempBackMove = backMove;
-	tempScrollYfrac    = bg_layer_yfrac[1];      // sprite (pre-advance): lagged frac, glued to layer 1
-	tempScrollYfracNow = bg_layer_yfrac_now[1];  // HP bar (post-advance): this-tick frac
 	tempScrollExtraPx  = endlessScrollExtraPx1;  // this batch rides layer 1
+	tempScrollYLayer   = 1;
+	tempScrollBaseStep = (map1YDelayMax > 1 && backMove < 2) ? 1 : (int)backMove;
+	tempScrollDelayMax = map1YDelayMax;
+	// Layer 1 records both terrain and enemy sprites before the ey advance, so their
+	// fractional phases match. Health bars are drawn after the advance; pull their
+	// integer anchor back by the same amount and retain the pre-advance phase.
+	tempScrollYBase    = 0;
+	tempScrollYfrac    = bg_layer_yfrac[1];
+	tempScrollYBaseBar = -(tempBackMove + tempScrollExtraPx);
+	tempScrollYfracBar = bg_layer_yfrac[1];
 	JE_drawEnemy(50);
 	JE_drawEnemy(100);
 
@@ -2537,10 +2651,14 @@ level_loop:
 
 		tempMapXOfs = mapX2Ofs + PLAYFIELD_X_SHIFT;
 		tempMapXOfs_frac = mapX2Ofs_f - mapX2Ofs;
+		tempMapXOfs_layer = 2;
 		tempBackMove = 0;
-		tempScrollYfrac    = 0.0f;  // not vertically scroll-tracked (layer-2 anchor): no sub-pixel glue
-		tempScrollYfracNow = 0.0f;
 		tempScrollExtraPx  = 0;     // layer-2 anchor: not vertically scroll-tracked
+		tempScrollYLayer   = 0;
+		tempScrollBaseStep = 0;
+		tempScrollDelayMax = 1;
+		tempScrollYBase = tempScrollYBaseBar = 0;
+		tempScrollYfrac = tempScrollYfracBar = 0.0f;
 		JE_drawEnemy(25);
 
 		if (enemyOnScreen == lastEnemyOnScreen)
@@ -2558,15 +2676,20 @@ level_loop:
 	{
 		tempMapXOfs = ((background3x1 == 0) ? oldMapX3Ofs : mapXOfs) + PLAYFIELD_X_SHIFT;
 		tempMapXOfs_frac = (background3x1 == 0) ? (oldMapX3Ofs_f - oldMapX3Ofs) : (mapXOfs_f - mapXOfs);
+		tempMapXOfs_layer = 3;
 		tempBackMove = backMove3;
-		// Layer-3 background records POST-advance (draw_background_3 advances before it draws), so a
-		// pre-advance enemy sprite sits one tick behind it -> 1-2px lag + scale-1 microjitter under a
-		// fast scroll modifier (sub-pixel hides it at scale>1). Fold THIS tick's integer scroll into
-		// the sprite's Y offset so the existing par_yfrac interp lands it at the SAME post-advance
-		// phase as the terrain -> glued at every scale. HP bar is already recorded post-advance.
-		tempScrollYfrac    = (float)(backMove3 + endlessScrollExtraPx3) + bg_layer_yfrac_now[3];
-		tempScrollYfracNow = bg_layer_yfrac_now[3];  // HP bar (already post-advance): this-tick frac
 		tempScrollExtraPx  = endlessScrollExtraPx3;  // this batch rides layer 3
+		tempScrollYLayer   = 3;
+		tempScrollBaseStep = (int)backMove3;
+		tempScrollDelayMax = 1;
+		// All enemies are authored and recorded at their pre-advance ey phase. Layer 3's
+		// terrain is post-advance, but shifting only this bank's sprites by the current
+		// delta breaks cross-bank structures (BRAINIAC) by exactly 1px normally and 2px
+		// on a Slipstream pulse. Preserve the entity phase; pull its post-move bar back.
+		tempScrollYBase    = 0;
+		tempScrollYfrac    = bg_layer_yfrac[3];
+		tempScrollYBaseBar = -(tempBackMove + tempScrollExtraPx);
+		tempScrollYfracBar = bg_layer_yfrac[3];
 		JE_drawEnemy(75);
 	}
 
@@ -3066,15 +3189,18 @@ draw_player_shot_loop_end:
 	{
 		tempMapXOfs = ((background3x1 == 0) ? oldMapX3Ofs : oldMapXOfs) + PLAYFIELD_X_SHIFT;
 		tempMapXOfs_frac = (background3x1 == 0) ? (oldMapX3Ofs_f - oldMapX3Ofs) : (oldMapXOfs_f - oldMapXOfs);
+		tempMapXOfs_layer = 3;
 		tempBackMove = backMove3;
-		// Layer-3 background records POST-advance (draw_background_3 advances before it draws), so a
-		// pre-advance enemy sprite sits one tick behind it -> 1-2px lag + scale-1 microjitter under a
-		// fast scroll modifier (sub-pixel hides it at scale>1). Fold THIS tick's integer scroll into
-		// the sprite's Y offset so the existing par_yfrac interp lands it at the SAME post-advance
-		// phase as the terrain -> glued at every scale. HP bar is already recorded post-advance.
-		tempScrollYfrac    = (float)(backMove3 + endlessScrollExtraPx3) + bg_layer_yfrac_now[3];
-		tempScrollYfracNow = bg_layer_yfrac_now[3];  // HP bar (already post-advance): this-tick frac
 		tempScrollExtraPx  = endlessScrollExtraPx3;  // this batch rides layer 3
+		tempScrollYLayer   = 3;
+		tempScrollBaseStep = (int)backMove3;
+		tempScrollDelayMax = 1;
+		// Keep every enemy bank at the common pre-advance entity phase; see the matching
+		// !topEnemyOver path above. The bar is recorded after JE_drawEnemy advances ey.
+		tempScrollYBase    = 0;
+		tempScrollYfrac    = bg_layer_yfrac[3];
+		tempScrollYBaseBar = -(tempBackMove + tempScrollExtraPx);
+		tempScrollYfracBar = bg_layer_yfrac[3];
 		JE_drawEnemy(75);
 	}
 
@@ -3085,10 +3211,14 @@ draw_player_shot_loop_end:
 
 		tempMapXOfs = mapX2Ofs + PLAYFIELD_X_SHIFT;
 		tempMapXOfs_frac = mapX2Ofs_f - mapX2Ofs;
+		tempMapXOfs_layer = 2;
 		tempBackMove = 0;
-		tempScrollYfrac    = 0.0f;  // not vertically scroll-tracked (layer-2 anchor): no sub-pixel glue
-		tempScrollYfracNow = 0.0f;
 		tempScrollExtraPx  = 0;     // layer-2 anchor: not vertically scroll-tracked
+		tempScrollYLayer   = 0;
+		tempScrollBaseStep = 0;
+		tempScrollDelayMax = 1;
+		tempScrollYBase = tempScrollYBaseBar = 0;
+		tempScrollYfrac = tempScrollYfracBar = 0.0f;
 		JE_drawEnemy(25);
 
 		if (enemyOnScreen == lastEnemyOnScreen)
@@ -5484,7 +5614,9 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 
 	enemy->mapoffset = 0;
 	enemy->mapoffset_frac = 0.0f;
+	enemy->scroll_ybase = 0;
 	enemy->scroll_yfrac = 0.0f;
+	enemy->scroll_ylayer = 0;
 
 	for (uint i = 0; i < 3; ++i)
 	{
@@ -5635,6 +5767,9 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 	enemy->edlevel = enemyDat[eDatI].dlevel;
 
 	enemy->fixedmovey = 0;
+	enemy->fixedmovey_carry = 0;
+	enemy->fixedmovey_carry_base = 0;
+	enemy->fixedmovey_carry_move = 0;
 
 	enemy->filter = 0x00;
 
@@ -5769,6 +5904,62 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 	return avail;
 }
 
+// Signed round-to-nearest division. Spawn catch-up values are small, but keeping the negative
+// path symmetric matters for fixedmovey/eyc combinations whose net motion is upward.
+static int event_scroll_round_div(int numerator, int denominator)
+{
+	if (denominator <= 0)
+		return 0;
+	return numerator >= 0
+	       ? (numerator + denominator / 2) / denominator
+	       : -((-numerator + denominator / 2) / denominator);
+}
+
+// Advance a freshly-created layer-bound enemy through the part of the previous boosted tick that
+// lay after its event coordinate. This is deliberately derived from the previous tick's ACTUAL
+// layer delta, not merely from the modifier percentage: the same code therefore covers fractional
+// carry pulses, stronger modifiers, and layer 3's independent rate. fixedmovey is folded into the
+// missed full-tick motion before it is prorated, so fixed=-baseStep scenery does not get shifted.
+static int event_enemy_scroll_catchup(JE_word enemyOffset, const struct JE_SingleEnemyType *e)
+{
+	int layer = 0;
+	if (enemyOffset == 25 || enemyOffset == 75)
+		layer = 1;
+	else if (enemyOffset == 50)
+		layer = 3;
+	else
+		return 0;  // slots 0..24 are free-flying/sky enemies, not vertically layer-bound
+
+	const int eventTime = (int)eventRec[eventLoc - 1].eventtime;
+	const int span = eventScrollTo - eventScrollFrom;
+	if (!eventScrollCatchupValid || (int)curLoc != eventScrollTo || span <= 0 ||
+	    eventTime <= eventScrollFrom || eventTime > eventScrollTo)
+		return 0;  // exact-time event, level/event jump, or a non-scroll forceEvents interval
+
+	const int late = eventScrollTo - eventTime;
+	if (late <= 0)
+		return 0;
+
+	const int fixedMoveRaw = e->fixedmovey;
+	const int scalable = enemy_scalable_fixed_y(fixedMoveRaw, e->eyc);
+	int fixedMoveScaled = scalable;
+	const int baseStep = eventScrollBaseStep[layer];
+	if (scalable != 0 && eventScrollBoost > 0 && baseStep > 0)
+	{
+		if (eventScrollDelayMax[layer] == 1)
+			fixedMoveScaled = scalable * eventScrollLayerDelta[layer] / baseStep;
+		else
+			fixedMoveScaled = scalable * (100 + eventScrollBoost) / 100;
+	}
+	const int fixedMove = (fixedMoveRaw - scalable) + fixedMoveScaled;
+
+	// An existing enemy would have received these three terms during the full previous tick.
+	// Apply only the fraction after this event's coordinate; for ordinary fixed-0 scenery on
+	// layer 1 this reduces exactly to `late`, with no rounding at all.
+	const int fullMove = eventScrollLayerDelta[layer] + fixedMove + e->eyc;
+	return event_scroll_round_div(fullMove * late, span);
+}
+
 void JE_createNewEventEnemy(JE_byte enemyTypeOfs, JE_word enemyOffset, Sint16 uniqueShapeTableI)
 {
 	int i;
@@ -5837,6 +6028,10 @@ void JE_createNewEventEnemy(JE_byte enemyTypeOfs, JE_word enemyOffset, Sint16 un
 	enemy[b - 1].eyc += eventRec[eventLoc - 1].eventdat3;
 	enemy[b - 1].linknum = eventRec[eventLoc - 1].eventdat4;
 	enemy[b - 1].fixedmovey = eventRec[eventLoc - 1].eventdat6;
+	enemy[b - 1].fixedmovey_carry = 0;
+	enemy[b - 1].fixedmovey_carry_base = 0;
+	enemy[b - 1].fixedmovey_carry_move = 0;
+	enemy[b - 1].ey += event_enemy_scroll_catchup(enemyOffset, &enemy[b - 1]);
 }
 
 void JE_eventJump(JE_word jump)
@@ -6065,7 +6260,10 @@ void JE_eventSystem(void)
 	case 17: /* Ground Bottom */
 		JE_createNewEventEnemy(0, 25, 0);
 		if (b > 0)
+		{
 			enemy[b-1].ey = 190 + eventRec[eventLoc-1].eventdat5;
+			enemy[b-1].ey += event_enemy_scroll_catchup(25, &enemy[b-1]);
+		}
 		break;
 
 	case 18: /* Sky Enemy on Bottom */
@@ -6129,10 +6327,13 @@ void JE_eventSystem(void)
 					enemy[i].eyc = eventRec[eventLoc-1].eventdat2;
 
 				if (eventRec[eventLoc-1].eventdat6 != 0)
-					enemy[i].fixedmovey = eventRec[eventLoc-1].eventdat6;
-
-				if (eventRec[eventLoc-1].eventdat6 == -99)
-					enemy[i].fixedmovey = 0;
+				{
+					enemy[i].fixedmovey = (eventRec[eventLoc-1].eventdat6 == -99)
+					                       ? 0 : eventRec[eventLoc-1].eventdat6;
+					enemy[i].fixedmovey_carry = 0;
+					enemy[i].fixedmovey_carry_base = 0;
+					enemy[i].fixedmovey_carry_move = 0;
+				}
 
 				if (eventRec[eventLoc-1].eventdat5 > 0)
 					enemy[i].enemycycle = eventRec[eventLoc-1].eventdat5;
@@ -6198,7 +6399,10 @@ void JE_eventSystem(void)
 	case 23: /* Sky Enemy on Bottom */
 		JE_createNewEventEnemy(0, 50, 0);
 		if (b > 0)
+		{
 			enemy[b-1].ey = 180 + eventRec[eventLoc-1].eventdat5;
+			enemy[b-1].ey += event_enemy_scroll_catchup(50, &enemy[b-1]);
+		}
 		break;
 
 	case 24: /* Enemy Global Animate */
@@ -6314,7 +6518,10 @@ void JE_eventSystem(void)
 	case 32:  // create enemy
 		JE_createNewEventEnemy(0, 50, 0);
 		if (b > 0)
+		{
 			enemy[b-1].ey = 190;
+			enemy[b-1].ey += event_enemy_scroll_catchup(50, &enemy[b-1]);
+		}
 		break;
 
 	case 33: /* Enemy From other Enemies */
@@ -6530,7 +6737,10 @@ void JE_eventSystem(void)
 	case 56: /* Ground2 Bottom */
 		JE_createNewEventEnemy(0, 75, 0);
 		if (b > 0)
+		{
 			enemy[b-1].ey = 190;
+			enemy[b-1].ey += event_enemy_scroll_catchup(75, &enemy[b-1]);
+		}
 		break;
 
 	case 57:
@@ -7127,7 +7337,9 @@ enum
 // placement and opacity come from the Enemy Bars settings. frac fills the bar
 // (left->right horizontal, bottom->up vertical); the fill colour tracks health on the
 // bank-7 (112..127) ramp, so it reads on every level palette.
-static void draw_enemy_hp_bar(int id, int boxL, int boxR, int boxT, int boxB, float frac, int barBase, float par_frac, float par_yfrac)
+static void draw_enemy_hp_bar(int id, int boxL, int boxR, int boxT, int boxB, float frac,
+                              int barBase, float par_frac, int par_layer, float par_anchor,
+                              int par_ybase, float par_yfrac, int par_ylayer)
 {
 	if (frac < 0.0f) frac = 0.0f; else if (frac > 1.0f) frac = 1.0f;
 
@@ -7209,11 +7421,19 @@ static void draw_enemy_hp_bar(int id, int boxL, int boxR, int boxT, int boxB, fl
 	{
 		rl_current_id = id;
 		rl_current_par_frac = par_frac;    // float the bar's parallax to match its enemy
+		rl_current_par_layer = par_layer;
+		rl_current_par_anchor = par_anchor;
+		rl_current_par_ybase = par_ybase;
 		rl_current_par_yfrac = par_yfrac;  // float the bar's vertical scroll to match its enemy
+		rl_current_par_ylayer = par_ylayer;
 		rl_rec_hp_bar(x, y, along, fill, (Uint8)col, vertical, opacity);
 		rl_current_id = 0;
 		rl_current_par_frac = 0.0f;
+		rl_current_par_layer = 0;
+		rl_current_par_anchor = 0.0f;
+		rl_current_par_ybase = 0;
 		rl_current_par_yfrac = 0.0f;
+		rl_current_par_ylayer = 0;
 	}
 }
 
@@ -7294,7 +7514,15 @@ static void draw_enemy_health_bars(void)
 				barBase = ENDLESS_ELITE_FILTER;
 			else if (endlessMode && enemy[e].eliteState == 3)
 				barBase = ENDLESS_CHAMPION_FILTER;
-			draw_enemy_hp_bar(RL_ID_ENEMYBAR_BASE + (int)e, left, right, top, bottom, frac, barBase, enemy[e].mapoffset_frac, enemy[e].scroll_yfrac);
+			// Slot banks 0/25/50/75 use horizontal anchors 2/1/3/1 respectively (the same
+			// batches configured around JE_drawEnemy above). Preserve the representative enemy's
+			// absolute anchor so finalize can apply the same draw-order correction to its bar.
+			const int par_layer = (e < 25) ? 2 : (e < 50) ? 1 : (e < 75) ? 3 : 1;
+			const float par_anchor = (float)(enemy[e].mapoffset - PLAYFIELD_X_SHIFT) + enemy[e].mapoffset_frac;
+			draw_enemy_hp_bar(RL_ID_ENEMYBAR_BASE + (int)e, left, right, top, bottom, frac,
+			                  barBase, enemy[e].mapoffset_frac, par_layer, par_anchor,
+			                  enemy[e].scroll_ybase, enemy[e].scroll_yfrac,
+			                  enemy[e].scroll_ylayer);
 		}
 	}
 }

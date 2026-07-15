@@ -109,19 +109,28 @@ typedef struct
 	// interpolated, so the laser/main-pulse base stays on the gun. 0 = not attached.
 	Uint8 ship_attach;
 
-	// Sub-pixel parallax correction for entities anchored to a background layer (enemies:
-	// drawn at ex + tempMapXOfs, a whole-pixel offset). par_frac = the fraction the integer
-	// offset dropped this tick; par_frac_dx = its per-tick change (finalize). The display
-	// replay adds (par_frac - par_frac_dx*inv) so the entity floats its parallax onto the
-	// same sub-pixel offset as its layer (kept glued instead of stepping). 0 = not anchored.
+	// Horizontal parallax correction for entities anchored to a background layer (enemies:
+	// drawn at ex + tempMapXOfs, a whole-pixel offset). par_anchor is the entity batch's
+	// un-floored anchor; par_layer names the background it must follow. Finalize adjusts
+	// par_frac to the anchor that layer actually recorded this tick, then fills par_frac_dx.
+	// Replay adds (par_frac - par_frac_dx*inv), keeping the entity glued even when its draw
+	// and its layer straddle the mid-frame parallax update. par_layer 0 = not anchored.
 	float par_frac, par_frac_dx;
+	float par_anchor;
+	Uint8 par_layer;
 
-	// VERTICAL counterpart for scroll-tracked entities: the sub-pixel Y offset of the
-	// background layer this entity rides (bg_layer_yfrac), so it floats onto the layer's
-	// smooth sub-pixel scroll instead of stepping by the integer per-tick delta. Without it,
-	// a boosted (fractional-rate) scroll makes the smooth background slide against the
-	// integer-stepping enemies. par_yfrac_dy = its per-tick change (finalize). 0 = not tracked.
-	float par_yfrac, par_yfrac_dy;
+	// VERTICAL background binding. par_ybase is the whole-pixel correction from the
+	// entity's draw phase to its layer's draw phase; par_yfrac is the layer's fractional
+	// phase. Keeping these separate lets replay round only the shared fractional offset,
+	// so rows at negative Y and enemies at positive Y cannot round opposite ways at .5.
+	// par_yown100 is the finalized enemy-local displacement only, in exact hundredths.
+	// Replay always applies the layer's canonical transform independently, even when this
+	// command has no previous match.
+	// par_ylayer 0 means the command is not vertically bound.
+	int par_ybase;
+	float par_yfrac;
+	int par_yown100;
+	Uint8 par_ylayer;
 }
 RenderCmd;
 
@@ -143,10 +152,17 @@ extern int rl_shot_attach;
 // tempMapXOfs dropped (tempMapXOfs_frac); 0 otherwise.
 extern float rl_current_par_frac;
 
-// Vertical scroll sub-pixel fraction stamped onto the next recorded command(s) (see
-// par_yfrac in RenderCmd). blit_enemy sets this to the bg_layer_yfrac of the layer the
-// enemy scroll-tracks, so it stays glued to the smoothly-scrolling background; 0 otherwise.
+// Background layer and absolute un-floored X anchor associated with rl_current_par_frac.
+// Bound enemy sprites/bars set these so finalize can normalize them to the exact anchor their
+// background recorded, independent of draw order. Layer 0 means no background binding.
+extern int rl_current_par_layer;
+extern float rl_current_par_anchor;
+
+// Vertical binding stamped onto the next recorded command(s) (see RenderCmd above).
+// Enemy sprites and bars set the layer, whole-pixel draw-phase correction, and the
+// layer's fractional phase together; layer 0 means no vertical background binding.
 extern float rl_current_par_yfrac;
+extern int rl_current_par_ybase, rl_current_par_ylayer;
 
 // Per-tick velocity (px/tick) stamped onto the next recorded command(s): a shot's
 // real motion (sxm/sym), set around its blit, 0 otherwise. Drives forward

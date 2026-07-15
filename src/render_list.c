@@ -8,6 +8,7 @@
 #include "vga256d.h"
 #include "video.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,7 +16,11 @@ bool render_list_recording = false;
 int rl_current_id = 0;
 int rl_shot_attach = 0;
 float rl_current_par_frac = 0.0f;
+int rl_current_par_layer = 0;
+float rl_current_par_anchor = 0.0f;
 float rl_current_par_yfrac = 0.0f;
+int rl_current_par_ybase = 0;
+int rl_current_par_ylayer = 0;
 int rl_current_vel_x = 0, rl_current_vel_y = 0;
 int rl_current_acc_x = 0, rl_current_acc_y = 0;
 
@@ -47,9 +52,13 @@ static RenderCmd *rl_push(void)
 	// Parallax sub-pixel fraction (enemies); finalize fills par_frac_dx from the prev match.
 	c->par_frac = rl_current_par_frac;
 	c->par_frac_dx = 0.0f;
-	// Vertical scroll sub-pixel fraction (scroll-tracked enemies); finalize fills par_yfrac_dy.
+	c->par_layer = (Uint8)rl_current_par_layer;
+	c->par_anchor = rl_current_par_anchor;
+	// Vertical background binding; finalize fills only the entity-local displacement.
+	c->par_ybase = rl_current_par_ybase;
 	c->par_yfrac = rl_current_par_yfrac;
-	c->par_yfrac_dy = 0.0f;
+	c->par_yown100 = 0;
+	c->par_ylayer = (Uint8)rl_current_par_ylayer;
 	// Seed dx/dy from the recorded velocity: rl_finalize keeps it for extrapolating
 	// ids (shots) and overwrites it with the prev/cur diff for the rest.
 	c->dx = rl_current_vel_x;
@@ -70,11 +79,17 @@ void rl_begin_record(void)
 	counts[cur_buf] = 0;
 	rl_current_id = 0;
 	rl_current_par_frac = 0.0f;
+	rl_current_par_layer = 0;
+	rl_current_par_anchor = 0.0f;
 	rl_current_par_yfrac = 0.0f;
+	rl_current_par_ybase = 0;
+	rl_current_par_ylayer = 0;
 	rl_current_vel_x = 0;
 	rl_current_vel_y = 0;
 	rl_current_acc_x = 0;
 	rl_current_acc_y = 0;
+	for (int layer = 1; layer <= 3; ++layer)
+		bg_layer_xofs_valid[layer] = false;
 	render_list_recording = true;
 }
 
@@ -230,6 +245,40 @@ static inline int rl_iround(float v)
 	return (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
 }
 
+static inline int rl_idround(double v)
+{
+	return (int)(v + (v >= 0.0 ? 0.5 : -0.5));
+}
+
+// Round a fractional POSITION offset to the nearest pixel, with exact integer-translation
+// invariance. Unlike round-half-away-from-zero, floor(x + .5) gives the same result after any
+// integer translation; a negative background row and positive enemy therefore cannot separate
+// by 1px merely because the shared fast-scroll phase lands exactly on a half pixel.
+static inline int rl_round_offset(double v)
+{
+	return (int)floor(v + 0.5);
+}
+
+// The one canonical vertical presentation transform for a background layer. Background rows
+// and every bound entity call this same helper, so their shared component cannot diverge through
+// stale command state, different rounding, or an unmatched interpolation id. Layer 3 is RECORDED
+// after its integer advance; replay preserves its authored base step but removes any modifier-added
+// part, then uses the shared lagged fractional clock. `now` remains available for callers that
+// genuinely need the current phase.
+static inline int rl_layer_y_offset(int layer, bool now, float inv, int scale)
+{
+	const float rate = now ? bg_layer_dy_now[layer] : bg_layer_dy[layer];
+	const float frac = now ? bg_layer_yfrac_now[layer] : bg_layer_yfrac[layer];
+	// endlessScrollExtraPx publishes both values in exact hundredths. Recover that fixed-point
+	// representation before subtracting: doing (frac - rate) in float can turn an exact -N.5
+	// endpoint into -N.500000004 under a fast rate, which half-up then rounds one pixel backward.
+	const int rate100 = rl_iround(rate * 100.0f);
+	const int frac100 = rl_iround(frac * 100.0f);
+	const double offset = ((double)frac100 - (double)rate100 * (double)inv) *
+	                      (double)scale / 100.0;
+	return rl_round_offset(offset);
+}
+
 // Wrap a delta into [-m/2, m/2) so background rows interpolate smoothly across the
 // 24px/28px tile wrap instead of snapping. For either-way axes (horizontal scroll).
 static int wrap_delta(int d, int m)
@@ -305,6 +354,13 @@ void rl_finalize(void)
 	for (size_t i = 0; i < ncur; ++i)
 	{
 		RenderCmd *const c = &cur[i];
+		// The player/parallax update occurs halfway through the legacy draw order. Depending on
+		// the z-order flags, a bound enemy can therefore be recorded with the previous anchor
+		// while its background uses the new one (or vice versa). Normalize the display-only
+		// fraction to the anchor the layer actually recorded; x and simulation coordinates stay
+		// untouched, and exact/residual replay ignores this correction.
+		if (c->par_layer >= 1 && c->par_layer <= 3 && bg_layer_xofs_valid[c->par_layer])
+			c->par_frac += bg_layer_xofs[c->par_layer] - c->par_anchor;
 
 		const int id = c->id;
 
@@ -315,6 +371,7 @@ void rl_finalize(void)
 
 		c->dx = 0;
 		c->dy = 0;
+		c->par_yown100 = 0;
 
 		if (id <= 0 || id >= RL_ID_MAX)
 			continue;  // static / untagged: never interpolate
@@ -339,7 +396,25 @@ void rl_finalize(void)
 		// same anchor's (an enemy keeps its layer), so this stays small; the integer part
 		// of the parallax move is already in dx above, so their sum floats the parallax.
 		c->par_frac_dx = c->par_frac - prev[pi].par_frac;
-		c->par_yfrac_dy = c->par_yfrac - prev[pi].par_yfrac;  // vertical scroll sub-pixel (see X)
+
+		// Recover only the entity-local displacement from the phase-corrected endpoints.
+		// The canonical layer rate is deliberately NOT stored in the command: replay applies
+		// it independently, so an unmatched/new/clipped bound sprite still follows its layer.
+		int par_yown100 = 0;
+		bool par_ybound_match = false;
+		if (c->par_ylayer >= 1 && c->par_ylayer <= 3 &&
+		    c->par_ylayer == prev[pi].par_ylayer)
+		{
+			par_ybound_match = true;
+			const int endpoint100 =
+			    ((c->y + c->par_ybase) -
+			     (prev[pi].y + prev[pi].par_ybase)) * 100 +
+			    rl_iround(c->par_yfrac * 100.0f) -
+			    rl_iround(prev[pi].par_yfrac * 100.0f);
+			const int L = c->par_ylayer;
+			const float layer_rate = bg_layer_dy[L];
+			par_yown100 = endpoint100 - rl_iround(layer_rate * 100.0f);
+		}
 
 		if (c->kind == RC_BG_ROW || c->kind == RC_BG_ROW_BLEND)
 		{
@@ -365,15 +440,22 @@ void rl_finalize(void)
 				db = 0;
 			c->filt_dbright = db;
 		}
-		else if (dx > 40 || dx < -40 || dy > 40 || dy < -40)
+		else if (dx > 40 || dx < -40 ||
+		         (par_ybound_match
+		              ? (par_yown100 > 4000 || par_yown100 < -4000)
+		              : (dy > 40 || dy < -40)))
 		{
-			// Large jump => recycled slot or teleport; snap rather than streak.
+			// Large enemy-own jump => recycled slot or teleport; snap rather than streak.
+			// A bound layer may itself legitimately move more than 40px under a speed
+			// modifier, so exclude its canonical rate from this test.
 			dx = 0;
 			dy = 0;
+			par_yown100 = 0;
 		}
 
 		c->dx = dx;
 		c->dy = dy;
+		c->par_yown100 = par_yown100;
 	}
 }
 
@@ -786,12 +868,9 @@ static void rl_replay_common(SDL_Surface *dst, float inv, float alpha, bool appl
 			continue;
 		}
 
-		// Position: EXACT scaled base plus displacements rounded at the render
-		// scale. (Never round a combined float: rl_iround(x - d) != x - rl_iround(d)
-		// at half-pixels, which once caused 1px jitter even at scale 1.) The two
-		// vertical-scroll branches below are the deliberate exception -- there the base
-		// itself jumps by an integer pulse between ticks, so the combined value must be
-		// rounded as one to stay continuous across boundaries (see bg_row Y).
+		// Position: exact scaled integer base plus a rounded displacement. Vertical background
+		// bindings also keep their phase correction split into integer + fractional pieces; this
+		// is required for relative alignment when one sprite is above Y=0 and another below it.
 		int x = c->x * scale, y = c->y * scale;
 		const bool is_ship_id = c->id >= RL_ID_SHIP_BASE && c->id < RL_ID_SIDEKICK_BASE;
 		if (use_override && ship_override_active && is_ship_id)
@@ -887,33 +966,37 @@ static void rl_replay_common(SDL_Surface *dst, float inv, float alpha, bool appl
 				// slow sections then jumps. Mirrors the horizontal parallax above; a byte-exact
 				// no-op (frac 0, integer rate) on full-speed layers. notes.md §Slow-scroll smoothing.
 				//
-				// Round base + offset TOGETHER here (the one place that must, unlike the exact-base
-				// rule at the top of this block). Across a tick boundary the recorded c->y jumps by
-				// the whole-pixel scroll pulse while yfrac compensates fractionally; the true float
-				// position is continuous, but rl_iround is round-half-AWAY-from-zero, which is not
-				// integer-translation-invariant at exactly x.5 -- so rounding only the offset splits
-				// one continuous value two ways and steps the row 1px BACKWARD at the boundary
-				// ("up/down" jitter on fractional rates like 1.5 px/tick). Rounding the combined
-				// value gives an identical result on both sides of every boundary, at any scale.
+				// The integer row and fractional phase are rounded separately with rl_round_offset,
+				// whose half-up rule is integer-translation-invariant. Thus tile-wrap pulses remain
+				// continuous without making negative rows round differently from positive entities.
 				//
-				// Layer 3 records its rows AFTER advancing (draw_background_3), unlike layers 1/2, so
-				// it needs this tick's rate/frac (bg_layer_*_now), not the one-tick-lagged values the
-				// pre-advance layers use -- otherwise layer 3 alone sits one tick out of phase and
-				// jitters against the true motion (visible under a scroll modifier). See tyrian2.c.
+				// Layer 3 is recorded AFTER its integer advance, unlike layers 1/2. The stock 1px
+				// base advance is part of the level's authored placement; only a scroll modifier's
+				// EXTRA pixels are unaccounted for. Remove those extras, then use the same lagged
+				// fractional clock as the bound enemy. Removing nothing leaves BRAINIAC's shootables
+				// behind; removing the complete step puts them 1px ahead. Removing exactly the extra
+				// preserves stock placement at every modifier speed.
 				const int L = c->id - RL_ID_BG_BASE;
-				const float rate  = (L == 3) ? bg_layer_dy_now[L]    : bg_layer_dy[L];
-				const float yfrac = (L == 3) ? bg_layer_yfrac_now[L] : bg_layer_yfrac[L];
-				y = rl_iround((c->y + yfrac - rate * inv) * scale);
+				const int phase_base = (L == 3) ? -endlessScrollExtraPx3 : 0;
+				y = (c->y + phase_base) * scale +
+				    rl_layer_y_offset(L, false, inv, scale);
 			}
-			else if (use_override && (c->par_yfrac != 0.0f || c->par_yfrac_dy != 0.0f))
+			else if (use_override && c->par_ylayer != 0)
 			{
-				// Scroll-tracked entity (enemy / HP bar): fold the integer per-tick scroll
-				// (c->dy) and the sub-pixel fraction into one rounded displacement, like bg_row
-				// above. Rounded separately, the fraction dies at scale 1 and the integer pulse
-				// shows through, so the entity jitters against the smooth background whenever
-				// supersampling is off. c->dy also carries any own velocity. Round base + offset
-				// together (see bg_row) so it stays glued to its layer across tick boundaries.
-				y = rl_iround((c->y + c->par_yfrac - (c->dy + c->par_yfrac_dy) * inv) * scale);
+				// Scroll-tracked entity (enemy / HP bar): apply the canonical layer transform
+				// independently from entity-local movement. The first offset is therefore
+				// bit-identical to the background's even for a new command, a changed multi-blit
+				// count, or a snapped slot. Rounding own motion separately prevents the shared
+				// fast-scroll phase from shifting its rounding threshold by one pixel.
+				const int L = c->par_ylayer;
+				y = (c->y + c->par_ybase) * scale +
+				    rl_layer_y_offset(L, false, inv, scale);
+				if (c->par_yown100 != 0 && inv != 0.0f)
+				{
+					const double own_offset = (double)c->par_yown100 * (double)inv *
+					                          (double)scale / 100.0;
+					y -= rl_idround(own_offset);
+				}
 			}
 			else if (c->dy && inv != 0.0f)
 			{

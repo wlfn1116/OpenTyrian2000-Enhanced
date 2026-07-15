@@ -227,6 +227,14 @@ int enemyBarOpacity  = 75;
    off = classic one present per tick. Gates vt_ship_owns() and the JE_starShowVGA
    interpolation loop (tyrian2.c). */
 bool smoothMotion  = true;
+
+void set_smooth_motion(bool enabled)
+{
+	smoothMotion = enabled;
+	if (!smoothMotion)
+		render_supersample = 1;
+}
+
 /* Bigger explosion "superspark" ring buffer (MAX_SUPERPIXELS) vs the classic 101-spark cap;
    off = the original sparser DOS spark showers. Read by JE_doSP (varz.c). */
 bool extraSparks = true;
@@ -373,10 +381,6 @@ bool load_opentyrian_config(void)
 		if (render_supersample_filter < SS_FILTER_SHARP || render_supersample_filter > SS_FILTER_NONE)
 			render_supersample_filter = SS_FILTER_NONE;
 
-		// Supersampling bypasses scaler algorithms (Scale2x/hqNx) in-game, so force
-		// the same-size plain scaler; the Graphics menu enforces the same rule.
-		if (render_supersample != 1)
-			scaler = scaler_plain_equivalent(scaler);
 	}
 
 	section = config_find_section(config, "keyboard", NULL);
@@ -604,6 +608,12 @@ bool load_opentyrian_config(void)
 		customWeaponEditLevel = 0;
 		customWeaponEditMode = 0;
 	}
+
+	// Smooth Motion owns the sub-pixel render path. Keep it disabled when motion
+	// interpolation is off, then apply the scaler constraint to the final state.
+	set_smooth_motion(smoothMotion);
+	if (render_supersample != 1)
+		scaler = scaler_plain_equivalent(scaler);
 
 	fclose(file);
 

@@ -40,12 +40,6 @@
 JE_word backPos, backPos2, backPos3;
 JE_word backMove, backMove2, backMove3;
 
-// Endless overclock/warp: number of EXTRA scroll sub-steps to apply this sim tick, on top of the
-// normal per-tick scroll. Computed once per tick in tyrian2.c from endlessExtraScrollSteps() and
-// reused by every scroll layer (bg 1 in tyrian2.c, bg 2/3 here) and by the enemy scroll-tracking
-// in JE_drawEnemy, so the whole level fast-forwards in lockstep. 0 when the modifier is inactive.
-int endlessScrollExtraThisTick = 0;
-
 // Endless SMOOTH scroll boost: the extra scroll (px) applied to each background layer this
 // tick, computed once per tick in tyrian2.c via endlessScrollExtraPx() (fractional carry, so
 // the boosted scroll advances by a near-constant px/tick instead of whole `backMove` lumps ->
@@ -71,6 +65,8 @@ float mapXOfs_f, mapX2Ofs_f, mapX3Ofs_f;
 float oldMapXOfs_f, oldMapX3Ofs_f;
 float bg_layer_dx[4]   = { 0.0f, 0.0f, 0.0f, 0.0f };  // index 1..3
 float bg_layer_frac[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+float bg_layer_xofs[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+bool  bg_layer_xofs_valid[4] = { false, false, false, false };
 static float bg_layer_ofs_prev[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
 // VERTICAL counterparts of bg_layer_dx/frac: bg_layer_dy (FLOAT scroll rate) + bg_layer_yfrac
@@ -80,13 +76,10 @@ float bg_layer_yfrac[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 bool  bg_smooth_y_active = false;
 
 // this-tick (non-lagged) vertical scroll rate + sub-pixel fraction per layer [1..3]. bg_layer_dy/
-// bg_layer_yfrac above are lagged one tick to match the BACKGROUND rows of layers 1/2 (recorded
-// PRE-advance). Two things are instead recorded AFTER this tick's scroll advance and need these
-// current values: scroll-tracked ENTITIES (enemies + their HP bars), and background LAYER 3 --
-// draw_background_3 advances backPos3 before drawing, unlike layers 1/2. Fed the lagged values they
-// drift one tick out of phase and jitter 1px against the true motion (worst under a scroll modifier,
-// where the integer scroll steps an extra pixel some ticks). Set in tyrian2.c beside the publish;
-// 0 when no modifier and on full-speed integer-rate layers.
+// bg_layer_yfrac above are lagged one tick to match all entities and the BACKGROUND rows of layers
+// 1/2 (recorded PRE-advance). Background LAYER 3 instead needs the current values because
+// draw_background_3 advances backPos3 before drawing. Set in tyrian2.c beside the publish; 0 when
+// no modifier and on full-speed integer-rate layers.
 float bg_layer_yfrac_now[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 float bg_layer_dy_now[4]    = { 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -100,6 +93,8 @@ static void bg_set_layer_dx(int layer, float cur_f, int cur_int)
 		d = 0.0f;
 	bg_layer_dx[layer] = d;
 	bg_layer_frac[layer] = cur_f - (float)cur_int;
+	bg_layer_xofs[layer] = cur_f;
+	bg_layer_xofs_valid[layer] = true;
 	bg_layer_ofs_prev[layer] = cur_f;
 }
 

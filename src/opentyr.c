@@ -408,8 +408,11 @@ static void adjustMenuItemValue(MenuItemId id, int dir)
 		JE_playSampleNum(S_CURSOR);
 		break;
 	case MENU_ITEM_SUPERSAMPLE:
-		render_supersample = (render_supersample + (int)COUNTOF(supersampleNames) + dir) % (int)COUNTOF(supersampleNames);
-		enforcePlainScalerForSupersample();
+		if (smoothMotion)
+		{
+			render_supersample = (render_supersample + (int)COUNTOF(supersampleNames) + dir) % (int)COUNTOF(supersampleNames);
+			enforcePlainScalerForSupersample();
+		}
 		JE_playSampleNum(S_CURSOR);
 		break;
 	case MENU_ITEM_SS_FILTER:
@@ -485,7 +488,7 @@ static void adjustMenuItemValue(MenuItemId id, int dir)
 		JE_playSampleNum(S_CURSOR);
 		break;
 	case MENU_ITEM_SMOOTH_MOTION:
-		smoothMotion = !smoothMotion;
+		set_smooth_motion(!smoothMotion);
 		JE_playSampleNum(S_CURSOR);
 		break;
 	case MENU_ITEM_EXTRA_SPARKS:
@@ -909,7 +912,8 @@ static bool runOptionsMenu(MenuId startMenu)
 			const int y = yMenuItems + dyMenuItems * i;
 
 			const bool selected = i == *selectedMenuItemIndex;
-			const bool disabled = currentPicker != MENU_ITEM_NONE && !selected;
+			const bool disabled = (currentPicker != MENU_ITEM_NONE && !selected)
+			                   || (menuItem->id == MENU_ITEM_SUPERSAMPLE && !smoothMotion);
 
 			if (selected)
 				yPicker = y;
@@ -1601,6 +1605,12 @@ static bool runOptionsMenu(MenuId startMenu)
 				}
 				case MENU_ITEM_SUPERSAMPLE:
 				{
+					if (!smoothMotion)
+					{
+						JE_playSampleNum(S_SPRING);
+						break;
+					}
+
 					JE_playSampleNum(S_CLICK);
 
 					currentPicker = selectedMenuItemId;
@@ -1741,7 +1751,7 @@ static bool runOptionsMenu(MenuId startMenu)
 				}
 				case MENU_ITEM_SMOOTH_MOTION:
 				{
-					smoothMotion = !smoothMotion;
+					set_smooth_motion(!smoothMotion);
 					JE_playSampleNum(S_CLICK);
 					break;
 				}
@@ -2011,7 +2021,7 @@ static bool runOptionsMenu(MenuId startMenu)
 				}
 				case MENU_ITEM_SUPERSAMPLE:
 				{
-					render_supersample = (int)pickerSelectedIndex;
+					render_supersample = smoothMotion ? (int)pickerSelectedIndex : 1;
 					enforcePlainScalerForSupersample();
 					break;
 				}

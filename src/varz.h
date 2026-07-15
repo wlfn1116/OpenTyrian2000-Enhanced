@@ -95,6 +95,12 @@ struct JE_SingleEnemyType
 	JE_byte     filter;
 	JE_integer  evalue;
 	JE_integer  fixedmovey;
+	// Fractional carry used when a scroll modifier scales fixedmovey. A positive base names
+	// the full-speed layer divisor; -100 names the delay-gated percentage fallback; 0 resets.
+	// carry_move invalidates the carry when eyc changes how much of fixedmovey is scroll-relative.
+	JE_integer  fixedmovey_carry;
+	JE_integer  fixedmovey_carry_base;
+	JE_integer  fixedmovey_carry_move;
 	JE_byte     freq[3]; /* [1..3] */
 	JE_byte     launchwait;
 	JE_word     launchtype;
@@ -107,7 +113,9 @@ struct JE_SingleEnemyType
 	JE_byte     explonum;
 	JE_integer  mapoffset;
 	float       mapoffset_frac;  // sub-pixel part of the parallax anchor, for the smooth-H health bar
-	float       scroll_yfrac;    // sub-pixel part of the vertical scroll anchor, for the smooth-V health bar
+	JE_integer  scroll_ybase;    // whole-pixel draw-phase correction for the smooth-V health bar
+	float       scroll_yfrac;    // fractional vertical layer phase for the smooth-V health bar
+	JE_byte     scroll_ylayer;   // vertical background binding (0=none, 1..3=layer)
 	JE_boolean  scoreitem;
 
 	JE_boolean  special;

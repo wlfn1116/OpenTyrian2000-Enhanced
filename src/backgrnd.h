@@ -27,7 +27,6 @@
 
 extern JE_word backPos, backPos2, backPos3;
 extern JE_word backMove, backMove2, backMove3;
-extern int endlessScrollExtraThisTick;  // extra scroll sub-steps this tick (endless overclock); see backgrnd.c
 // Endless SMOOTH scroll boost: per-layer extra scroll px this tick (fractional carry). Set
 // once/tick in tyrian2.c; makes the boosted scroll advance smoothly instead of in whole
 // backMove lumps. See backgrnd.c and endlessScrollExtraPx() (endless.c).
@@ -53,15 +52,19 @@ extern float mapXOfs_f, mapX2Ofs_f, mapX3Ofs_f;
 extern float oldMapXOfs_f, oldMapX3Ofs_f;  // un-floored mirrors of oldMapXOfs / oldMapX3Ofs
 extern float bg_layer_dx[4], bg_layer_frac[4];
 
+// Absolute horizontal anchor actually used when each background layer was recorded this tick.
+// Bound entities can be drawn on the other side of the mid-frame parallax update, so the render
+// list normalizes them to this anchor during finalize. valid[] is reset by rl_begin_record.
+extern float bg_layer_xofs[4];
+extern bool bg_layer_xofs_valid[4];
+
 // Vertical scroll smoothing: bg_layer_dy (FLOAT average scroll rate) + bg_layer_yfrac (sub-pixel
 // remainder) per layer, gated by bg_smooth_y_active. notes.md §Slow-scroll smoothing.
 extern float bg_layer_dy[4], bg_layer_yfrac[4];
 extern bool bg_smooth_y_active;
-// this-tick (non-lagged) scroll rate + sub-pixel fraction. Used by things recorded AFTER their
-// scroll advance: scroll-tracked ENTITIES (enemies + HP bars), AND background LAYER 3, which
-// (unlike layers 1/2) advances backPos3 before it records its rows (draw_background_3). The lagged
-// bg_layer_dy/bg_layer_yfrac match the pre-advance layers 1/2; layer 3 needs these this-tick values
-// or its rows drift one tick out of phase and jitter. See backgrnd.c / tyrian2.c.
+// this-tick (non-lagged) scroll rate + sub-pixel fraction. Layer 3 alone uses these because it
+// advances backPos3 before recording its rows (draw_background_3). All enemy banks retain their
+// common pre-advance authored phase and use the lagged values above. See backgrnd.c / tyrian2.c.
 extern float bg_layer_yfrac_now[4], bg_layer_dy_now[4];
 
 extern JE_word mapX, mapY, mapX2, mapX3, mapY2, mapY3;

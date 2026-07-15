@@ -1470,7 +1470,7 @@ float endlessGravityDriftX(void) { return endlessGravityDrift() * endlessGravity
 float endlessGravityDriftY(void) { return endlessGravityDrift() * endlessGravityDirY; }
 
 // Classic (non-VT) path: integer px/tick per axis that tracks the (fractional) drift. Each axis carries
-// its own sub-pixel remainder between ticks (like endlessExtraScrollSteps) so the integer nudge averages
+// its own sub-pixel remainder between ticks so the integer nudge averages
 // out to exactly the scaled drift, whatever the zone -- not a fixed 1/2 wobble. (int) truncates toward
 // zero, so a negative component -- an omni well pulling up/left -- carries correctly too.
 int endlessGravityPullX(void)
@@ -1745,37 +1745,24 @@ void endlessPerkSetOwned(int id, int n)
 	endlessPerkOwned[id] = (JE_byte)n;
 }
 
-// OVERCLOCK / SLIPSTREAM: extra layer-1 scroll steps this tick, as a smooth fractional
-// accumulator rate (notes.md §Endless scroll boost).
-int endlessExtraScrollSteps(void)
+// Single source of truth for the scroll multiplier. Bound fixed-motion scripts use this too,
+// while sky/local scripts deliberately do not. notes.md §Endless scroll boost.
+int endlessScrollBoostPercent(void)
 {
-	static int accum = 0;
-	int boost = 0;
-	if (endlessMode)
-	{
-		if (endlessActiveMods & (ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_WARP))
-			boost = 220;             // "much faster" -- the level blurs past
-		else if (endlessActiveMods & (ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SLIPSTREAM))
-			boost = 70;              // +70% scroll pace
-	}
-	if (boost == 0)
-	{
-		accum = 0;
+	if (!endlessMode)
 		return 0;
-	}
-	accum += boost;
-	int steps = accum / 100;
-	accum -= steps * 100;
-	return steps;
+	if (endlessActiveMods & (ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_WARP))
+		return 220;
+	if (endlessActiveMods & (ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SLIPSTREAM))
+		return 70;
+	return 0;
 }
 
 // True while a scroll-speed modifier is active -- STABLE across ticks, unlike the fractional
 // step count, so the bg bottom-margin gate can't flicker (notes.md §Endless scroll boost).
 bool endlessScrollBoostActive(void)
 {
-	return endlessMode &&
-	       (endlessActiveMods & (ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SLIPSTREAM |
-	                             ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_WARP)) != 0;
+	return endlessScrollBoostPercent() != 0;
 }
 
 // Smooth vertical scroll for ONE layer: outputs the constant display rate + sub-pixel fraction, and
@@ -1792,14 +1779,7 @@ int endlessScrollExtraPx(int channel, int fireStep, int delayMax, int baseThisTi
 		*fracOut = 0.0f;
 	if (channel < 0 || channel > 2)
 		return 0;
-	int boost = 0;
-	if (endlessMode)
-	{
-		if (endlessActiveMods & (ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_WARP))
-			boost = 220;                 // "much faster" -- the level blurs past
-		else if (endlessActiveMods & (ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SLIPSTREAM))
-			boost = 70;                  // +70% scroll pace
-	}
+	const int boost = endlessScrollBoostPercent();
 	if (fireStep <= 0)  // the layer isn't scrolling this section
 	{
 		carry[channel] = 0;

@@ -102,19 +102,41 @@ passes and two buffers:
   (`bg_layer_dx`/`bg_layer_frac`). Rows are replayed at recorded x plus
   `(frac - dx*inv)`; float endpoints make the pan continuous across tick
   boundaries while still tracking the ticks enemies anchor to.
+- The legacy z-order can put a layer and its bound enemies on opposite sides of
+  `JE_mainGamePlayerFunctions`, which also recalculates horizontal parallax. The
+  entity may therefore carry the previous anchor while its layer carries the new
+  one (or vice versa), becoming 1px misaligned at integer crossings. Finalization
+  normalizes tagged enemy sprites and HP bars to the absolute anchor their layer
+  actually recorded; simulation and exact/residual replay retain their original
+  integer coordinates.
 - Vertical: the same idea via `bg_layer_dy`/`yfrac`. An integer per-tick scroll
   can't express a fractional rate (3.2 → 3,3,3,4 velocity pulse that looks like
   speeding up and slowing down); the float rate makes the displayed velocity
   constant. The published rate lags one tick, matching how `bgScrollDeltaY` is a
   draw-time position diff. Applies to every level — see §Slow-scroll smoothing.
-- Scroll-tracked enemies must fold the integer scroll and the sub-pixel fraction
-  into one rounded displacement. Rounding them separately loses the fraction at
-  scale 1 (it rounds to 0) and the enemy jitters against the smooth background
-  whenever supersampling is off.
-- Enemy sprite and HP bar use different fracs: the sprite is drawn before the
-  `ey` scroll advance (lagged frac), the bar after it (this-tick frac). Feeding
-  either the wrong one makes it jump 1px on the ticks the integer scroll steps an
-  extra pixel.
+- Keep a vertically bound command's whole-pixel draw-phase correction separate
+  from the layer's fractional phase. Replay adds the whole part exactly and rounds
+  only the shared fractional offset with `floor(x + .5)`. Rounding the combined
+  absolute coordinate half-away-from-zero is not translation-invariant: a
+  negative background row and positive enemy choose opposite pixels at exactly
+  `.5`, producing the scale-1-only 1px mismatch under fractional fast scroll.
+- Every enemy bank is authored and recorded at a common pre-advance phase; HP bars
+  are recorded after each enemy advance and receive the inverse whole-pixel correction.
+  Layer 3 terrain is the sole draw-order exception: it is recorded post-advance, so
+  replay preserves its authored base step, subtracts only the modifier-added pixels,
+  and applies the bound entities' lagged fractional phase. This keeps the shipped
+  placement while preventing the offset from growing with scroll speed (BRAINIAC).
+- Finalization canonicalizes the bound part of an enemy's vertical displacement
+  to the exact float layer rate. Replay applies that layer transform independently
+  on every bound command, including new, clipped-count-changed, and snapped commands;
+  only enemy-local motion comes from cross-tick matching. The two components are
+  rounded separately so the layer phase cannot inject a 1px error into local motion,
+  and the large-jump guard tests only local motion rather than rejecting a legitimate
+  high-speed layer delta.
+- The smooth-scroll accumulator is quantized in hundredths. Replay reconstructs those
+  integer hundredths and evaluates the canonical layer offset in double precision;
+  subtracting a large rate directly in `float` can turn an exact `-N.5` tick endpoint
+  into `-N.500000004` and round it one pixel backward.
 
 ### Slow-scroll smoothing — `endless.c`, `tyrian2.c`, `render_list.c`
 
@@ -135,9 +157,8 @@ so the sim scroll (and demos, collision, events) stays byte-identical to stock.
 - `fireStep` is the per-fire step, not the live `backMove` (the delay gate has
   already forced that to 0 on off-ticks): `(delayMax>1 && backMove<2) ? 1 :
   backMove`. Feeding the forced value makes `Σ(target − base)` drift.
-- Byte-exact no-op on full-speed layers: an integer rate gives `frac == 0`, and
-  `rl_iround` is symmetric (`round(−x) == −round(x)`), so the float path equals
-  the old integer path exactly — no regression, no new 1x jitter. At 1x a
+- Byte-exact no-op on full-speed layers: an integer rate gives `frac == 0`, so
+  the float path equals the old integer path exactly — no regression, no new 1x jitter. At 1x a
   fractional layer still steps 1px per N ticks, but now at the correct sub-pixel
   phase and in lockstep with its scroll-tracked enemies (they read the same
   `bg_layer_yfrac`), instead of all freezing then jumping together.
@@ -158,6 +179,31 @@ layers 1/2/3. `rateOut`/`fracOut` expose the smooth float rate and sub-pixel
 remainder for the render-list vertical interpolation. With no modifier the same
 call runs at boost 0, returning 0 extra px and only the base-rate rate/frac
 (§Slow-scroll smoothing).
+
+`fixedmovey` has mixed level-script semantics. Sky formations use it as local
+motion and leave it unscaled; layer-bound enemies use it to modify (often exactly
+cancel) their normal layer advance. An opposing `fixedmovey`/`eyc` pair first
+cancels at stock speed (BRAINIAC uses -1/+1); only the remaining fixed component
+is scroll-relative. That residual is scaled directly from the batch's actual
+`tempBackMove + tempScrollExtraPx`, with a signed per-enemy carry for non-integral
+ratios. A residual `fixedmovey == -baseStep` object thus cancels every boosted
+pixel exactly, while an already-cancelled pair cannot acquire speed-dependent
+drift. Delay-gated sections use the same modifier percentage with a carry because
+stock `fixedmovey` runs even on gate-off ticks.
+The removed `endlessExtraScrollSteps` path used an independent pulse phase, so
+its average was right but individual ticks increasingly separated objects from
+their layer at higher modifiers.
+
+Event-time spawn phase needs the same treatment. Level events are keyed to
+layer 1's integer `curLoc`; a boosted tick can cross several event coordinates,
+so the next tick may first process a spawn with `curLoc > eventtime`. Without a
+catch-up, only the records on skipped coordinates start one or more pixels behind
+their terrain (AST CITY exposes this densely). `tyrian2.c` retains the exact
+layer-1 interval and layer-3 delta crossed by the preceding tick, then advances a
+new bound enemy through the missed fraction of its layer plus its own `eyc` and
+scaled `fixedmovey`. This also preserves fixed-motion cancellation in BRAINIAC.
+Sky slots are deliberately excluded, as they are not vertically layer-bound;
+event jumps and `forceEvents` timeline-only increments invalidate the catch-up.
 
 ### Other render-rate presents
 

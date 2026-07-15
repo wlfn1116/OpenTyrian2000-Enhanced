@@ -18,6 +18,7 @@
  */
 #include "video.h"
 
+#include "config.h"
 #include "keyboard.h"
 #include "mouse.h"
 #include "opentyr.h"
@@ -61,6 +62,9 @@ static void update_native_scaler_dims(void);
 // pixel — the present pass averages the slight overshoot back down to exact size.
 int effective_supersample(void)
 {
+	if (!smoothMotion)
+		return 1;
+
 #ifdef __vita__
 	// The Vita GPU can't sustain the NxN sub-pixel present (render at N* then downscale). Force
 	// 1x: Smooth Motion's render-rate interpolation still runs (even ship/background motion at
