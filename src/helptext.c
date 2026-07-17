@@ -80,7 +80,7 @@ char shipInfo[HELPTEXT_SHIPINFO_COUNT][2][256];                          /* [1..
 char licensingInfo[3][46];                                               /* [1..3] of string */
 char orderingInfo[6][32];                                                /* [1..6] of string */
 char superTyrianText[6][64];                                             /* [1..6] of string */
-char menuInt[MENU_MAX+1][14][18];                                        /* [0..18][0..13] of string[17]; 14 rows (was 11) for the expanded endless E-Shop */
+char menuInt[MENU_MAX+1][14][24];                                        /* [0..18][0..13] of string[23]; 14 rows (was 11) + 24-byte labels (was 18) for the endless E-Shop */
 
 static void decrypt_string(char *s, size_t len)
 {

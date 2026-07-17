@@ -75,6 +75,12 @@ enum
 	MENU_PERKS = 17,  // endless perk pick: forced 1-of-3 (+ decline) gate before the buy/sell front menu
 };
 
+// Horizontal centre of the monitor window's readout slot (the panel under the map, y173). Both the
+// shop cash total and the endless course RANK are centred on this x (value 77). The slot is
+// asymmetric -- the corner bulb eats its right end -- so this is the window centre, not the slot
+// midpoint. See JE_drawEndlessCourseMods (ENDLESS_RANK_CX) and notes.md §Menus & shop.
+#define MENU_MONITOR_CENTER_X 77
+
 /*** Structs ***/
 struct cube_struct
 {
@@ -614,23 +620,23 @@ static void configure_endless_shop_menu(void)
 		SDL_strlcpy(menuInt[1][1], "E-Shop", sizeof(menuInt[1][1]));
 		SDL_strlcpy(menuInt[1][2], "Perks", sizeof(menuInt[1][2]));
 
-		// E-Shop submenu (menuInt row MENU_ESHOP+1): title, 5 buys, Done. Names only -- the
+		// E-Shop submenu (menuInt row MENU_ESHOP+1): title, 11 buys, Done. Names only -- the
 		// exact cost of each buy is shown in the help line at the bottom (see the help block).
-		char (*e)[18] = menuInt[MENU_ESHOP + 1];
-		SDL_strlcpy(e[0], "E-Shop", sizeof(e[0]));
-		// Ordered cheapest -> most expensive by base price (Reroll 500, Bomb 800, Reinforce 1500,
-		// Sabotage 2500, Special 25%, Extra Perk 4000, Turbo 50%, Overblast 75%, Overdrive 95%,
-		// Revive 10000), EXCEPT Gamble is pinned LAST (right before Done) by request.
-		SDL_strlcpy(e[1], "Buy Reroll", sizeof(e[1]));
-		SDL_strlcpy(e[2], endlessBombFull() ? "Bombs Full" : "Buy Bomb", sizeof(e[2]));
+		char (*e)[24] = menuInt[MENU_ESHOP + 1];
+		SDL_strlcpy(e[0], "Endless Shop", sizeof(e[0]));
+		// Grouped by category so same-colour rows sit together (see endless_eshop_row_bank):
+		// neutral shop actions (Reroll, Sabotage), upgrades (Reinforce, Extra Perk), the weapon,
+		// the three kill-fire buffs, the consumables (Revive, Bomb), then Gamble last before Done.
+		SDL_strlcpy(e[1], "Buy Shop Reroll", sizeof(e[1]));
+		SDL_strlcpy(e[2], "Buy Sector Sabotage", sizeof(e[2]));
 		SDL_strlcpy(e[3], endlessHullMaxed() ? "Hull Maxed" : "Buy Reinforce", sizeof(e[3]));
-		SDL_strlcpy(e[4], "Buy Sabotage", sizeof(e[4]));
-		SDL_strlcpy(e[5], "Buy Special", sizeof(e[5]));
-		SDL_strlcpy(e[6], "Buy Extra Perk", sizeof(e[6]));
-		SDL_strlcpy(e[7], endlessBuffKindBought() == 1 ? "Turbodrive ON" : "Buy Turbodrive", sizeof(e[7]));
-		SDL_strlcpy(e[8], endlessBuffKindBought() == 3 ? "Overblast ON" : "Buy Overblast", sizeof(e[8]));
-		SDL_strlcpy(e[9], endlessBuffKindBought() == 2 ? "Overdrive ON" : "Buy Overdrive", sizeof(e[9]));
-		SDL_strlcpy(e[10], endlessReviveArmed() ? "Revive Ready" : "Buy Revive", sizeof(e[10]));
+		SDL_strlcpy(e[4], "Buy Extra Perk", sizeof(e[4]));
+		SDL_strlcpy(e[5], "Buy Special Weapon", sizeof(e[5]));
+		SDL_strlcpy(e[6], endlessBuffKindBought() == 1 ? "Turbodrive ON" : "Buy Turbodrive", sizeof(e[6]));
+		SDL_strlcpy(e[7], endlessBuffKindBought() == 3 ? "Overblast ON" : "Buy Overblast", sizeof(e[7]));
+		SDL_strlcpy(e[8], endlessBuffKindBought() == 2 ? "Overdrive ON" : "Buy Overdrive", sizeof(e[8]));
+		SDL_strlcpy(e[9], endlessReviveArmed() ? "Revive Ready" : "Buy Revive", sizeof(e[9]));
+		SDL_strlcpy(e[10], endlessBombFull() ? "Bombs Full" : "Buy Bomb", sizeof(e[10]));
 		SDL_strlcpy(e[11], "Buy Gamble", sizeof(e[11]));
 		SDL_strlcpy(e[12], "Done", sizeof(e[12]));
 		menuChoices[MENU_ESHOP] = 13;
@@ -647,7 +653,7 @@ static void configure_endless_shop_menu(void)
  * The exact perk effect + owned count shows in the help line; the decline cash is there too. */
 static void configure_endless_perk_menu(void)
 {
-	char (*p)[18] = menuInt[MENU_PERKS + 1];
+	char (*p)[24] = menuInt[MENU_PERKS + 1];
 	const int n = endlessPerkChoiceCount();
 
 	SDL_strlcpy(p[0], "Choose a Perk", sizeof(p[0]));
@@ -1469,24 +1475,39 @@ void JE_itemScreen(void)
 				char buf[20];
 
 				snprintf(buf, sizeof buf, "%lu", player[0].cash);
-				JE_textShade(VGAScreen, 65, 173, buf, 1, 6, DARKEN);
+				// Centre the cash total in the monitor slot, matching the endless course RANK readout
+				// (same slot, same row) instead of growing rightward from a fixed left edge.
+				// y172: DARKEN draws the body at y+1, so this lands on row 173 -- level with the RANK.
+				JE_textShade(VGAScreen, MENU_MONITOR_CENTER_X - JE_textWidth(buf, TINY_FONT) / 2, 172, buf, 1, 6, DARKEN);
 			}
+			// Rollover tier colours: when a gauge overruns one bar-row it overdraws the leading
+			// bars in the next bank, so it tiers by colour instead of marching off the panel.
+			// Shared by the armour (endless) and shield bars below. Layer colours tunable.
+			static const int shopBarRolloverCol[] = { 14, 30, 46, 62, 78, 94, 110, 126 };
 			if (endlessMode)
 			{
-				// Reinforced hull exceeds the classic 28-armour bar; draw it as colour-coded
-				// rollover rows (same 28-per-layer rollover as the in-game HUD armour bar) so it
-				// can't march off the panel into the shield gauge. Layer colours tunable.
-				static const int shopArmorLayerCol[] = { 14, 30, 46, 62, 78, 94, 110, 126 };
+				// Reinforced hull exceeds the classic 28-armour bar; roll it over 28 units per
+				// layer (same rollover as the in-game HUD armour bar).
 				int a = player[0].armor;
-				for (int L = 0; a > 0 && L < (int)COUNTOF(shopArmorLayerCol); ++L)
+				for (int L = 0; a > 0 && L < (int)COUNTOF(shopBarRolloverCol); ++L)
 				{
-					JE_barDrawShadow(VGAScreen, 42, 152, 3, shopArmorLayerCol[L], (a > 28) ? 28 : a, 2, 13);
+					JE_barDrawShadow(VGAScreen, 42, 152, 3, shopBarRolloverCol[L], (a > 28) ? 28 : a, 2, 13);
 					a -= 28;
 				}
 			}
 			else
 				JE_barDrawShadow(VGAScreen, 42, 152, 3, 14, player[0].armor, 2, 13);
-			JE_barDrawShadow(VGAScreen, 104, 152, 2, 14, shields[player[0].items.shield].mpwr * 2, 2, 13);
+			// HXS Class B/C shields reach 12/14 bars -- past the 10-bar gauge width. Roll the shield
+			// bar over at 10 bars (20 amt at res 2) per layer, matching the armour bar. mpwr <= 10
+			// draws a single layer, byte-identical to before.
+			{
+				int s = shields[player[0].items.shield].mpwr * 2;
+				for (int L = 0; s > 0 && L < (int)COUNTOF(shopBarRolloverCol); ++L)
+				{
+					JE_barDrawShadow(VGAScreen, 104, 152, 2, shopBarRolloverCol[L], (s > 20) ? 20 : s, 2, 13);
+					s -= 20;
+				}
+			}
 		}
 
 		/* Draw crap on the left side of the screen, i.e. two player scores, ship graphic, etc. */
@@ -3036,6 +3057,23 @@ void JE_drawMenuHeader(void)
 	JE_dString(VGAScreen, 74 + JE_fontCenter(tempStr, FONT_SHAPES), 10, tempStr, FONT_SHAPES);
 }
 
+// Endless E-Shop: tint each buy row by WHAT IT IS, so related purchases share a colour and the
+// player can read the menu at a glance. Banks are palette-1 (the shop palette; see notes.md
+// "Menus & shop"): 12=green, 8=cyan, 4=red, 5=purple, 7=fiery red->yellow, 15=default gold. Keyed
+// by menu row x (== curSel[MENU_ESHOP]); the row order is fixed in configure_endless_shop_menu().
+static unsigned int endless_eshop_row_bank(JE_byte x)
+{
+	switch (x)
+	{
+	case 7: case 8: case 9:  return 12;  // Turbodrive / Overblast / Overdrive -- kill-fire BUFFS (green)
+	case 4: case 5:          return  8;  // Reinforce / Extra Perk             -- permanent UPGRADES (cyan)
+	case 6:                  return  4;  // Special Weapon                     -- OFFENSE (red)
+	case 10: case 11:        return  5;  // Revive / Bomb                      -- held CONSUMABLES (purple)
+	case 12:                 return  7;  // Gamble                             -- RISK (fiery red/yellow)
+	default:                 return 15;  // Reroll / Sabotage / Done           -- neutral shop actions (gold)
+	}
+}
+
 void JE_drawMenuChoices(void)
 {
 	JE_byte x;
@@ -3124,7 +3162,9 @@ void JE_drawMenuChoices(void)
 		{
 			// Same buy/sell menu, small font: the shape font has no smaller size, so draw the rows
 			// in TINY_FONT (perk list + endless E-Shop). The leading '~' still toggles the highlight.
-			JE_outTextAndDarken(VGAScreen, text_x, tempY, str, 15, 2, TINY_FONT);
+			// E-Shop rows are tinted by category (endless_eshop_row_bank); the perk list stays gold.
+			unsigned int bank = (curMenu == MENU_ESHOP) ? endless_eshop_row_bank(x) : 15;
+			JE_outTextAndDarken(VGAScreen, text_x, tempY, str, bank, 2, TINY_FONT);
 		}
 		else
 		{
@@ -3156,9 +3196,9 @@ void JE_drawMenuChoices(void)
 #define ENDLESS_MODS_ROW_H      9
 
 // Danger-grade slot under the map. The slot is asymmetric (the corner bulb eats its right end), so
-// centre on the monitor window's centre (x77), not the slot midpoint, and every rank lines up.
-// notes.md §Menus & shop.
-#define ENDLESS_RANK_CX        77
+// centre on the monitor window's centre (MENU_MONITOR_CENTER_X), not the slot midpoint, and every
+// rank lines up -- the same slot/centre the shop cash total uses. notes.md §Menus & shop.
+#define ENDLESS_RANK_CX        MENU_MONITOR_CENTER_X
 #define ENDLESS_RANK_Y        173   // endlessModText draws the body AT this row (no +1 like DARKEN)
 
 // Rank-letter tint, 0 (F) .. 9 (S+++): a green-to-red ramp -- greens in palette-18 bank 8, the
@@ -3789,7 +3829,7 @@ void JE_drawMainMenuHelpText(void)
 					snprintf(costStr, sizeof(costStr), "$%d", endlessHullPrice());
 				}
 				break;
-			case 8:
+			case 7:
 				if (endlessBuffKindBought() == 1)
 					SDL_strlcpy(tempStr, "Turbodrive active for next sector.", sizeof(tempStr));
 				else if (endlessBuffKindBought() != 0)
@@ -3802,7 +3842,7 @@ void JE_drawMainMenuHelpText(void)
 					snprintf(costStr, sizeof(costStr), "$%ld", endlessTurbodrivePrice());
 				}
 				break;
-			case 9:
+			case 8:
 				if (endlessBuffKindBought() == 3)
 					SDL_strlcpy(tempStr, "Overblast active for next sector.", sizeof(tempStr));
 				else if (endlessBuffKindBought() != 0)
@@ -3815,7 +3855,7 @@ void JE_drawMainMenuHelpText(void)
 					snprintf(costStr, sizeof(costStr), "$%ld", endlessOverblastPrice());
 				}
 				break;
-			case 10:
+			case 9:
 				if (endlessBuffKindBought() == 2)
 					SDL_strlcpy(tempStr, "Overdrive active for next sector.", sizeof(tempStr));
 				else if (endlessBuffKindBought() != 0)
@@ -3824,7 +3864,7 @@ void JE_drawMainMenuHelpText(void)
 					snprintf(tempStr, sizeof(tempStr), "Drives recharge in %d sector(s).", endlessBuffCooldownLeft());
 				else
 				{
-					SDL_strlcpy(tempStr, "Turbodrive + stacking fire/damage.", sizeof(tempStr));
+					SDL_strlcpy(tempStr, "Turbodrive + Overblast together.", sizeof(tempStr));
 					snprintf(costStr, sizeof(costStr), "$%ld", endlessOverdrivePrice());
 				}
 				break;
@@ -3835,7 +3875,7 @@ void JE_drawMainMenuHelpText(void)
 					SDL_strlcpy(tempStr, "Buy a random special weapon.", sizeof(tempStr));
 				snprintf(costStr, sizeof(costStr), "$%ld", endlessSpecialPrice());
 				break;
-			case 3:  // Buy Bomb
+			case 11:  // Buy Bomb
 				if (endlessBombFull())
 					SDL_strlcpy(tempStr, "Bomb stockpile is full (10).", sizeof(tempStr));
 				else
@@ -3844,7 +3884,7 @@ void JE_drawMainMenuHelpText(void)
 					snprintf(costStr, sizeof(costStr), "$%ld", endlessBombPrice());
 				}
 				break;
-			case 11:  // Revive Token
+			case 10:  // Revive Token
 				if (endlessReviveArmed())
 					SDL_strlcpy(tempStr, "A revive is armed - survive one death.", sizeof(tempStr));
 				else
@@ -3853,11 +3893,11 @@ void JE_drawMainMenuHelpText(void)
 					snprintf(costStr, sizeof(costStr), "$%ld", endlessRevivePrice());
 				}
 				break;
-			case 7:  // Extra Perk
+			case 5:  // Extra Perk
 				SDL_strlcpy(tempStr, "Pick a bonus perk now.", sizeof(tempStr));
 				snprintf(costStr, sizeof(costStr), "$%ld", endlessExtraPerkPrice());
 				break;
-			case 5:  // Sabotage Sector
+			case 3:  // Sabotage Sector
 				if (endlessCleanseCharges() > 0)
 					snprintf(tempStr, sizeof(tempStr), "%d strip(s) queued.  Buy more:", endlessCleanseCharges());
 				else
@@ -7007,7 +7047,7 @@ void JE_menuFunction(JE_byte select)
 		{
 			curMenu = MENU_FULL_GAME;
 		}
-		else if (select == 7)  // Extra Perk: charge, then open the perk PICK menu to choose one
+		else if (select == 5)  // Extra Perk: charge, then open the perk PICK menu to choose one
 		{
 			if (endlessTryBuyExtraPerk())
 			{
@@ -7024,17 +7064,17 @@ void JE_menuFunction(JE_byte select)
 		else
 		{
 			bool bought = false;
-			switch (select)  // order matches the labels in configure_endless_shop_menu (Gamble pinned last)
+			switch (select)  // Extra Perk (5) handled above; order matches configure_endless_shop_menu
 			{
 			case 2: bought = endlessTryReroll();          break;  // reroll the shop stock
-			case 3: bought = endlessTryBuyBomb();         break;  // +1 superbomb (cap 10)
+			case 3: bought = endlessTryBuyCleanse();      break;  // sabotage: strip the next sector's worst mod
 			case 4: bought = endlessTryReinforce();       break;  // +max armor (run-persistent)
-			case 5: bought = endlessTryBuyCleanse();      break;  // sabotage: strip the next sector's worst mod
 			case 6: bought = endlessTryBuySpecial();      break;  // random special weapon
-			case 8: bought = endlessTryBuyTurbodrive();  break;  // Turbodrive (kill-fire boost)
-			case 9: bought = endlessTryBuyOverblast();    break;  // Overblast (damage-only stacks)
-			case 10: bought = endlessTryBuyOverdrive();   break;  // Overdrive (+ escalating fire+damage stacks)
-			case 11: bought = endlessTryBuyRevive();      break;  // one-shot revive token
+			case 7: bought = endlessTryBuyTurbodrive();  break;  // Turbodrive (kill-fire boost)
+			case 8: bought = endlessTryBuyOverblast();    break;  // Overblast (damage-only stacks)
+			case 9: bought = endlessTryBuyOverdrive();   break;  // Overdrive (+ escalating fire+damage stacks)
+			case 10: bought = endlessTryBuyRevive();      break;  // one-shot revive token
+			case 11: bought = endlessTryBuyBomb();         break;  // +1 superbomb (cap 10)
 			case 12: bought = endlessTryGamble();         break;  // random good/bad outcome (pinned last)
 			}
 			JE_playSampleNum(bought ? S_SELECT : S_SPRING);

@@ -318,7 +318,7 @@ enum {
 };
 
 typedef struct {
-	const char *name;      // menu label (<= 17 chars, menuInt width)
+	const char *name;      // menu label (<= 23 chars, menuInt width)
 	const char *desc;      // help-line description
 	JE_byte     maxStack;  // how many times it can be taken
 } EndlessPerk;
@@ -2368,7 +2368,7 @@ enum {
 };
 static const char *const endlessGambleOutcomeNames[EGO_COUNT] = {
 	"Jackpot (+5x)", "Win (+2x)", "Revive token", "Free perk pick", "Hull tier +", "Overclock gun +1", "Special weapon",
-	"Arsenal (max bombs)", "Second wind (heal)", "Blood money", "Overblast next", "Overcharge next", "Merchant Favor", "Golden Touch",
+	"Arsenal (max bombs)", "Second wind (heal)", "Blood money", "Overblast next", "Overcharged next", "Merchant Favor", "Golden Touch",
 	"Double or Nothing", "Refund fee", "Nothing (house wins)",
 	"Loan Shark (+tax)", "Nitro deal", "Overheat deal", "Glass Cannon",
 	"Meltdown (gun -1)", "Sticky Fingers", "Rustbucket", "Amnesia (-perk)", "Dud Arsenal",
@@ -2442,7 +2442,7 @@ static void endlessApplyGambleOutcome(int id, long cost)
 		break;
 	case EGO_OVERCHARGE:
 		endlessPurchasedMods |= ENDLESS_MOD_OVERCHARGE;
-		SDL_strlcpy(endlessGambleMsg, "Overcharge next sector!", sizeof endlessGambleMsg);
+		SDL_strlcpy(endlessGambleMsg, "Overcharged next sector!", sizeof endlessGambleMsg);
 		break;
 	case EGO_FAVOR:
 		endlessPurchasedMods |= ENDLESS_MOD_FAVOR;

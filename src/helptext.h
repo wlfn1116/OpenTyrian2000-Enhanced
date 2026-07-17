@@ -70,7 +70,7 @@ extern char shipInfo[HELPTEXT_SHIPINFO_COUNT][2][256];
 extern char licensingInfo[3][46];
 extern char orderingInfo[6][32];
 extern char superTyrianText[6][64];
-extern char menuInt[MENU_MAX+1][14][18];  // 14 rows/menu (was 11) for the expanded endless E-Shop list
+extern char menuInt[MENU_MAX+1][14][24];  // 14 rows/menu (was 11) + 24-byte labels (was 18) for the expanded endless E-Shop
 
 void read_encrypted_pascal_string(char *s, size_t size, FILE *f);
 void skip_pascal_string(FILE *f);

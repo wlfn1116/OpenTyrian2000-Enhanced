@@ -471,6 +471,17 @@ mutable `last`, so a Quit-Level retry replays the same track.
   (`menuInt[MENU_ESHOP+1]`) are re-applied after every buy so prices stay live.
   The Perks entry reuses MENU_PERKS as a read-only scrolling list rendered from
   `perkListId[]`.
+- E-Shop rows are tinted by category so related buys share a hue
+  (`endless_eshop_row_bank` in `JE_drawMenuChoices`, keyed by row x ==
+  `curSel[MENU_ESHOP]`): buffs Turbodrive/Overblast/Overdrive = green (bank 12),
+  Reinforce/Extra-Perk = cyan (8), Special Weapon = red (4), Bomb/Revive = purple
+  (5), Gamble = fiery red→yellow (7), Reroll/Sabotage/Done = default gold (15).
+  Only `curMenu == MENU_ESHOP` is recoloured; the perk list stays gold. Measured
+  palette-1 (shop `colors`) bank hues, TINY_FONT body ≈ shade 9: 0 grey, 1 tan/gold
+  (cash), 2 olive-green, 3 steel-blue, 4 red/salmon, 5 muted-purple, 6 blue-grey,
+  7 red→orange→yellow (vivid, also HP/boss-bar bank), 8 light-cyan, 9 pure-blue
+  (dark low shades — avoid on the dark list bg), 10/11/14 tan/brown, 12 vivid
+  green, 13 muted-teal, 15 red→gold (the default menu-text ramp).
 - Chart-a-Course text plumbing: the danger RANK label centres on the monitor
   window's centre (x=77, under the map), not the asymmetric slot midpoint, so
   every rank width lines up. `endlessModText` draws its own 8-direction outline
