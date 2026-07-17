@@ -1480,33 +1480,30 @@ void JE_itemScreen(void)
 				// y172: DARKEN draws the body at y+1, so this lands on row 173 -- level with the RANK.
 				JE_textShade(VGAScreen, MENU_MONITOR_CENTER_X - JE_textWidth(buf, TINY_FONT) / 2, 172, buf, 1, 6, DARKEN);
 			}
-			// Rollover tier colours: when a gauge overruns one bar-row it overdraws the leading
-			// bars in the next bank, so it tiers by colour instead of marching off the panel.
-			// Shared by the armour (endless) and shield bars below. Layer colours tunable.
-			static const int shopBarRolloverCol[] = { 14, 30, 46, 62, 78, 94, 110, 126 };
 			if (endlessMode)
 			{
-				// Reinforced hull exceeds the classic 28-armour bar; roll it over 28 units per
-				// layer (same rollover as the in-game HUD armour bar).
+				// Reinforced hull exceeds the classic 28-armour bar; draw it as colour-coded
+				// rollover rows (same 28-per-layer rollover as the in-game HUD armour bar) so it
+				// can't march off the panel into the shield gauge. Layer colours tunable.
+				static const int shopArmorLayerCol[] = { 14, 30, 46, 62, 78, 94, 110, 126 };
 				int a = player[0].armor;
-				for (int L = 0; a > 0 && L < (int)COUNTOF(shopBarRolloverCol); ++L)
+				for (int L = 0; a > 0 && L < (int)COUNTOF(shopArmorLayerCol); ++L)
 				{
-					JE_barDrawShadow(VGAScreen, 42, 152, 3, shopBarRolloverCol[L], (a > 28) ? 28 : a, 2, 13);
+					JE_barDrawShadow(VGAScreen, 42, 152, 3, shopArmorLayerCol[L], (a > 28) ? 28 : a, 2, 13);
 					a -= 28;
 				}
 			}
 			else
 				JE_barDrawShadow(VGAScreen, 42, 152, 3, 14, player[0].armor, 2, 13);
-			// HXS Class B/C shields reach 12/14 bars -- past the 10-bar gauge width. Roll the shield
-			// bar over at 10 bars (20 amt at res 2) per layer, matching the armour bar. mpwr <= 10
-			// draws a single layer, byte-identical to before.
+			// Shield strength (item mpwr) rescaled so the strongest shield (HXS Class C, mpwr 14)
+			// fills exactly 10 bars and every weaker shield proportionally fewer -- matching the
+			// in-game shield gauge, whose full height scales the same way (shield_max = mpwr*2).
+			// Rounded to the nearest bar; None (mpwr 0) draws nothing; clamped so it can't overrun.
 			{
-				int s = shields[player[0].items.shield].mpwr * 2;
-				for (int L = 0; s > 0 && L < (int)COUNTOF(shopBarRolloverCol); ++L)
-				{
-					JE_barDrawShadow(VGAScreen, 104, 152, 2, shopBarRolloverCol[L], (s > 20) ? 20 : s, 2, 13);
-					s -= 20;
-				}
+				int shieldBars = (shields[player[0].items.shield].mpwr * 10 + 7) / 14;
+				if (shieldBars > 10)
+					shieldBars = 10;
+				JE_barDrawShadow(VGAScreen, 104, 152, 1, 14, shieldBars, 2, 13);
 			}
 		}
 
@@ -2759,7 +2756,30 @@ void draw_ship_illustration(void)
 		const int x = ship_x[sprite_id - 27],
 		          y = ship_y[sprite_id - 27];
 
+		// Gencore II's illustration (sprite 45, a 95px-wide uncompressed block) fills its
+		// "background" with palette 162 -- the same colour (#241408) as the shop wall (226) -- so
+		// it blends in everywhere except its square top-right corner, which overhangs the panel's
+		// lighter bevel in 3 spots (window ~141-142,30-31 in 16:9) where those dark pixels show.
+		// The raw sprite can't flag them transparent, so save the bevel and paint it back.
+		Uint8 * const seg = (Uint8 *)VGAScreenSeg->pixels;
+		const int segpitch = VGAScreenSeg->pitch;
+		const bool patch_corner = (sprite_id == 45);
+		Uint8 under[3] = { 0 };
+		if (patch_corner)
+		{
+			under[0] = seg[(y    ) * segpitch + (x + 93)];
+			under[1] = seg[(y    ) * segpitch + (x + 94)];
+			under[2] = seg[(y + 1) * segpitch + (x + 94)];
+		}
+
 		blit_sprite(VGAScreenSeg, x, y, OPTION_SHAPES, sprite_id);
+
+		if (patch_corner)
+		{
+			seg[(y    ) * segpitch + (x + 93)] = under[0];
+			seg[(y    ) * segpitch + (x + 94)] = under[1];
+			seg[(y + 1) * segpitch + (x + 94)] = under[2];
+		}
 	}
 
 	// generator
@@ -4319,7 +4339,10 @@ void JE_drawScore(void)
 	if (curMenu == MENU_UPGRADE_SUB)
 	{
 		sprintf(cl, "%d", JE_cashLeft());
-		JE_textShade(VGAScreen, 65, 173, cl, 1, 6, DARKEN);
+		// Centre on the monitor slot at the same row the main shop draws the cash total (see the
+		// MENU_MONITOR_CENTER_X / y172 draw in JE_menuFunction), so the readout stays put instead
+		// of jumping to a fixed left edge when the weapon-sim submenu takes over the display.
+		JE_textShade(VGAScreen, MENU_MONITOR_CENTER_X - JE_textWidth(cl, TINY_FONT) / 2, 172, cl, 1, 6, DARKEN);
 	}
 }
 
