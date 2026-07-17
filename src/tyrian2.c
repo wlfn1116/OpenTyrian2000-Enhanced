@@ -924,6 +924,13 @@ static int   tempScrollBaseStep = 0, tempScrollDelayMax = 1;
 // extra px, so they drifted off the terrain). notes.md §Endless scroll boost / §Slow-scroll smoothing.
 static int tempScrollExtraPx = 0;
 
+// Sky-bank (slots 0..24) enemies carry tempBackMove == 0: any scroll ride is authored in the
+// enemy's own eyc. One moving at exactly the layer-2 step is attached scenery (EP2 GYGES's
+// glass structures), detected per enemy in JE_drawEnemy so it can take the scroll modifier's
+// extra layer-2 pixels and the layer's canonical sub-pixel clock instead of drifting off its
+// terrain. Read by blit_enemy for the sprite's vertical binding stamps.
+static bool skyGlueThisEnemy = false;
+
 // Event records are keyed to layer-1's absolute scroll coordinate (curLoc). A boosted layer can
 // cross two or more event coordinates in one simulation tick, so some records are first processed
 // at curLoc > eventtime. Remember the interval crossed by the previous tick: newly-created bound
@@ -936,6 +943,13 @@ static int eventScrollLayerDelta[4] = { 0, 0, 0, 0 };
 static int eventScrollBaseStep[4] = { 0, 0, 0, 0 };
 static int eventScrollDelayMax[4] = { 1, 1, 1, 1 };
 static int eventScrollBoost = 0;
+// Sky-glue spawns ride a DIFFERENT layer than the event clock, and the two layers quantize
+// their boosted fractional rates through independent carries. Anchoring those spawns needs
+// the stock glass-px-per-event-px ratio (the boost cancels out of it) and the current
+// cross-layer carry phase, captured in hundredths at the end of each tick's scroll block.
+static bool eventScrollSkyValid = false;
+static int eventScrollSkyRatio100 = 0;
+static int eventScrollSkyPhase100 = 0;
 
 // Only the part of fixedmovey left after it cancels an opposing eyc is scroll-relative. BRAINIAC,
 // for example, pairs fixed=-1 with eyc=+1 to make a zero local velocity; scaling fixed alone would
@@ -1026,8 +1040,18 @@ inline static void blit_enemy(SDL_Surface *surface, unsigned int i, signed int x
 	rl_current_par_layer = tempMapXOfs_layer;
 	rl_current_par_anchor = (float)(tempMapXOfs - PLAYFIELD_X_SHIFT) + tempMapXOfs_frac;
 	rl_current_par_ybase = tempScrollYBase;
-	rl_current_par_yfrac = tempScrollYfrac;
-	rl_current_par_ylayer = tempScrollYLayer;
+	if (skyGlueThisEnemy)
+	{
+		// Attached sky scenery: bind to layer 2's lagged clock so replay places it with the
+		// exact transform the glass rows use (pre-advance phase, batch base is already 0).
+		rl_current_par_yfrac = bg_layer_yfrac[2];
+		rl_current_par_ylayer = 2;
+	}
+	else
+	{
+		rl_current_par_yfrac = tempScrollYfrac;
+		rl_current_par_ylayer = tempScrollYLayer;
+	}
 	if (enemy[i].filter != 0)
 		blit_sprite2_filter(surface, x, y, *enemy[i].sprite2s, index, enemy[i].filter);
 	else
@@ -1072,17 +1096,43 @@ enum { MAP_STOP_STALL_LIMIT = 210 };
 
 void JE_drawEnemy(int enemyOffset) // actually does a whole lot more than just drawing
 {
+	// JE_drawEnemy(25) is only ever the sky bank (slots 0..24), the one batch whose layer-2
+	// ride lives in eyc rather than tempBackMove -- the same structural identity the event
+	// spawner uses (its case 0 adjusts sky spawns by backMove2).
+	const bool skyBank = (enemyOffset == 25);
+
 	player[0].x -= 25;
 
 	for (int i = enemyOffset - 25; i < enemyOffset; i++)
 	{
 		if (enemyAvail[i] != 1)
 		{
+			// Attached sky scenery rides at exactly the layer-2 step. The ride can be
+			// authored in eyc (GYGES's later glass structures) OR in fixedmovey with the
+			// eycc oscillator swinging eyc symmetrically around 0 on top (GYGES's first
+			// chain structure: fixed=2, eyc 0 +/- eyrev), so sum the ride components and
+			// skip the oscillator's transient eyc. Homing (yaccel) marks a free flyer.
+			const int skyRide = (int)enemy[i].fixedmovey +
+			                    (enemy[i].eycc != 0 ? 0 : (int)enemy[i].eyc);
+			skyGlueThisEnemy = skyBank && backMove2 > 0 &&
+			                   skyRide == (int)backMove2 && enemy[i].yaccel == 0;
+
 			enemy[i].mapoffset = tempMapXOfs;
 			enemy[i].mapoffset_frac = tempMapXOfs_frac;  // for the health bar's smooth-H match
-			enemy[i].scroll_ybase = tempScrollYBaseBar;
-			enemy[i].scroll_yfrac = tempScrollYfracBar;
-			enemy[i].scroll_ylayer = (JE_byte)tempScrollYLayer;
+			if (skyGlueThisEnemy)
+			{
+				// The bar records post-advance; pull back the scroll part of this tick's
+				// advance (eyc == backMove2 plus the modifier's extra layer-2 pixels).
+				enemy[i].scroll_ybase = -((int)backMove2 + endlessScrollExtraPx2);
+				enemy[i].scroll_yfrac = bg_layer_yfrac[2];
+				enemy[i].scroll_ylayer = 2;
+			}
+			else
+			{
+				enemy[i].scroll_ybase = tempScrollYBaseBar;
+				enemy[i].scroll_yfrac = tempScrollYfracBar;
+				enemy[i].scroll_ylayer = (JE_byte)tempScrollYLayer;
+			}
 
 			// Endless: decide once (per linkgroup) this enemy's tier -- 0 undecided, 1 normal,
 			// 2 elite, 3 champion; score pickups and invincible (255-armor) enemies excluded.
@@ -1254,8 +1304,11 @@ enemy_still_exists:
 
 			// Scroll-track at overclock pace using the SMOOTH per-tick px of whichever layer this
 			// enemy rides (tagged per batch beside tempBackMove), so ground enemies glide with the
-			// terrain instead of drifting when two layers share a backMove. notes.md §Endless scroll boost.
-			enemy[i].ey += tempBackMove + tempScrollExtraPx;
+			// terrain instead of drifting when two layers share a backMove. Attached sky scenery
+			// rides layer 2 through its own eyc, so it takes that layer's extra pixels here.
+			// notes.md §Endless scroll boost.
+			enemy[i].ey += tempBackMove + tempScrollExtraPx +
+			               (skyGlueThisEnemy ? endlessScrollExtraPx2 : 0);
 
 			if (enemy[i].ex <= -24 || enemy[i].ex >= vga_width - 24)
 				goto draw_enemy_end;
@@ -1919,6 +1972,7 @@ start_level_first:
 	eventLoc = 1;
 	curLoc = 0;
 	eventScrollCatchupValid = false;
+	eventScrollSkyValid = false;
 	backMove = 1;
 	backMove2 = 2;
 	backMove3 = 3;
@@ -2225,12 +2279,17 @@ level_loop:
 	}
 
 	/*Background Wrapping*/
+	// A boosted scroll can cross a wrap threshold more than one whole map row deep in a single
+	// tick; carry those rows past the wrap target so a looping layer doesn't slip a tile against
+	// the scroll clock and its glued enemies. Stock strides (< 28 px) land within one row of the
+	// threshold, so the carry is 0 and the plain reset is unchanged. A stop wrap (to == from,
+	// the "don't scroll past the top" default) keeps the plain pin.
 	if (mapYPos <= BKwrap1)
-		mapYPos = BKwrap1to;
+		mapYPos = (BKwrap1to > BKwrap1) ? BKwrap1to - (BKwrap1 - mapYPos) / 14 * 14 : BKwrap1to;
 	if (mapY2Pos <= BKwrap2)
-		mapY2Pos = BKwrap2to;
+		mapY2Pos = (BKwrap2to > BKwrap2) ? BKwrap2to - (BKwrap2 - mapY2Pos) / 14 * 14 : BKwrap2to;
 	if (mapY3Pos <= BKwrap3)
-		mapY3Pos = BKwrap3to;
+		mapY3Pos = (BKwrap3to > BKwrap3) ? BKwrap3to - (BKwrap3 - mapY3Pos) / 15 * 15 : BKwrap3to;
 
 	allPlayersGone = all_players_dead() &&
 	                 ((*player[0].lives == 1 && player[0].exploding_ticks == 0) || (!onePlayerAction && !twoPlayerMode)) &&
@@ -2477,6 +2536,18 @@ level_loop:
 		endlessScrollExtraPx2 = endlessScrollExtraPx(1, fire2, map2YDelayMax, base2,
 		                                             &bgSmoothRatePend[2], &bgSmoothFracPend[2]);
 
+		// Sky-glue spawn anchor: stock layer ratio + the layers' current carry phase (the
+		// fracs are these exact integer hundredths). Captured post-update, so events at the
+		// START of the next tick see the state their crossed interval ended on.
+		eventScrollSkyValid = fire1 > 0 && fire2 > 0;
+		if (eventScrollSkyValid)
+		{
+			eventScrollSkyRatio100 = 100 * fire2 * map1YDelayMax / (fire1 * map2YDelayMax);
+			const int c1 = (int)lroundf(bgSmoothFracPend[1] * 100.0f);
+			const int c2 = (int)lroundf(bgSmoothFracPend[2] * 100.0f);
+			eventScrollSkyPhase100 = eventScrollSkyRatio100 * c1 / 100 - c2;
+		}
+
 		endlessScrollExtraPx3 = endlessScrollExtraPx(2, (int)backMove3, 1, (int)backMove3,
 		                                             &bgSmoothRatePend[3], &bgSmoothFracPend[3]);
 		eventScrollBaseStep[3] = (int)backMove3;
@@ -2653,7 +2724,7 @@ level_loop:
 		tempMapXOfs_frac = mapX2Ofs_f - mapX2Ofs;
 		tempMapXOfs_layer = 2;
 		tempBackMove = 0;
-		tempScrollExtraPx  = 0;     // layer-2 anchor: not vertically scroll-tracked
+		tempScrollExtraPx  = 0;     // layer-2 anchor: any ride is per-enemy via skyGlueThisEnemy
 		tempScrollYLayer   = 0;
 		tempScrollBaseStep = 0;
 		tempScrollDelayMax = 1;
@@ -3216,7 +3287,7 @@ draw_player_shot_loop_end:
 		tempMapXOfs_frac = mapX2Ofs_f - mapX2Ofs;
 		tempMapXOfs_layer = 2;
 		tempBackMove = 0;
-		tempScrollExtraPx  = 0;     // layer-2 anchor: not vertically scroll-tracked
+		tempScrollExtraPx  = 0;     // layer-2 anchor: any ride is per-enemy via skyGlueThisEnemy
 		tempScrollYLayer   = 0;
 		tempScrollBaseStep = 0;
 		tempScrollDelayMax = 1;
@@ -5930,8 +6001,11 @@ static int event_enemy_scroll_catchup(JE_word enemyOffset, const struct JE_Singl
 		layer = 1;
 	else if (enemyOffset == 50)
 		layer = 3;
+	else if (enemyOffset == 0 && backMove2 > 0 && e->yaccel == 0 &&
+	         (int)e->fixedmovey + (e->eycc != 0 ? 0 : (int)e->eyc) == (int)backMove2)
+		layer = 2;  // attached sky scenery rides layer 2 through eyc and/or fixedmovey (see JE_drawEnemy)
 	else
-		return 0;  // slots 0..24 are free-flying/sky enemies, not vertically layer-bound
+		return 0;  // free-flying sky enemies are not vertically layer-bound
 
 	const int eventTime = (int)eventRec[eventLoc - 1].eventtime;
 	const int span = eventScrollTo - eventScrollFrom;
@@ -5940,6 +6014,29 @@ static int event_enemy_scroll_catchup(JE_word enemyOffset, const struct JE_Singl
 		return 0;  // exact-time event, level/event jump, or a non-scroll forceEvents interval
 
 	const int late = eventScrollTo - eventTime;
+
+	if (layer == 2)
+	{
+		// The glass and the event clock quantize their boosted fractional rates through
+		// independent carries, so the integer identity "glass == ratio x curLoc" that stock
+		// keeps exact wanders +/-1px with the relative carry phase. Pieces of one structure
+		// spawn on different ticks and would inherit different phases -- a permanent 1px seam
+		// inside the structure (GYGES's chain machine). Anchor every spawn to the same ideal
+		// line instead: late whole event-px at the stock layer ratio plus the current
+		// cross-layer phase. Applies even at late == 0 (the phase can be nonzero on an
+		// on-time tick). Local motion beyond the ride is prorated like the other banks;
+		// sky fixedmovey itself never scales (local-motion semantics).
+		if (!eventScrollSkyValid || late < 0)
+			return 0;
+		int catchup = event_scroll_round_div(eventScrollSkyRatio100 * late +
+		                                     eventScrollSkyPhase100, 100);
+		const int surplus = ((int)e->fixedmovey + (e->eycc != 0 ? 0 : (int)e->eyc)) -
+		                    (int)backMove2;
+		if (surplus != 0)
+			catchup += event_scroll_round_div(surplus * late, span);
+		return catchup;
+	}
+
 	if (late <= 0)
 		return 0;
 
@@ -6040,21 +6137,38 @@ void JE_createNewEventEnemy(JE_byte enemyTypeOfs, JE_word enemyOffset, Sint16 un
 void JE_eventJump(JE_word jump)
 {
 	JE_word tempW;
+	JE_word target;
 
 	if (jump == 65535)
 	{
 		curLoc = returnLoc;
+		target = returnLoc;
 	}
 	else
 	{
 		returnLoc = curLoc + 1;
-		curLoc = jump;
+		// Endless scroll boost: the tick that reached this jump advanced the clock and every
+		// scrolling layer in lockstep by base + extra px, overrunning the jump record by up to
+		// endlessScrollExtraPx1 more than the stock stride level authors laid their maps out
+		// around. That overrun terrain is already consumed and cannot be rewound, so re-base
+		// the clock the same distance PAST the target to keep post-jump event times matched to
+		// the map (ICESECRET's ramp-in jump otherwise lands every clock-timed building ~a tile
+		// off its foundation under Warp Speed). Zero extra px -> stock byte-identical.
+		int excess = (int)curLoc - (int)eventRec[eventLoc - 1].eventtime;
+		if (excess > endlessScrollExtraPx1)
+			excess = endlessScrollExtraPx1;
+		if (excess < 0)
+			excess = 0;
+		curLoc = (JE_word)(jump + excess);
+		target = jump;
 	}
+	// Rescan against the author's target, not the re-based clock: records inside the excess
+	// window must still fire (this pass), merely late, like any other boost-overrun record.
 	tempW = 0;
 	do
 	{
 		tempW++;
-	} while (!(eventRec[tempW-1].eventtime >= curLoc));
+	} while (!(eventRec[tempW-1].eventtime >= target));
 	eventLoc = tempW - 1;
 }
 

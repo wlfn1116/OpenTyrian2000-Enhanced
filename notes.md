@@ -209,6 +209,22 @@ The removed `endlessExtraScrollSteps` path used an independent pulse phase, so
 its average was right but individual ticks increasingly separated objects from
 their layer at higher modifiers.
 
+The sky bank (slots 0..24, `JE_drawEnemy(25)`) has no `tempBackMove` channel:
+anything attached to background layer 2 authors the ride into the enemy's own
+motion, in either of two styles. GYGES's plain glass structures spawn with
+`eyc == backMove2` (event dat3); its first chain structure instead rides on
+`fixedmovey == backMove2` (event dat6) with the `eycc` oscillator swinging
+`eyc` symmetrically between `±eyrev` (average 0) for the sway. The boost
+therefore outran both until the per-enemy attachment test in `JE_drawEnemy` —
+ride = `fixedmovey` + (`eyc` unless `eycc` oscillates it) `== backMove2 > 0`,
+no `yaccel` homing (it mutates `eyc` after the test and marks a free flyer) —
+began adding `endlessScrollExtraPx2` to their scroll advance. The same test binds their
+sprites and health bars to layer 2's canonical presentation transform
+(`par_ylayer 2`, lagged fractional clock, bar pulled back by the post-advance
+scroll part), so under a fractional boost rate they render pixel-locked to the
+glass rather than pulsing against its smooth float rate. Free flyers, and the
+whole bank at stock speed (`extraPx2 == 0`), keep byte-identical simulation.
+
 Event-time spawn phase needs the same treatment. Level events are keyed to
 layer 1's integer `curLoc`; a boosted tick can cross several event coordinates,
 so the next tick may first process a spawn with `curLoc > eventtime`. Without a
@@ -217,8 +233,22 @@ their terrain (AST CITY exposes this densely). `tyrian2.c` retains the exact
 layer-1 interval and layer-3 delta crossed by the preceding tick, then advances a
 new bound enemy through the missed fraction of its layer plus its own `eyc` and
 scaled `fixedmovey`. This also preserves fixed-motion cancellation in BRAINIAC.
-Sky slots are deliberately excluded, as they are not vertically layer-bound;
-event jumps and `forceEvents` timeline-only increments invalidate the catch-up.
+Free-flying sky slots are excluded, as they are not vertically layer-bound. A
+spawn that passes the sky attachment test rides layer 2 — a DIFFERENT layer
+than the event clock, which changes the math. The glass and the event clock
+quantize their boosted fractional rates through independent carries, so the
+integer identity "glass == ratio × curLoc" that stock keeps exact wanders ±1px
+with the relative carry phase. Pieces of one structure spawn on different ticks,
+inherit different phases, and keep them for life — a permanent 1px seam inside
+the structure (GYGES's chain machine showed it on Slipstream). Per-tick pulse
+proration cannot fix this: even a late-0 spawn can land on a shifted-phase tick.
+Each sky spawn is instead anchored to the ideal line — `ratio100 × late` at the
+stock layer ratio (the boost cancels out of it) plus the current cross-layer
+carry phase (`eventScrollSkyRatio100`/`eventScrollSkyPhase100`, captured in
+hundredths from the smoothing carries at the end of each tick's scroll block).
+Local motion beyond the ride is prorated like the other banks, and sky
+`fixedmovey` itself never scales (local-motion semantics). Event jumps and
+`forceEvents` timeline-only increments invalidate the catch-up.
 
 ### Other render-rate presents
 
