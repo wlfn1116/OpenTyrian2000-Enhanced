@@ -1880,14 +1880,15 @@ static const EndlessMod endlessModTable[] = {
 	{ ENDLESS_MOD_ENRAGE,        10, "enemy fire rate climbs" },
 	{ ENDLESS_MOD_GRAVITY,        8, "downward pull" },
 	{ ENDLESS_MOD_ELITEPACK,     20, "half enemies elite" },
-	{ ENDLESS_MOD_OVERCLOCK,     10, "faster scroll + fire" },
+	{ ENDLESS_MOD_OVERCLOCK,     10, "faster enemy attacks" },  // fire rate + shot speed; ALSO speeds the scroll -- the monitor adds a separate scroll row (endlessCourseModRows) so "+ fire" ambiguity never returns
+	{ ENDLESS_MOD_SLIPSTREAM,     6, "faster scrolling" },      // the level rushes at you -- less reaction time
 	{ ENDLESS_MOD_KAMIKAZE,      12, "enemies home in" },   // moderate homing, NO ram -- the mid sector tier (what Homing used to be)
 	{ ENDLESS_MOD_HOMING,         6, "light homing" },      // the gentlest homing tier -- enemies barely lean toward you
 	{ ENDLESS_MOD_RAMPAGE,       50, "enemies ram you" },   // gamble-only brutal Kamikaze: strong homing + extra ram damage (top-tier danger weight)
-	{ ENDLESS_MOD_OVERLOAD,      15, "extreme scroll + fire" },
+	{ ENDLESS_MOD_OVERLOAD,      15, "extreme enemy attacks" },
 	{ ENDLESS_MOD_APEX,          40, "all enemies elite" },
 	{ ENDLESS_MOD_LEGION,        50, "all champion enemies" },
-	{ ENDLESS_MOD_WARP,           0, "much faster scrolling" },
+	{ ENDLESS_MOD_WARP,          20, "much faster scrolling" },  // Slipstream cranked way up (rare injected)
 	{ ENDLESS_MOD_BACKFIRE, 12, "kills jam your guns" },
 	{ ENDLESS_MOD_BURNOUT,   18, "kills weaken guns" },
 	{ ENDLESS_MOD_MISFIRE,   14, "kills cut your damage" },
@@ -1902,7 +1903,6 @@ static const EndlessMod endlessModTable[] = {
 	{ ENDLESS_MOD_OVERCHARGE,     0, "more weapon damage" },
 	{ ENDLESS_MOD_DILATION,       0, "slower enemy shots" },
 	{ ENDLESS_MOD_FAVOR,          0, "cheaper next shop" },
-	{ ENDLESS_MOD_SLIPSTREAM,     0, "faster scrolling" },
 	{ ENDLESS_MOD_OVERDRIVE,   0, "kills stack firepower" },
 	{ ENDLESS_MOD_OVERBLAST,   0, "kills stack damage" },
 	{ ENDLESS_MOD_BOUNTY,        30, "big cash payout" },
@@ -2337,8 +2337,9 @@ static Uint64 endlessStripWorstMod(Uint64 mods)
 {
 	static const Uint64 order[] = {  // nastiest first
 		ENDLESS_MOD_LEGION, ENDLESS_MOD_APEX, ENDLESS_MOD_DEADGEN, ENDLESS_MOD_RAMPAGE, ENDLESS_MOD_OVERLOAD,
+		ENDLESS_MOD_WARP,  // extreme scroll -- right below Overload on the danger ladder
 		ENDLESS_MOD_ELITEPACK, ENDLESS_MOD_DEVASTATING, ENDLESS_MOD_SHIELDLESS, ENDLESS_MOD_FORTIFIED, ENDLESS_MOD_FRENZY,
-		ENDLESS_MOD_SLUGGISH, ENDLESS_MOD_SWIFT, ENDLESS_MOD_OVERCLOCK, ENDLESS_MOD_ENRAGE,
+		ENDLESS_MOD_SLUGGISH, ENDLESS_MOD_SWIFT, ENDLESS_MOD_OVERCLOCK, ENDLESS_MOD_ENRAGE, ENDLESS_MOD_SLIPSTREAM,
 		ENDLESS_MOD_GRAVITY | ENDLESS_MOD_GRAVITY_OMNI, ENDLESS_MOD_TOPSY,  // gravity + its omni flag strip together, so a sabotaged well is fully cleared (not left as an orphaned omni pull)
 		ENDLESS_MOD_KAMIKAZE, ENDLESS_MOD_HOMING,  // the two mild homing tiers -- stripped last
 	};
@@ -2839,6 +2840,7 @@ static int      endlessCourseEp[ENDLESS_MAX_COURSES];
 static JE_byte  endlessCourseSec[ENDLESS_MAX_COURSES];
 static JE_byte  endlessCourseFile[ENDLESS_MAX_COURSES];  // each course's specific lvlFileNum (see forcedLvlFileNum)
 static Uint64 endlessCourseMod[ENDLESS_MAX_COURSES];
+static JE_byte  endlessCourseNameSalt[ENDLESS_MAX_COURSES];  // per-visit nudge so no two offered names read the same
 static int      endlessLastEp = 0;
 static JE_byte  endlessLastSec = 0;
 static bool     endlessForced = false;  // this visit is a forced "Ambush" (single dangerous sector)
@@ -2859,6 +2861,7 @@ static const EndlessTheme endlessHostileThemes[] = {
 	{ ENDLESS_MOD_GRAVITY,     "Gravity Well" },
 	{ ENDLESS_MOD_ELITEPACK,   "Elite Pack" },
 	{ ENDLESS_MOD_OVERCLOCK,   "Overclock" },
+	{ ENDLESS_MOD_SLIPSTREAM,  "Slipstream" },    // faster scroll: the level rushes at you (a threat, not the old boon)
 	{ ENDLESS_MOD_TOPSY,       "Topsy Turvy" },  // fork: upside-down screen (boss-style -- controls invert with the view)
 	{ ENDLESS_MOD_SLUGGISH,    "Molasses" },      // fork: slowed ship (depth-scaled; combos below -- its gravity pairing is a rare injection)
 
@@ -2889,6 +2892,11 @@ static const EndlessTheme endlessHostileThemes[] = {
 	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_DEVASTATING,  "Reactor Breach" },
 	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_GRAVITY,      "Riptide" },  // not the Overdrive buff -- renamed to avoid the clash with the OVERDRIVE boon below
 	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_ELITEPACK,    "Prototype Swarm" },
+	// -- pairs: slipstream (the level rushes past while ...; no Overclock pairing -- Overclock
+	//    already carries the same +70% scroll, so welding them would be a redundant bit) --
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FRENZY,      "Fast Lane" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_DEVASTATING, "Runaway" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FORTIFIED,   "Bypass" },
 	// -- more pairs: fury / speed / mass --
 	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE,          "Bloodrage" },
 	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_OVERCLOCK,       "Redline" },
@@ -3060,7 +3068,6 @@ static const EndlessTheme endlessBoonThemes[] = {
 	{ ENDLESS_MOD_OVERCHARGE, "Overcharged" },
 	{ ENDLESS_MOD_DILATION,   "Time Dilation" },
 	{ ENDLESS_MOD_FAVOR,      "Merchant's Favor" },
-	{ ENDLESS_MOD_SLIPSTREAM, "Slipstream" },
 	{ ENDLESS_MOD_CURSED,     "Cursed Bounty" },
 	// -- boon pairs (stack your buffs) --
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE, "Ascendant" },
@@ -3070,12 +3077,9 @@ static const EndlessTheme endlessBoonThemes[] = {
 	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_BOUNTY,         "Windfall" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_TURBODRIVE,    "Blood Frenzy" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERCHARGE,   "Executioner" },
-	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SLIPSTREAM,   "Blitz" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FAVOR,        "Clearance" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_BOUNTY,     "Killing Spree" },
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_BOUNTY,    "Mercenary" },
-	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_BOUNTY,    "Smash and Grab" },
-	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_SLIPSTREAM,  "Time Warp" },
 	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_OVERCHARGE, "Power Surge" },
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_OVERCHARGE, "Deadeye" },
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_DILATION,   "Sharpshooter" },
@@ -3086,17 +3090,21 @@ static const EndlessTheme endlessBoonThemes[] = {
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERDRIVE, "Bloodrush" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_CURSED, "Adrenaline" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FAVOR, "Momentum" },
-	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_SLIPSTREAM, "Power Play" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERDRIVE, "Berserk" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_CURSED, "Fortune" },
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FAVOR, "Jackpot" },
-	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_SLIPSTREAM, "Payday" },
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_CURSED, "Gold Rush" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FAVOR, "Bonanza" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_BOUNTY, "Lucky Break" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERDRIVE, "Fire Sale" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_CURSED, "Discount" },
-	{ ENDLESS_MOD_WARP,       "Warp Speed" },  // rare (injected)
+};
+
+// WARP (Slipstream cranked way up -- the level hurtles past) is a rare scroll THREAT with its own
+// injection in endlessGenerateCourses; naming-only here, like the omni-gravity table, so it never
+// enters the hostile shuffle pool.
+static const EndlessTheme endlessWarpThemes[] = {
+	{ ENDLESS_MOD_WARP,       "Warp Speed" },
 };
 
 // OVERLOAD (Overclock cranked way up) is a rare, brutal hostile with its own pool, injected
@@ -3191,7 +3199,7 @@ static const EndlessTheme endlessEvilThemes[] = {
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FORTIFIED,   "Uphill Battle" },
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_SWIFT,       "Overwhelmed" },
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_GRAVITY,     "Dead Weight" },
-	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FRENZY,      "Crossfire" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FRENZY,      "Friendly Fire" },
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_ENRAGE,      "Slow Burn" },
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_ELITEPACK,   "Cornered" },
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_OVERCLOCK,   "Vapor Lock" },
@@ -3213,7 +3221,7 @@ static const EndlessTheme endlessEvilThemes[] = {
 	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_GRAVITY,      "Downhill" },
 	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_ELITEPACK,    "No Contest" },
 	// -- two dangers welded to the curse: the memorable evil nightmares --
-	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Death March" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Forced March" },
 	{ ENDLESS_MOD_BURNOUT  | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "Last Legs" },
 	{ ENDLESS_MOD_MISFIRE  | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,       "Stalemate" },
 	{ ENDLESS_MOD_BURNOUT  | ENDLESS_MOD_FRENZY | ENDLESS_MOD_DEVASTATING,    "No Way Out" },
@@ -3317,15 +3325,19 @@ static const EndlessTheme endlessMixedThemes[] = {
 	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_SWIFT,            "Hazard Discount" },
 	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_DEVASTATING,      "Combat Pay" },
 	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_FRENZY,           "Loss Leader" },
-	// -- pairs: kills stack your damage (Overblast) / firepower (Overdrive) / faster level (Slipstream) --
+	// -- pairs: kills stack your damage (Overblast) / firepower (Overdrive) --
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_FORTIFIED,    "Sledge" },
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_SWIFT,        "Piercer" },
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_ELITEPACK,    "Headhunter" },
 	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_FORTIFIED,    "Snowball" },
 	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_ELITEPACK,    "Killstreaker" },
-	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FRENZY,      "Fast Lane" },
-	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_DEVASTATING, "Runaway" },
-	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FORTIFIED,   "Bypass" },
+	// -- pairs: a boon riding the faster-scroll threat (Slipstream was a boon once; these combos
+	//    now read as gambits -- reachable when a boon is grafted onto a Slipstream course) --
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SLIPSTREAM,     "Blitz" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_BOUNTY,      "Smash and Grab" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_SLIPSTREAM,    "Time Warp" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_SLIPSTREAM,  "Power Play" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_SLIPSTREAM,  "Payday" },
 
 	// -- triples: boon + two threats --
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,       "Armor Piercer" },
@@ -3409,6 +3421,9 @@ static const EndlessTheme *endlessFindTheme(Uint64 mods)
 	for (unsigned i = 0; i < COUNTOF(endlessDeadgenThemes); ++i)
 		if (endlessDeadgenThemes[i].mods == mods)
 			return &endlessDeadgenThemes[i];
+	for (unsigned i = 0; i < COUNTOF(endlessWarpThemes); ++i)
+		if (endlessWarpThemes[i].mods == mods)
+			return &endlessWarpThemes[i];
 	// OMNI fallthrough: an omnidirectional gravity combo with no exact name reads as its plain-gravity
 	// twin (Dense Matter, Event Horizon, ...). Strip the cosmetic OMNI bit and retry once -- the retry
 	// has no OMNI bit, so it can't recurse further.
@@ -3447,37 +3462,79 @@ static Uint64 endlessPickThemeMods(const EndlessTheme *tbl, unsigned count, Uint
 	ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_OVERLOAD | \
 	ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_BURNOUT | ENDLESS_MOD_MISFIRE | ENDLESS_MOD_OVERHEAT | \
 	ENDLESS_MOD_HOMING | ENDLESS_MOD_RAMPAGE | ENDLESS_MOD_TOPSY | ENDLESS_MOD_SLUGGISH | \
-	ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_DEADGEN )
+	ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_DEADGEN | ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_WARP )
 
 // Bits that HELP you -- the boon side. A course carrying any of these plus a hostile bit is a "mixed"
-// gambit (risk + reward). WARP is a boon (rare); the evil kill-fire mirrors are hostile (above), and
-// CURSED is a trap counted on the hostile side, so neither belongs here.
+// gambit (risk + reward). Faster scrolling (SLIPSTREAM/WARP) counts HOSTILE -- the level rushing at
+// you cuts reaction time; the evil kill-fire mirrors are hostile (above), and CURSED is a trap
+// counted on the hostile side, so none of those belong here.
 #define ENDLESS_BOON_MASK ( \
 	ENDLESS_MOD_FRAGILE | ENDLESS_MOD_BOUNTY | ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE | \
-	ENDLESS_MOD_DILATION | ENDLESS_MOD_FAVOR | ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_OVERDRIVE | \
-	ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_WARP )
+	ENDLESS_MOD_DILATION | ENDLESS_MOD_FAVOR | ENDLESS_MOD_OVERDRIVE | \
+	ENDLESS_MOD_OVERBLAST )
 
 // Evocative names for un-curated (randomly generated) combos, picked deterministically per bitset so a
 // given combo always reads the same. Three flavors so an un-named combo still reads the RIGHT tone: an
 // ominous word for pure danger, a fortunate word for a pure boon combo, a "gambit" word for a mixed one.
+// Big pools keep same-chart hash collisions rare (the unique-name pass in endlessGenerateCourses catches
+// the rest). Every word must be unique across ALL name tables (curated included -- see the dup scan in
+// notes.md) and stick to font_ascii-displayable characters: letters, space, apostrophe, hyphen.
 static const char *const endlessGenericNames[] = {
 	"Havoc", "Chaos", "Carnage", "Ruin", "Fury", "Terror", "Doom", "Peril",
 	"Menace", "Scourge", "Bedlam", "Mayhem", "Torment", "Dread", "Malice",
 	"Ordeal", "Gauntlet", "Crucible", "Inferno", "Tempest", "Reckoning",
 	"Oblivion", "Rampage", "Turmoil", "Onset", "Affliction",
+	"Anguish", "Vengeance", "Spite", "Blight", "Bane", "Calamity",
+	"Catastrophe", "Shockwave", "Aftershock", "Fallout", "Deluge", "Torrent",
+	"Broadside", "Dragnet", "Crosshairs", "Deathtrap", "Minefield", "Gallows",
+	"Ill Omen", "Tribulation", "Strife", "Discord", "Incursion", "Squall",
+	"Whirlwind", "Ashfall", "Backdraft", "Misfortune", "Jeopardy", "Hazard",
+	"Distress", "Duress", "Snare", "Pitfall", "Vendetta", "Hostile Ground",
+	"Scorched Sky", "Grim Tide", "Nightfall", "Darkfall", "Downpour",
+	"Hornet Nest", "Viper Pit", "Killing Floor", "Furnace", "Cauldron",
+	"Ravage", "Rupture", "Sundering", "Retribution", "Reprisal",
+	"Dire Straits", "Storm Front", "Headwinds", "Foul Weather", "Wasteland",
+	"Badlands", "Rough Waters", "Breaking Point", "Boiling Point",
+	"Fever Pitch", "Graveyard", "Onrush",
 };
 static const char *const endlessBoonGenericNames[] = {
 	"Godsend", "Reprieve", "Tailwind", "Grace", "Easy Street", "Good Omen",
 	"Lucky Star", "Silver Lining", "Uplift", "Bright Side", "Fair Winds",
 	"Respite", "Blessing", "Sanctuary", "Boon", "Windswept",
+	"Serendipity", "Providence", "Good Fortune", "Charmed", "Lucky Streak",
+	"Golden Hour", "Halcyon", "Oasis", "Haven", "Safe Harbor", "Safe Passage",
+	"Smooth Sailing", "Clear Skies", "Blue Skies", "Daybreak", "First Light",
+	"New Dawn", "Morning Star", "North Star", "Guiding Light", "Beacon",
+	"Lodestar", "Godspeed", "Cakewalk", "Breather", "Mercy", "Benediction",
+	"Deliverance", "Prosperity", "Abundance", "Milk Run", "Sunday Drive",
+	"Scenic Route", "Fair Weather", "Green Light", "All Clear", "Home Free",
+	"Open Road", "Free Ride", "Sweet Spot", "Kind Stars", "Full Sails",
+	"Warm Welcome", "Gentle Current", "Good Graces", "Guardian Angel",
+	"Fresh Start", "Head Start", "Helping Hand", "Stroke of Luck",
+	"Free Pass", "Sunrise",
 };
 static const char *const endlessMixedGenericNames[] = {
 	"Gambit", "Trade-off", "Bargain", "Double Edge", "Wager", "Faustian",
 	"Devil's Deal", "Two-Edged", "Give and Take", "Long Shot", "Roll the Dice",
 	"Loaded Dice", "Bittersweet", "Mixed Bag", "Toss-Up", "Wild Card", "Crossroads",
+	"Coin Flip", "Heads or Tails", "Double Down", "Ante Up", "Calculated Risk",
+	"Risky Business", "Gray Area", "Fine Print", "Hidden Cost", "Price to Pay",
+	"Steep Price", "Fair Trade", "Horse Trade", "Quid Pro Quo", "Tit for Tat",
+	"Tug of War", "Balancing Act", "Tightrope", "Razor's Edge", "Knife's Edge",
+	"Double Bind", "Dilemma", "Conundrum", "Paradox", "Pandora's Box",
+	"Poison Apple", "Forbidden Fruit", "Siren Song", "Fool's Gold",
+	"Fool's Errand", "Devil's Due", "Snake Eyes", "Hedged Bet", "Side Bet",
+	"Long Odds", "Even Odds", "Leap of Faith", "Blind Bargain", "Gilded Cage",
+	"Mixed Blessing", "Rose and Thorn", "Gift Horse", "Trojan Horse",
+	"Silver Hook", "Honey Trap", "Hard Bargain", "Push Your Luck",
+	"Buyer Beware", "Sucker Bet", "Raised Stakes",
 };
 
-const char *endlessComboName(Uint64 mods)
+// `salt` steps a GENERATED pick to the next word in its list -- 0 everywhere except the per-visit
+// unique-name pass in endlessGenerateCourses (two distinct bitsets can hash to the same word, and
+// one chart must never offer two sectors reading the same). Curated names ignore it: the theme
+// tables hold no duplicate names, so distinct combos can't clash through them.
+static const char *endlessComboNameSalted(Uint64 mods, unsigned salt)
 {
 	const EndlessTheme *t = endlessFindTheme(mods);
 	if (t)
@@ -3487,7 +3544,7 @@ const char *endlessComboName(Uint64 mods)
 	// Mask the cosmetic OMNI bit so an un-named omni gravity combo shares its plain-gravity twin's
 	// generated name (the direction is a runtime surprise, not a different sector on the chart).
 	Uint64 key = mods & ~ENDLESS_MOD_GRAVITY_OMNI;
-	Uint64 h = key ^ (key >> 4) ^ (key >> 9);  // mix so nearby bitsets differ
+	Uint64 h = (key ^ (key >> 4) ^ (key >> 9)) + salt;  // mix so nearby bitsets differ
 	// Classify off the danger/boon masks so the generated name matches the sector's tone. Cursed counts
 	// hostile-side (it's a trap), matching how the monitor lists it.
 	const bool hasHostile = (key & (ENDLESS_HOSTILE_MASK | ENDLESS_MOD_CURSED)) != 0;
@@ -3497,6 +3554,11 @@ const char *endlessComboName(Uint64 mods)
 	if (hasBoon)
 		return endlessBoonGenericNames[h % COUNTOF(endlessBoonGenericNames)];
 	return endlessGenericNames[h % COUNTOF(endlessGenericNames)];
+}
+
+const char *endlessComboName(Uint64 mods)
+{
+	return endlessComboNameSalted(mods, 0);
 }
 
 // --- Course danger tier + description ------------------------------------------------------------
@@ -3523,10 +3585,8 @@ static const struct { unsigned bit; int credit; } endlessBoonMitigation[] = {
 	{ ENDLESS_MOD_FRAGILE,     8 },  // frail foes die fast: fewer guns left firing
 	{ ENDLESS_MOD_OVERCHARGE,  5 },  // shots hit harder: quicker kills
 	{ ENDLESS_MOD_OVERDRIVE,   5 },  // each kill stacks fire and damage
-	{ ENDLESS_MOD_WARP,        5 },  // the level blurs past: far less time exposed
 	{ ENDLESS_MOD_OVERBLAST,   4 },  // each kill stacks damage
 	{ ENDLESS_MOD_TURBODRIVE, 3 },  // each kill quickens the guns
-	{ ENDLESS_MOD_SLIPSTREAM,  2 },  // a faster level: a little less exposure
 };
 
 // The sector's net danger: its hostile modifiers' summed reward (endlessModTable, in tenths of the
@@ -3608,10 +3668,12 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_ENRAGE,      "enemy fire rate keeps rising" },
 	{ ENDLESS_MOD_GRAVITY,     "constant downward pull" },
 	{ ENDLESS_MOD_ELITEPACK,   "half of enemies are elite" },
-	{ ENDLESS_MOD_OVERCLOCK,   "faster fire, shots and scroll" },
+	{ ENDLESS_MOD_OVERCLOCK,   "enemy fire/shots + scroll faster" },
+	{ ENDLESS_MOD_SLIPSTREAM,  "level scrolls 70% faster" },
 	{ ENDLESS_MOD_KAMIKAZE,    "enemies home in moderately" },
 	{ ENDLESS_MOD_HOMING,      "enemies home in slightly" },
-	{ ENDLESS_MOD_OVERLOAD,    "extreme fire, shots and scroll" },
+	{ ENDLESS_MOD_OVERLOAD,    "enemy fire/shots + scroll extreme" },
+	{ ENDLESS_MOD_WARP,        "level scrolls 3.2x faster" },
 	{ ENDLESS_MOD_RAMPAGE,     "strong homing + ram damage" },
 	{ ENDLESS_MOD_OVERHEAT,    "hull slowly loses armor" },
 	{ ENDLESS_MOD_TOPSY,       "view and controls flip" },
@@ -3640,17 +3702,21 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_FRENZY,        "downward pull; faster fire" },
 	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_DEVASTATING, "half elite; harder hits" },
 	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FRENZY,      "half elite; faster fire" },
-	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FORTIFIED,   "fire/shot/scroll+; more HP" },
-	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_DEVASTATING, "fire/shot/scroll+; hard hits" },
-	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_GRAVITY,     "fire/shot/scroll+; pull down" },
-	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_ELITEPACK,   "fire/shot/scroll+; 1/2 elite" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FORTIFIED,   "foe fire/shot/scroll+; more HP" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_DEVASTATING, "foe fire/shot/scroll+; hard hits" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_GRAVITY,     "foe fire/shot/scroll+; pull down" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_ELITEPACK,   "foe fire/shot/scroll+; 1/2 elite" },
 	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_ENRAGE,         "fast fire that keeps rising" },
-	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_OVERCLOCK,      "fire++; shots/scroll faster" },
-	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_OVERCLOCK,       "shots++; fire/scroll faster" },
+	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_OVERCLOCK,      "foe fire++; shots/scroll faster" },
+	{ ENDLESS_MOD_SWIFT | ENDLESS_MOD_OVERCLOCK,       "foe shots++; fire/scroll faster" },
 	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_GRAVITY,        "pull down; fire rate rises" },
 	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_ELITEPACK,      "half elite; fire rate rises" },
-	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK,      "fire rises; shot/scroll faster" },
+	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_OVERCLOCK,      "foe fire rises; shot/scroll faster" },
 	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_ELITEPACK,     "downward pull; half elite" },
+	// -- slipstream (faster scroll) pairs --
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FRENZY,      "scroll +70%; faster fire" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_DEVASTATING, "scroll +70%; harder hits" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_FORTIFIED,   "scroll +70%; more enemy HP" },
 	// -- disorientation, drag and stripped defenses --
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FORTIFIED,       "flipped view; more enemy HP" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FRENZY,          "flipped view; faster fire" },
@@ -3658,7 +3724,7 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_DEVASTATING,     "flipped view; harder hits" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_ENRAGE,          "flipped view; fire rate rises" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_ELITEPACK,       "flipped view; half elite" },
-	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_OVERCLOCK,       "view flip; fire/shot/scroll+" },
+	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_OVERCLOCK,       "view flip; foe fire/shot/scroll+" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_GRAVITY,         "flipped view + downward pull" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_SLUGGISH,        "flipped view; ship slowed" },
 	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_FORTIFIED,    "slower ship; more enemy HP" },
@@ -3667,14 +3733,14 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_DEVASTATING,  "slower ship; harder hits" },
 	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_ENRAGE,       "slower ship; fire rate rises" },
 	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_ELITEPACK,    "slower ship; half elite" },
-	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_OVERCLOCK,    "ship slow; fire/shot/scroll+" },
+	{ ENDLESS_MOD_SLUGGISH | ENDLESS_MOD_OVERCLOCK,    "ship slow; foe fire/shot/scroll+" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_FORTIFIED,  "no shield regen; more foe HP" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_FRENZY,     "no shield regen; faster fire" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_SWIFT,      "no shield regen; fast shots" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_DEVASTATING,"no shield regen; harder hits" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_ENRAGE,     "no regen; fire rate rises" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_ELITEPACK,  "no shield regen; half elite" },
-	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_OVERCLOCK,  "no regen; fire/shot/scroll+" },
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_OVERCLOCK,  "no regen; foe fire/shot/scroll+" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_GRAVITY,    "no regen; downward pull" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_TOPSY,      "no regen; view flips" },
 	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_SLUGGISH,   "no regen; ship slowed" },
@@ -3685,7 +3751,7 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "more HP; fast shots hit hard" },
 	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE,    "fast, hard shots; fire rises" },
 	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING | ENDLESS_MOD_ENRAGE, "HP+; shots fast/hard; fire+" },
-	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "fire/shot++; scroll+; hard hits" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING, "foe fire/shot++; scroll+; hit+" },
 	{ ENDLESS_MOD_ENRAGE | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "fast, hard shots; fire rises" },
 	{ ENDLESS_MOD_GRAVITY | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,    "downward pull; fast hard shots" },
 	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "half elite; more HP; hard hits" },
@@ -3693,7 +3759,7 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,"pull down; more HP; hard hits" },
 	{ ENDLESS_MOD_FRENZY | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,   "pull; fast fire; hard hits" },
 	{ ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "half elite; fast hard shots" },
-	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "shots++; fire/scroll+; hard hits" },
+	{ ENDLESS_MOD_OVERCLOCK | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,  "foe shots++; fire/scroll+; hit+" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,           "view flips; fire/shots faster" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING,  "view flips; more HP; hard hits" },
 	{ ENDLESS_MOD_TOPSY | ENDLESS_MOD_GRAVITY | ENDLESS_MOD_DEVASTATING,    "view flips; pull; hard hits" },
@@ -3716,28 +3782,28 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_GRAVITY,       "moderate homing; pull down" },
 	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_ELITEPACK,     "moderate homing; half elite" },
 	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_ENRAGE,        "homing; fire rate keeps rising" },
-	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_OVERCLOCK,     "homing; fire/shots/scroll faster" },
+	{ ENDLESS_MOD_KAMIKAZE | ENDLESS_MOD_OVERCLOCK,     "homing; foe fire/shot/scroll+" },
 	// -- overload, apex and legion --
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED,     "fire/shot/scroll++; more HP" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_DEVASTATING,   "fire/shot/scroll++; hard hits" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_ELITEPACK,     "fire/shot/scroll++; 1/2 elite" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FRENZY,        "fire++; shots/scroll extreme" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_SWIFT,         "shots++; fire/scroll extreme" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_GRAVITY,       "fire/shot/scroll++; pull down" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_ENRAGE,        "fire rises; shots/scroll extreme" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "fire/shot/scroll++; HP+; hit+" },
-	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "shots+++; fire/scroll++; hit+" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED,     "foe fire/shot/scroll++; more HP" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_DEVASTATING,   "foe fire/shot/scroll++; hard hits" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_ELITEPACK,     "foe fire/shot/scroll++; 1/2 elite" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FRENZY,        "foe fire++; shots/scroll extreme" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_SWIFT,         "foe shots++; fire/scroll extreme" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_GRAVITY,       "foe fire/shot/scroll++; pull down" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_ENRAGE,        "foe fire rises; shots/scroll++" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "foe fire/shot/scroll++; HP+; hit+" },
+	{ ENDLESS_MOD_OVERLOAD | ENDLESS_MOD_SWIFT | ENDLESS_MOD_DEVASTATING,     "foe shots+++; fire/scroll++; hit+" },
 	{ ENDLESS_MOD_APEX | ENDLESS_MOD_FORTIFIED,         "all elite; more enemy HP" },
 	{ ENDLESS_MOD_APEX | ENDLESS_MOD_SWIFT,             "all elite; faster shots" },
 	{ ENDLESS_MOD_APEX | ENDLESS_MOD_DEVASTATING,       "all elite; harder hits" },
-	{ ENDLESS_MOD_APEX | ENDLESS_MOD_OVERLOAD,          "all elite; fire/shot/scroll++" },
+	{ ENDLESS_MOD_APEX | ENDLESS_MOD_OVERLOAD,          "all elite; foe fire/shot/scroll++" },
 	{ ENDLESS_MOD_APEX | ENDLESS_MOD_FRENZY,            "all elite; faster fire" },
 	{ ENDLESS_MOD_APEX | ENDLESS_MOD_ENRAGE,            "all elite; fire rate rises" },
 	{ ENDLESS_MOD_APEX | ENDLESS_MOD_GRAVITY,           "all elite; downward pull" },
 	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_FORTIFIED,       "all champions; more enemy HP" },
 	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_SWIFT,           "all champions; faster shots" },
 	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_DEVASTATING,     "all champions; harder hits" },
-	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_OVERLOAD,        "all champs; fire/shot/scroll++" },
+	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_OVERLOAD,        "all champs; foe fire/shot/scroll++" },
 	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_FRENZY,          "all champions; faster fire" },
 	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_ENRAGE,          "champions; fire rate rises" },
 	{ ENDLESS_MOD_LEGION | ENDLESS_MOD_GRAVITY,         "all champions; downward pull" },
@@ -3748,10 +3814,8 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_OVERCHARGE,  "your weapon damage +50%" },
 	{ ENDLESS_MOD_DILATION,    "enemy shots move 45% slower" },
 	{ ENDLESS_MOD_FAVOR,       "next shop is cheaper" },
-	{ ENDLESS_MOD_SLIPSTREAM,  "level scrolls 70% faster" },
 	{ ENDLESS_MOD_OVERDRIVE,   "kills stack fire and damage" },
 	{ ENDLESS_MOD_OVERBLAST,   "kills stack weapon damage" },
-	{ ENDLESS_MOD_WARP,        "level scrolls 3.2x faster" },
 	{ ENDLESS_MOD_CURSED,      "more cash; next shop empty" },
 	// -- stacked boons --
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE, "+50% damage; kill-fire boost" },
@@ -3761,12 +3825,9 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_FAVOR | ENDLESS_MOD_BOUNTY,          "larger payout; cheaper shop" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_TURBODRIVE,    "less foe HP; kills boost fire" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERCHARGE,    "less foe HP; your damage +50%" },
-	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SLIPSTREAM,    "less foe HP; scroll +70%" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_FAVOR,         "less foe HP; cheaper next shop" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_BOUNTY,     "fire boost; larger payout" },
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_BOUNTY,     "+50% damage; larger payout" },
-	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_BOUNTY,     "scroll +70%; larger payout" },
-	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_SLIPSTREAM,   "foe shots -45%; scroll +70%" },
 	{ ENDLESS_MOD_OVERDRIVE | ENDLESS_MOD_OVERCHARGE,  "+50% base; kills stack fire/dmg" },
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_OVERCHARGE,  "+50% base; kills stack damage" },
 	{ ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_DILATION,    "slow foe shots; damage stacks" },
@@ -3775,11 +3836,15 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_DILATION,      "less foe HP; foe shots -45%" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERDRIVE,     "less HP; kills stack fire/dmg" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FAVOR,      "kills boost fire; cheaper shop" },
-	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_SLIPSTREAM, "kills boost fire; scroll +70%" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERDRIVE,  "kills boost fire and damage" },
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FAVOR,      "+50% damage; cheaper next shop" },
-	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_SLIPSTREAM, "+50% damage; scroll +70%" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_FAVOR,        "foe shots -45%; cheaper shop" },
+	// -- gambits: a boon riding the faster-scroll threat --
+	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_SLIPSTREAM,    "less foe HP; scroll +70%" },
+	{ ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_BOUNTY,     "scroll +70%; larger payout" },
+	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_SLIPSTREAM,   "foe shots -45%; scroll +70%" },
+	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_SLIPSTREAM, "kills boost fire; scroll +70%" },
+	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_SLIPSTREAM, "+50% damage; scroll +70%" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_BOUNTY,       "foe shots -45%; larger payout" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERDRIVE,    "slow shots; kills stack fire/dmg" },
 	// -- evil self-curses --
@@ -3793,7 +3858,7 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_FRENZY,      "gun jams; foe fire faster" },
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_ENRAGE,      "your fire jams; foe fire rises" },
 	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_ELITEPACK,   "kills jam guns; half foes elite" },
-	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_OVERCLOCK,   "gun jams; fire/shot/scroll+" },
+	{ ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_OVERCLOCK,   "gun jams; foe fire/shot/scroll+" },
 	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_DEVASTATING,  "kills cut fire/dmg; harder hits" },
 	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_FORTIFIED,    "kills cut fire/dmg; more foe HP" },
 	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_ENRAGE,       "guns weaken; foe fire rises" },
@@ -3801,7 +3866,7 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_FRENZY,       "kills cut fire; foe fire faster" },
 	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_SWIFT,        "kills cut fire/dmg; fast shots" },
 	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_GRAVITY,      "kills cut fire/dmg; pull down" },
-	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_OVERCLOCK,    "guns weaken; fire/shot/scroll+" },
+	{ ENDLESS_MOD_BURNOUT | ENDLESS_MOD_OVERCLOCK,    "guns weaken; foe fire/shot/scroll+" },
 	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_DEVASTATING,  "kills cut dmg; foes hit harder" },
 	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_FORTIFIED,    "kills cut damage; more enemy HP" },
 	{ ENDLESS_MOD_MISFIRE | ENDLESS_MOD_SWIFT,        "kills cut dmg; foe shots faster" },
@@ -3976,7 +4041,7 @@ static Uint64 endlessPickMixBoon(Uint64 hostiles)
 	if (endlessRand() % 100 < 4)
 		return (endlessRand() % 2) ? ENDLESS_MOD_TURBODRIVE : ENDLESS_MOD_OVERBLAST;
 
-	Uint64 cand[6];
+	Uint64 cand[5];
 	int n = 0;
 	cand[n++] = ENDLESS_MOD_OVERCHARGE;   // more player damage -- always safe
 	cand[n++] = ENDLESS_MOD_BOUNTY;       // pure cash, no safety -- always safe
@@ -3985,8 +4050,6 @@ static Uint64 endlessPickMixBoon(Uint64 hostiles)
 		cand[n++] = ENDLESS_MOD_FRAGILE;
 	if (!(hostiles & (ENDLESS_MOD_SWIFT | ENDLESS_MOD_OVERCLOCK)))  // slow shots vs fast shots would cancel
 		cand[n++] = ENDLESS_MOD_DILATION;
-	if (!(hostiles & ENDLESS_MOD_OVERCLOCK))                        // keep the faster-level boon clean
-		cand[n++] = ENDLESS_MOD_SLIPSTREAM;
 	return cand[endlessRand() % n];
 }
 
@@ -4014,7 +4077,7 @@ static Uint64 endlessMakeBoonCombo(void)
 {
 	static const Uint64 pool[] = {
 		ENDLESS_MOD_FRAGILE, ENDLESS_MOD_BOUNTY, ENDLESS_MOD_OVERCHARGE, ENDLESS_MOD_DILATION,
-		ENDLESS_MOD_FAVOR, ENDLESS_MOD_SLIPSTREAM, ENDLESS_MOD_OVERBLAST,
+		ENDLESS_MOD_FAVOR, ENDLESS_MOD_OVERBLAST,
 	};
 	int ord[COUNTOF(pool)];
 	for (unsigned k = 0; k < COUNTOF(pool); ++k)
@@ -4101,6 +4164,8 @@ void endlessGenerateCourses(void)
 		ENDLESS_MOD_ENRAGE, ENDLESS_MOD_GRAVITY, ENDLESS_MOD_ELITEPACK, ENDLESS_MOD_OVERCLOCK,
 		ENDLESS_MOD_TOPSY,  // the flipped-view mod mixes freely with everything (purely visual, no softlock)
 		ENDLESS_MOD_SHIELDLESS,  // a pure defense debuff -- safe to stack onto any combo (DEADGEN stays out: super-rare, injected only)
+		// SLIPSTREAM stays out: Overclock (in the pool) already carries the same +70% scroll, so a
+		// random pairing would be a redundant bit. Slipstream sectors come from the named-theme shuffle.
 	};
 	for (int c = 1; c < endlessCourseCnt; ++c)
 	{
@@ -4126,8 +4191,8 @@ void endlessGenerateCourses(void)
 	}
 
 	// A boon course is uncommon (~1 in 3 visits replaces a hostile one): most draw a named boon theme
-	// (single or curated combo, WARP excluded -- it has its own rare injection below), but ~40% instead
-	// roll a fresh emergent boon pair/triple, so pure-good sectors vary beyond the named set too.
+	// (single or curated combo), but ~40% instead roll a fresh emergent boon pair/triple, so
+	// pure-good sectors vary beyond the named set too.
 	if (endlessCourseCnt > 1 && (endlessRand() % 3) == 0)
 	{
 		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
@@ -4135,7 +4200,7 @@ void endlessGenerateCourses(void)
 			endlessCourseMod[slot] = endlessMakeBoonCombo();
 		else
 			endlessCourseMod[slot] = endlessSwapTurbodriveOverblast(
-				endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, ENDLESS_MOD_WARP));
+				endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, 0));
 	}
 
 	// MIXED "gambit" sectors: graft a compatible boon onto some ORDINARY hostile courses, welding a real
@@ -4151,6 +4216,10 @@ void endlessGenerateCourses(void)
 		Uint64 mixCommon = 0;
 		for (unsigned k = 0; k < COUNTOF(combinable); ++k)
 			mixCommon |= combinable[k];
+		// Slipstream isn't in the combinable pool (redundant beside Overclock's scroll), but its named
+		// hostile sectors are ordinary enough to gamble on -- keep them boon-graft eligible so the
+		// Blitz / Time Warp / Power Play / Payday / Smash and Grab gambits stay reachable.
+		mixCommon |= ENDLESS_MOD_SLIPSTREAM;
 		for (int c = 1; c < endlessCourseCnt; ++c)
 		{
 			const Uint64 h = endlessCourseMod[c] & ENDLESS_HOSTILE_MASK;
@@ -4181,7 +4250,7 @@ void endlessGenerateCourses(void)
 		endlessCourseMod[slot] = endlessKamikazeThemes[endlessRand() % COUNTOF(endlessKamikazeThemes)].mods;
 	}
 
-	// Warp Speed (much faster scroll, a rare boon) -- ~1 in 12 visits.
+	// Warp Speed (much faster scroll -- a rare scroll THREAT: the level hurtles at you) -- ~1 in 12 visits.
 	if (endlessCourseCnt > 1 && (endlessRand() % 12) == 0)
 	{
 		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
@@ -4454,6 +4523,28 @@ void endlessGenerateCourses(void)
 		endlessCourseFile[j + 1] = file;
 		endlessCourseMod[j + 1]  = mod;
 	}
+
+	// UNIQUE NAMES: the offered modifier sets are distinct by now, but two different un-curated
+	// bitsets can still HASH to the same generated word (two "Toss-Up"s on one chart). Bump the
+	// later course's name-salt until every offered label is unique. RNG-free and deterministic,
+	// so a reloaded outpost re-derives the same names; only generated names ever need a salt
+	// (curated names ignore it and never clash -- the theme tables hold no duplicates).
+	for (int c = 0; c < endlessCourseCnt; ++c)
+		endlessCourseNameSalt[c] = 0;
+	for (int c = 1; c < endlessCourseCnt; ++c)
+	{
+		for (int guard = 0; guard < 64; ++guard)
+		{
+			const char *name = endlessComboNameSalted(endlessCourseMod[c], endlessCourseNameSalt[c]);
+			bool clash = false;
+			for (int k = 0; k < c && !clash; ++k)
+				if (strcmp(name, endlessComboNameSalted(endlessCourseMod[k], endlessCourseNameSalt[k])) == 0)
+					clash = true;
+			if (!clash)
+				break;
+			++endlessCourseNameSalt[c];
+		}
+	}
 }
 
 // Resolve a saved/chosen (episode, section) back to a real endless-safe level file. Prefer the
@@ -4493,7 +4584,7 @@ const char *endlessCourseName(int i)
 		return "";
 	if (endlessForced && i == 0)
 		return "Ambush!";
-	return endlessComboName(endlessCourseMod[i]);
+	return endlessComboNameSalted(endlessCourseMod[i], endlessCourseNameSalt[i]);
 }
 
 // The help line is a short RISK SUMMARY only -- the itemized threats/boons are drawn on the
@@ -4564,6 +4655,25 @@ int endlessCourseModRows(int i, EndlessCourseModRow *rows, int max)
 		// row of its own -- it rides the gravity bit and only changes the pull's direction).
 		if (endlessModTable[t].bit == ENDLESS_MOD_GRAVITY && (mods & ENDLESS_MOD_GRAVITY_OMNI))
 			rows[n].word = "pull any direction";
+		++n;
+	}
+	// Overclock/Overload ALSO speed the scroll, but their table row only claims the enemy attacks --
+	// list the scroll effect as its OWN red row (same words as Slipstream/Warp), so the two effects
+	// never blur back into one ambiguous "scroll + fire" phrase. Display-only: the course's danger
+	// score/payout still come from the single bit. Skipped when a real scroll bit already supplies
+	// the row (no such generated combo exists; belt-and-braces for hand-built sets).
+	if (n < max && (mods & ENDLESS_MOD_OVERLOAD) && !(mods & ENDLESS_MOD_WARP))
+	{
+		rows[n].word    = "much faster scrolling";
+		rows[n].weight  = 14;  // sorts right under Overload's 15; same deep-red band as Warp's 20
+		rows[n].hostile = true;
+		++n;
+	}
+	else if (n < max && (mods & ENDLESS_MOD_OVERCLOCK) && !(mods & (ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_WARP)))
+	{
+		rows[n].word    = "faster scrolling";
+		rows[n].weight  = 9;  // sorts right under Overclock's 10; same pale-red band as Slipstream's 6
+		rows[n].hostile = true;
 		++n;
 	}
 	for (int a = 1; a < n; ++a)  // insertion sort, worst first; n is tiny

@@ -37,10 +37,10 @@ enum {
 	ENDLESS_MOD_DILATION    = 1u << 14, // enemy shots move much slower (boon)
 	ENDLESS_MOD_FAVOR       = 1u << 15, // the next outpost slashes its prices (boon)
 	ENDLESS_MOD_CURSED      = 1u << 16, // a fortune in cash, but the next shop is barren (mixed)
-	ENDLESS_MOD_OVERCLOCK   = 1u << 17, // faster enemy fire, projectiles AND scroll pace (hostile)
-	ENDLESS_MOD_SLIPSTREAM  = 1u << 18, // just the scroll pace is sped up (the easy Overclock)
+	ENDLESS_MOD_OVERCLOCK   = 1u << 17, // faster enemy fire, projectiles AND scroll pace (hostile; monitor lists fire and scroll as separate rows)
+	ENDLESS_MOD_SLIPSTREAM  = 1u << 18, // ONLY the scroll pace is sped up -- the level rushes at you (hostile)
 	ENDLESS_MOD_OVERLOAD    = 1u << 19, // Overclock cranked WAY up -- brutal fire/shots/scroll (rare)
-	ENDLESS_MOD_WARP        = 1u << 20, // Slipstream cranked WAY up -- the level BLURS past (rare boon)
+	ENDLESS_MOD_WARP        = 1u << 20, // Slipstream cranked WAY up -- the level BLURS past (rare threat)
 	ENDLESS_MOD_OVERDRIVE = 1u << 21,// E-Shop "Overdrive" buy: Turbodrive + each kill stacks fire/damage
 	ENDLESS_MOD_BACKFIRE  = 1u << 22, // Backfire (Evil Turbodrive): each kill briefly JAMS your guns (slower fire)
 	ENDLESS_MOD_BURNOUT   = 1u << 23, // Burnout (Evil Overdrive): the jam PLUS each kill stacks a fire+damage penalty

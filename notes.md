@@ -353,6 +353,23 @@ mutable `last`, so a Quit-Level retry replays the same track.
   same net danger score; keep their thresholds in lockstep so the pair never
   disagree. Tier thresholds: ≤9 Low, ≤13 Moderate, ≤19 Tough, ≤26 High, ≤33
   Severe, ≤39 Deadly, ≤49 Extreme, ≤59 NIGHTMARE, >59 APOCALYPSE.
+- Faster scroll always reads hostile (2026-07). Mechanics unchanged: Overclock
+  (+70%) / Overload (+220%) still speed fire + shots + scroll together, and
+  Slipstream / Warp are the scroll-only versions at the same strengths — but
+  Slipstream/Warp moved to `ENDLESS_HOSTILE_MASK` (red rows, weights 6/20, paid
+  like threats, cleansable), so no faster-scroll mod ever shows as a green boon.
+  The PRESENTATION is decoupled: Overclock/Overload's monitor word is now
+  "faster/extreme enemy attacks" and `endlessCourseModRows` appends a separate
+  display-only red "(much) faster scrolling" row (suppressed if a real scroll
+  bit is present), replacing the ambiguous "faster scroll + fire" phrasing;
+  curated help lines attribute fire to the foe ("foe fire/shot/scroll+").
+  Slipstream's old boon combos (Blitz / Smash and Grab / Time Warp / Power
+  Play / Payday) moved to `endlessMixedThemes` (reachable via boon grafts —
+  `mixCommon` explicitly includes SLIPSTREAM), its hostile pairs (Fast Lane /
+  Runaway / Bypass) to the hostile table, and "Warp Speed" lives in a
+  naming-only `endlessWarpThemes` kept out of the shuffle pool. Slipstream
+  stays OUT of the combinable widen pool (Overclock already carries the same
+  +70% scroll — pairing them would be a redundant bit). Same bits, no save bump.
 - Rare whole-visit flavors (Jackpot ~1/25: all boons; Ambush ~1/20: one forced
   dangerous sector; Gauntlet ~1/7: all hostile). All three dice are rolled up
   front unconditionally so the seed stream stays aligned; precedence Jackpot >
@@ -376,6 +393,14 @@ mutable `last`, so a Quit-Level retry replays the same track.
   added). Un-named combos read with the right tone via three generic-name pools
   (ominous / fortunate / gambit), chosen in `endlessComboName` off
   `ENDLESS_HOSTILE_MASK` vs `ENDLESS_BOON_MASK`.
+- Names are unique per chart: distinct bitsets can hash to the same generic
+  word, so a final RNG-free pass in `endlessGenerateCourses` (after the danger
+  sort — it must consume no `endlessRand`, keeping the seed stream aligned)
+  bumps `endlessCourseNameSalt[]` until every offered label differs; the salt
+  steps a generated name to the next word in its pool and is a no-op on curated
+  names. Curated names must therefore be unique across ALL theme tables — the
+  evil twins of "Crossfire"/"Death March" were renamed "Friendly
+  Fire"/"Forced March" for this — and must not reuse a generic-pool word.
 - `endlessMixedThemes[]` supplies cosmetic names for the common gambit combos
   (pairs→quads + a few double-boon rares); `FRAGILE|DEVASTATING` is intentionally
   absent (it's the hostile table's "Glass Cannon"). The single-danger guarantee
