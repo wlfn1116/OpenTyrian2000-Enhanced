@@ -6420,6 +6420,11 @@ redo:
 
 				service_SDL_events(false);
 
+				// Classic-path (Smooth Motion off) direct mouse/touch movement for this
+				// tick, in whole ship px: computed at the mouse read below, applied in
+				// the movement block after the accel capture (VT parity: no momentum).
+				int mouseDirectDX = 0, mouseDirectDY = 0;
+
 				/* mouse input */
 				if ((inputDevice == 0 || inputDevice == 2) && has_mouse)
 				{
@@ -6439,11 +6444,37 @@ redo:
 
 					if (!vt)
 					{
-						Sint32 mouseXR;
-						Sint32 mouseYR;
-						mouseGetRelativePosition(&mouseXR, &mouseYR);
-						mouseXC += mouseXR;
-						mouseYC += mouseYR;
+						if (!isNetworkGame)
+						{
+							// Mirror the VT ship's mouse response (vt_ship_step): float
+							// relative motion x VT_MOUSE_SENS with a sub-pixel carry. The
+							// integer per-tick read floored sub-game-pixel motion to zero
+							// (slow precise motion moved nothing at large window scales)
+							// and the +-30 mouseXC clamp discarded fast-flick overflow;
+							// both read as input lag when Smooth Motion is off.
+							static float carryX[2], carryY[2];
+							const int pi = playerNum_ - 1;
+							float mxr, myr;
+							mouseGetRelativeMotionF(&mxr, &myr);
+							if (smoothies[9-1])
+								myr = -myr;  // inverted-control levels, same as the VT path
+							carryX[pi] += mxr * VT_MOUSE_SENS;
+							carryY[pi] += myr * VT_MOUSE_SENS;
+							mouseDirectDX = (int)carryX[pi];
+							mouseDirectDY = (int)carryY[pi];
+							carryX[pi] -= (float)mouseDirectDX;
+							carryY[pi] -= (float)mouseDirectDY;
+						}
+						else
+						{
+							// Network lockstep: keep the original integer read feeding
+							// the synced mouseXC pipeline.
+							Sint32 mouseXR;
+							Sint32 mouseYR;
+							mouseGetRelativePosition(&mouseXR, &mouseYR);
+							mouseXC += mouseXR;
+							mouseYC += mouseYR;
+						}
 					}
 				}
 
@@ -6549,6 +6580,12 @@ redo:
 						this_player->y += (mouseYC + 3) / 4;
 					else if (mouseYC < 0)
 						this_player->y += (mouseYC - 3) / 4;
+
+					// Direct mouse/touch move (non-network classic path): after the
+					// accel capture above so, like the VT ship, the mouse steers
+					// position without feeding momentum.
+					this_player->x += mouseDirectDX;
+					this_player->y += mouseDirectDY;
 				}
 
 				if (mouseXC > 3)

@@ -80,6 +80,9 @@ int  boss_bar_hud_left_shift(int hudRightX);  // px to shift LEFT for a right-si
 bool boss_bar_hud_needs_up_shift(void);       // true while a BOTTOM horizontal bar is shown
 
 // Variable-timestep player ship (experimental; see render notes in tyrian2.c).
+// Mouse sensitivity (ship px per px of pointer motion, orig ~1/4) is shared with
+// the classic per-tick mouse path in JE_playerMovement so both modes feel alike.
+#define VT_MOUSE_SENS 0.25f
 extern bool vt_ship;       // runtime toggle for render-rate ship simulation
 bool vt_ship_owns(void);   // true when VT currently controls the player ship
 void vt_ship_step(float dt);  // advance the ship one displayed frame (dt in ticks)

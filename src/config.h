@@ -236,7 +236,7 @@ extern int enemyBarLayout;    // EnemyBarLayout
 extern int enemyBarPosition;  // EnemyBarPosition
 extern int enemyBarOpacity;   // 0..100 (percent; 0 hides the bars)
 extern bool smoothMotion;   // interpolate motion between logic ticks for smooth high-refresh play
-void set_smooth_motion(bool enabled);  // disabling smooth motion also disables supersampling
+void set_smooth_motion(bool enabled);  // off: disables supersampling; off->on: Sub-pixel back to Auto
 extern bool extraSparks;    // raise the explosion superspark limit far above the classic 101 cap
 // Superspark projectile trails (menu: Enhancements -> Weapon Tweaks -> Superspark Weapons). Only
 // ep4/5 item data tags these projectiles; retagged per-episode by JE_applySuperSparks. notes.md §Weapons.

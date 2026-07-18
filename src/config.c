@@ -230,6 +230,10 @@ bool smoothMotion  = true;
 
 void set_smooth_motion(bool enabled)
 {
+	// Only on a real off->on transition (not the config-load self-call), so a
+	// deliberately saved Sub-pixel choice survives a restart.
+	if (enabled && !smoothMotion)
+		render_supersample = 0;  // re-arm Auto supersampling
 	smoothMotion = enabled;
 	if (!smoothMotion)
 		render_supersample = 1;

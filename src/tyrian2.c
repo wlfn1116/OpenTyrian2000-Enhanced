@@ -189,7 +189,7 @@ bool vt_ship = true;
 #define VT_FRICTION_X 1.0f  // velocity bled per tick with no x input (orig ~1/tick)
 #define VT_FRICTION_Y 0.5f  // orig y friction fires every 2nd tick => half rate
 #define VT_VMAX       4.0f  // velocity clamp/axis (orig: vel clamp 4); +VT_DIRECT gives ~5 total like the original
-#define VT_MOUSE_SENS 0.25f // screen-px ship motion per screen-px of mouse motion (orig ~1/4)
+// VT_MOUSE_SENS lives in tyrian2.h: the classic per-tick mouse path shares it
 
 static float vt_x[2], vt_y[2], vt_vx[2], vt_vy[2];
 static int vt_wrote_vx[2], vt_wrote_vy[2];  // last velocity VT wrote to player[]
@@ -202,7 +202,7 @@ static float vt_twiddle_mx[2], vt_twiddle_my[2];
 bool vt_ship_owns(void)
 {
 	return vt_ship
-	    && smoothMotion                            // user's Enhancements toggle
+	    && smoothMotion                            // user's Graphics-menu toggle
 	    && smoothScroll != 0 && frameCountMax > 0  // the render-rate present loop must run
 	    && !play_demo && !record_demo && !isNetworkGame  // determinism-sensitive
 	    && !twoPlayerMode && !endLevel;

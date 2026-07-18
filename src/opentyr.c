@@ -489,6 +489,7 @@ static void adjustMenuItemValue(MenuItemId id, int dir)
 		break;
 	case MENU_ITEM_SMOOTH_MOTION:
 		set_smooth_motion(!smoothMotion);
+		enforcePlainScalerForSupersample();  // turning on re-arms Auto; scaler rule applies
 		JE_playSampleNum(S_CURSOR);
 		break;
 	case MENU_ITEM_EXTRA_SPARKS:
@@ -641,6 +642,7 @@ static bool runOptionsMenu(MenuId startMenu)
 #endif
 				{ MENU_ITEM_SCALER, "Scaler:", "Change the pixel art scaling algorithm.", getScalerPickerItemsCount, getScalerPickerItem },
 								{ MENU_ITEM_SCALING_MODE, "Scaling Mode:", "Change the scaling mode.", getScalingModePickerItemsCount, getScalingModePickerItem },
+								{ MENU_ITEM_SMOOTH_MOTION, "Smooth Motion:", "Interpolate motion for smooth high-refresh play." },
 								{ MENU_ITEM_SUPERSAMPLE, "Sub-pixel:", "Supersample in-game motion; Auto matches the scaler.", getSupersamplePickerItemsCount, getSupersamplePickerItem },
 								{ MENU_ITEM_SS_FILTER, "Filter:", "Sub-pixel filter: Sharp, Smooth, or None (raw).", getSSFilterPickerItemsCount, getSSFilterPickerItem },
 								{ MENU_ITEM_VSYNC, "VSync:", "Sync presentation to your monitor's refresh rate." },
@@ -663,9 +665,8 @@ static bool runOptionsMenu(MenuId startMenu)
 		[MENU_ENHANCEMENTS] = {
 			.header = "Enhancements",
 			.items = {
-				{ MENU_ITEM_SMOOTH_MOTION, "Smooth Motion:", "Interpolate motion for smooth high-refresh play." },
-				{ MENU_ITEM_EXTRA_SPARKS, "Extra Sparks:", "Denser, longer-lasting explosion spark showers." },
 				{ MENU_ITEM_DEBUG_MODE, "Debug Mode:", "Enable the debug menu and debug level select." },
+				{ MENU_ITEM_EXTRA_SPARKS, "Extra Sparks:", "Denser, longer-lasting explosion spark showers." },
 				{ MENU_ITEM_ENEMY_BARS_MENU, "Enemy Bars...", "Health bars on enemies you've damaged." },
 				{ MENU_ITEM_BOSS_BARS, "Boss Health Bars...", "Style and layout of the boss health bars." },
 				{ MENU_ITEM_GAUGE_GRADS_MENU, "Gauge Gradients...", "Gradient direction of each HUD gauge." },
@@ -1752,6 +1753,7 @@ static bool runOptionsMenu(MenuId startMenu)
 				case MENU_ITEM_SMOOTH_MOTION:
 				{
 					set_smooth_motion(!smoothMotion);
+					enforcePlainScalerForSupersample();  // turning on re-arms Auto; scaler rule applies
 					JE_playSampleNum(S_CLICK);
 					break;
 				}

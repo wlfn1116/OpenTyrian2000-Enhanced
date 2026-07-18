@@ -84,6 +84,11 @@ int effective_supersample(void)
 		}
 		else
 			factor = scalers[scaler].width / vga_width;
+
+		// A 1x scaler would resolve Auto to 1x — no sub-pixel motion at all, a
+		// pointless state — so Auto always supersamples at least 2x.
+		if (factor < 2)
+			factor = 2;
 	}
 	if (factor < 1)
 		factor = 1;
