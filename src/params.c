@@ -63,7 +63,7 @@ void JE_paramCheck(int argc, char *argv[])
 		{ 'k', 'k', "death",             false },
 		{ 'r', 'r', "record",            false },
 		{ 'l', 'l', "loot",              false },
-		
+
 		{ 0, 0, NULL, false}
 	};
 	

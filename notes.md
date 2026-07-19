@@ -144,10 +144,18 @@ passes and two buffers:
 - Finalization canonicalizes the bound part of an enemy's vertical displacement
   to the exact float layer rate. Replay applies that layer transform independently
   on every bound command, including new, clipped-count-changed, and snapped commands;
-  only enemy-local motion comes from cross-tick matching. The two components are
-  rounded separately so the layer phase cannot inject a 1px error into local motion,
-  and the large-jump guard tests only local motion rather than rejecting a legitimate
-  high-speed layer delta.
+  only enemy-local motion comes from cross-tick matching. The large-jump guard tests
+  only local motion rather than rejecting a legitimate high-speed layer delta.
+- The layer offset and the entity-local offset are rounded as ONE value
+  (`rl_layer_y_offset` takes `par_yown100`). Rounding them separately puts each on
+  its own staircase; whenever the entity moves against the scroll (own opposing the
+  layer rate, e.g. own100 = -200 for a 1px/tick upward swimmer on a 1px/tick layer)
+  the thresholds interleave and the sum steps down-up-down inside a single tick — a
+  1px sawtooth visible at scale 1 and diluted to 1/N px at supersample N (EP5
+  CORAL's launched fish around the locked boss). A resting entity (own 0) still
+  gets the background rows' expression bit-for-bit, so terrain gluing is unchanged,
+  and a scroll-cancelling boss (own == -rate) reduces to the constant `frac` — held
+  perfectly still at every alpha even under a fractional endless boost rate.
 - The smooth-scroll accumulator is quantized in hundredths. Replay reconstructs those
   integer hundredths and evaluates the canonical layer offset in double precision;
   subtracting a large rate directly in `float` can turn an exact `-N.5` tick endpoint

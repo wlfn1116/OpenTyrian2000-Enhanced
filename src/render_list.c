@@ -245,11 +245,6 @@ static inline int rl_iround(float v)
 	return (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
 }
 
-static inline int rl_idround(double v)
-{
-	return (int)(v + (v >= 0.0 ? 0.5 : -0.5));
-}
-
 // Round a fractional POSITION offset to the nearest pixel, with exact integer-translation
 // invariance. Unlike round-half-away-from-zero, floor(x + .5) gives the same result after any
 // integer translation; a negative background row and positive enemy therefore cannot separate
@@ -265,7 +260,15 @@ static inline int rl_round_offset(double v)
 // after its integer advance; replay preserves its authored base step but removes any modifier-added
 // part, then uses the shared lagged fractional clock. `now` remains available for callers that
 // genuinely need the current phase.
-static inline int rl_layer_y_offset(int layer, bool now, float inv, int scale)
+//
+// own100 is the bound entity's own per-tick displacement (par_yown100; background rows pass 0),
+// folded into the SAME rounded value. Rounding the layer and own offsets separately makes their
+// staircases interleave whenever the entity moves against the scroll (own opposing the rate):
+// the sum then steps down-up-down inside one tick -- a 1px sawtooth at scale 1 (CORAL's upward-
+// swimming launched fish). One combined round keeps own100 == 0 bit-identical to the background
+// rows, holds a scroll-cancelling boss (rate + own == 0) perfectly still at every alpha, and
+// tracks a mover's true position within half a pixel, monotonically. notes.md §Sub-pixel parallax.
+static inline int rl_layer_y_offset(int layer, bool now, float inv, int scale, int own100)
 {
 	const float rate = now ? bg_layer_dy_now[layer] : bg_layer_dy[layer];
 	const float frac = now ? bg_layer_yfrac_now[layer] : bg_layer_yfrac[layer];
@@ -274,7 +277,7 @@ static inline int rl_layer_y_offset(int layer, bool now, float inv, int scale)
 	// endpoint into -N.500000004 under a fast rate, which half-up then rounds one pixel backward.
 	const int rate100 = rl_iround(rate * 100.0f);
 	const int frac100 = rl_iround(frac * 100.0f);
-	const double offset = ((double)frac100 - (double)rate100 * (double)inv) *
+	const double offset = ((double)frac100 - (double)(rate100 + own100) * (double)inv) *
 	                      (double)scale / 100.0;
 	return rl_round_offset(offset);
 }
@@ -985,24 +988,19 @@ static void rl_replay_common(SDL_Surface *dst, float inv, float alpha, bool appl
 				const int L = c->id - RL_ID_BG_BASE;
 				const int phase_base = (L == 3) ? -endlessScrollExtraPx3 : 0;
 				y = (c->y + phase_base) * scale +
-				    rl_layer_y_offset(L, false, inv, scale);
+				    rl_layer_y_offset(L, false, inv, scale, 0);
 			}
 			else if (use_override && c->par_ylayer != 0)
 			{
-				// Scroll-tracked entity (enemy / HP bar): apply the canonical layer transform
-				// independently from entity-local movement. The first offset is therefore
-				// bit-identical to the background's even for a new command, a changed multi-blit
-				// count, or a snapped slot. Rounding own motion separately prevents the shared
-				// fast-scroll phase from shifting its rounding threshold by one pixel.
+				// Scroll-tracked entity (enemy / HP bar): the canonical layer transform with
+				// the entity-local displacement folded into the same single round (see
+				// rl_layer_y_offset). A resting entity (own100 == 0) stays bit-identical to
+				// the background's offset even for a new command, a changed multi-blit count,
+				// or a snapped slot; an entity opposing the scroll no longer saws 1px inside
+				// the tick from two interleaved rounding staircases.
 				const int L = c->par_ylayer;
 				y = (c->y + c->par_ybase) * scale +
-				    rl_layer_y_offset(L, false, inv, scale);
-				if (c->par_yown100 != 0 && inv != 0.0f)
-				{
-					const double own_offset = (double)c->par_yown100 * (double)inv *
-					                          (double)scale / 100.0;
-					y -= rl_idround(own_offset);
-				}
+				    rl_layer_y_offset(L, false, inv, scale, c->par_yown100);
 			}
 			else if (c->dy && inv != 0.0f)
 			{
