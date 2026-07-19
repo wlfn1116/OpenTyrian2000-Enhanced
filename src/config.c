@@ -220,9 +220,18 @@ int bossBarTwoMode = BOSS_BAR_TWO_STACKED;
 bool debugMode     = true;
 /* Wider horizontal background parallax: a strafe sweeps all three layers across their full map
    width (revealing the ~1 tile normally hidden off the left) instead of the narrow stock sway.
-   Off restores the exact original amplitude. Read as the parallax_span selector in mainint.c and
-   the OOB clamp gate in backgrnd.c (bg_clamp_map). Off by default (stock behavior). */
+   Where the mid/deep layers over-pan past their map's side edge, the edge continues as a
+   horizontally-flipped mirror of itself (backgrnd.c bg_mirror_setup/bg_mirror_tile) instead of
+   ending in a content seam. Off restores the exact original amplitude and draw. Read as the
+   parallax_span selector in mainint.c and the mirror gate in backgrnd.c. Off by default. */
 bool extraParallax = false;
+/* Where a background layer's read window slides past its map row's side edge, continue it as
+   a horizontally-flipped mirror image (backgrnd.c bg_mirror_setup/bg_mirror_tile). Works in
+   both parallax modes: Extra Parallax over-pans the mid/deep layers far past their edges, and
+   even the stock span uncovers ~12px of layer 3's left edge at far-left. Off = the original
+   draw: the uncovered span shows adjacent-row tiles (the visible content seam), with the
+   pointer clamped in bounds only under Extra Parallax (stock keeps its harmless edge read). */
+bool mirroredLayers = true;
 /* Thin health bar near an enemy once damaged (draw_enemy_health_bars in tyrian2.c). */
 bool enemyBars       = true;
 int enemyBarLayout   = ENEMY_BAR_HORIZONTAL;
@@ -461,6 +470,10 @@ bool load_opentyrian_config(void)
 		int extra_parallax_enabled = extraParallax ? 1 : 0;
 		config_get_int_option(section, "extra_parallax", &extra_parallax_enabled);
 		extraParallax = (extra_parallax_enabled != 0);
+
+		int mirrored_layers_enabled = mirroredLayers ? 1 : 0;
+		config_get_int_option(section, "mirrored_layers", &mirrored_layers_enabled);
+		mirroredLayers = (mirrored_layers_enabled != 0);
 
 		// Music device (OPL3 / FluidSynth / Native MIDI) + SoundFont path. The
 		// MIDI devices only take effect in a WITH_MIDI build; otherwise init_audio()
@@ -705,6 +718,7 @@ bool save_opentyrian_config(void)
 	config_set_int_option(section, "smooth_motion", smoothMotion ? 1 : 0);
 	config_set_int_option(section, "extra_sparks", extraSparks ? 1 : 0);
 	config_set_int_option(section, "extra_parallax", extraParallax ? 1 : 0);
+	config_set_int_option(section, "mirrored_layers", mirroredLayers ? 1 : 0);
 	config_set_string_option(section, "music_device", music_device_names[music_device]);
 	config_set_string_option(section, "soundfont", soundfont);
 	for (int i = 0; i < SSW_COUNT; ++i)

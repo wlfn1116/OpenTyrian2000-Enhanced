@@ -83,11 +83,14 @@ extern bool background_advance;
 
 void JE_darkenBackground(JE_word neat);
 
-void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map);
-void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map);
+// mirror_w/col0: Extra Parallax edge mirroring -- columns that fall outside the map row
+// render as its horizontally-flipped reflection (see bg_mirror_tile in backgrnd.c).
+// mirror_w 0 = off (stock reads).
+void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map, int mirror_w, int col0);
+void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map, int mirror_w, int col0);
 // Supersampled variant (render-list replay only): x,y are HI-buffer coordinates;
 // each tile pixel is drawn as a scale x scale block, fully clipped, never recorded.
-void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map, int scale, bool blend);
+void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map, int scale, bool blend, int mirror_w, int col0);
 
 void draw_background_1(SDL_Surface *surface);
 void draw_background_2(SDL_Surface *surface);

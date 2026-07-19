@@ -143,7 +143,7 @@ void rl_rec_sprite(int x, int y, unsigned int table, unsigned int index, RenderC
 	c->black = black;
 }
 
-void rl_rec_bg_row(int x, int y, Uint8 **map, bool blend)
+void rl_rec_bg_row(int x, int y, Uint8 **map, bool blend, int mirror_w, int col0)
 {
 	RenderCmd *c = rl_push();
 	if (c == NULL)
@@ -152,6 +152,8 @@ void rl_rec_bg_row(int x, int y, Uint8 **map, bool blend)
 	c->x = x;
 	c->y = y;
 	c->map = map;
+	c->bg_mirror_w = (Sint8)mirror_w;
+	c->bg_col0 = (Sint8)col0;
 }
 
 void rl_rec_star(int x, float y, float dy, Uint8 color)
@@ -657,8 +659,8 @@ static void rl_draw_cmd(SDL_Surface *dst, const RenderCmd *c, int x, int y)
 	case RC_SPRITE_HV_BLEND:     blit_sprite_hv_blend(dst, x, y, c->table, c->index, c->hue, c->value); break;
 	case RC_SPRITE_HV_UNSAFE:    blit_sprite_hv_unsafe(dst, x, y, c->table, c->index, c->hue, c->value); break;
 	case RC_SPRITE_DARK:         blit_sprite_dark(dst, x, y, c->table, c->index, c->black); break;
-	case RC_BG_ROW:              blit_background_row(dst, x, y, c->map); break;
-	case RC_BG_ROW_BLEND:        blit_background_row_blend(dst, x, y, c->map); break;
+	case RC_BG_ROW:              blit_background_row(dst, x, y, c->map, c->bg_mirror_w, c->bg_col0); break;
+	case RC_BG_ROW_BLEND:        blit_background_row_blend(dst, x, y, c->map, c->bg_mirror_w, c->bg_col0); break;
 	case RC_STAR:                draw_starfield_star(dst, c->star_x, (int)(c->star_y + 0.5f), c->star_color); break;
 	case RC_FILTER_SCREEN:       JE_filterScreenApply(dst, (JE_shortint)c->filt_col, (JE_shortint)c->filt_bright); break;
 	}
@@ -685,8 +687,8 @@ static void rl_draw_cmd_scaled(SDL_Surface *dst, const RenderCmd *c, int x, int 
 	case RC_SPRITE_HV_BLEND:     blit_sprite_table_scaled(dst, x, y, c->table, c->index, scale, BLITT_HV_BLEND, c->hue, c->value, false); break;
 	case RC_SPRITE_HV_UNSAFE:    blit_sprite_table_scaled(dst, x, y, c->table, c->index, scale, BLITT_HV_UNSAFE, c->hue, c->value, false); break;
 	case RC_SPRITE_DARK:         blit_sprite_table_scaled(dst, x, y, c->table, c->index, scale, BLITT_DARK, 0, 0, c->black); break;
-	case RC_BG_ROW:              blit_background_row_scaled(dst, x, y, c->map, scale, false); break;
-	case RC_BG_ROW_BLEND:        blit_background_row_scaled(dst, x, y, c->map, scale, true); break;
+	case RC_BG_ROW:              blit_background_row_scaled(dst, x, y, c->map, scale, false, c->bg_mirror_w, c->bg_col0); break;
+	case RC_BG_ROW_BLEND:        blit_background_row_scaled(dst, x, y, c->map, scale, true, c->bg_mirror_w, c->bg_col0); break;
 	default:                     break;
 	}
 }

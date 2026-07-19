@@ -232,6 +232,7 @@ extern int bossBarLayout;   // BossBarLayout
 extern int bossBarTwoMode;  // BossBarTwoMode
 extern bool debugMode;      // gates the debug menu and debug level select
 extern bool extraParallax;  // wider all-layer horizontal parallax (strafe sweeps the full map width); off = original amplitude
+extern bool mirroredLayers; // over-panned layer edges continue as a flipped mirror image (both parallax modes)
 extern bool enemyBars;      // show a small health bar on damaged enemies
 extern int enemyBarLayout;    // EnemyBarLayout
 extern int enemyBarPosition;  // EnemyBarPosition

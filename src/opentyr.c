@@ -343,6 +343,7 @@ typedef enum
 	MENU_ITEM_GAUGE_FLASH_ARMOR,
 	MENU_ITEM_DEBUG_MODE,
 	MENU_ITEM_EXTRA_PARALLAX,
+	MENU_ITEM_MIRRORED_LAYERS,      // over-panned layer edges mirror (works in both parallax modes)
 	MENU_ITEM_SMOOTH_MOTION,
 	MENU_ITEM_EXTRA_SPARKS,
 	MENU_ITEM_XMAS,
@@ -490,6 +491,10 @@ static void adjustMenuItemValue(MenuItemId id, int dir)
 		break;
 	case MENU_ITEM_EXTRA_PARALLAX:
 		extraParallax = !extraParallax;
+		JE_playSampleNum(S_CURSOR);
+		break;
+	case MENU_ITEM_MIRRORED_LAYERS:
+		mirroredLayers = !mirroredLayers;
 		JE_playSampleNum(S_CURSOR);
 		break;
 	case MENU_ITEM_SMOOTH_MOTION:
@@ -672,6 +677,7 @@ static bool runOptionsMenu(MenuId startMenu)
 			.items = {
 				{ MENU_ITEM_DEBUG_MODE, "Debug Mode:", "Enable the debug menu and debug level select." },
 				{ MENU_ITEM_EXTRA_PARALLAX, "Extra Parallax:", "Wider parallax: strafing sweeps the whole map." },
+				{ MENU_ITEM_MIRRORED_LAYERS, "Mirrored Layers:", "Over-panned layer edges continue as a mirror." },
 				{ MENU_ITEM_EXTRA_SPARKS, "Extra Sparks:", "Denser, longer-lasting explosion spark showers." },
 				{ MENU_ITEM_ENEMY_BARS_MENU, "Enemy Bars...", "Health bars on enemies you've damaged." },
 				{ MENU_ITEM_BOSS_BARS, "Boss Health Bars...", "Style and layout of the boss health bars." },
@@ -1063,6 +1069,10 @@ static bool runOptionsMenu(MenuId startMenu)
 				draw_font_hv_shadow(VGAScreen, xMenuItemValue, y, extraParallax ? "On" : "Off", normal_font, left_aligned, 15, -3 + (selected ? 2 : 0) + (disabled ? -4 : 0), false, 2);
 				break;
 
+			case MENU_ITEM_MIRRORED_LAYERS:
+				draw_font_hv_shadow(VGAScreen, xMenuItemValue, y, mirroredLayers ? "On" : "Off", normal_font, left_aligned, 15, -3 + (selected ? 2 : 0) + (disabled ? -4 : 0), false, 2);
+				break;
+
 			case MENU_ITEM_SMOOTH_MOTION:
 				draw_font_hv_shadow(VGAScreen, xMenuItemValue, y, smoothMotion ? "On" : "Off", normal_font, left_aligned, 15, -3 + (selected ? 2 : 0) + (disabled ? -4 : 0), false, 2);
 				break;
@@ -1276,6 +1286,7 @@ static bool runOptionsMenu(MenuId startMenu)
 									case MENU_ITEM_GAUGE_FLASH_ARMOR:
 									case MENU_ITEM_DEBUG_MODE:
 									case MENU_ITEM_EXTRA_PARALLAX:
+									case MENU_ITEM_MIRRORED_LAYERS:
 									case MENU_ITEM_SMOOTH_MOTION:
 									case MENU_ITEM_EXTRA_SPARKS:
 									case MENU_ITEM_XMAS:
@@ -1764,6 +1775,12 @@ static bool runOptionsMenu(MenuId startMenu)
 				case MENU_ITEM_EXTRA_PARALLAX:
 				{
 					extraParallax = !extraParallax;
+					JE_playSampleNum(S_CLICK);
+					break;
+				}
+				case MENU_ITEM_MIRRORED_LAYERS:
+				{
+					mirroredLayers = !mirroredLayers;
 					JE_playSampleNum(S_CLICK);
 					break;
 				}

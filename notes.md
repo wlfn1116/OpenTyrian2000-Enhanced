@@ -143,15 +143,8 @@ passes and two buffers:
   over-pan (`mapX3Ofs → 125`, `mapX2Ofs → 72` at far-left). At `mapXOfs == 36`,
   `mapXPos == 12`, so the near layer's lone wrong-row boundary tile spans screen
   `[0,24)`, entirely inside the crop margin — no visible seam.
-- Over-pan out-of-bounds guard. The mid/deep layers now pan far enough that their
-  14-tile read window runs *before* the start of their map array at the top-of-scroll
-  edge (`mapXbpPos` goes to −2/−4). `mainmap` is the first struct member, so that read
-  would dereference tile pointers from adjacent globals — UB, and a crash risk on the
-  console ports. `draw_background_{1,2,3}` therefore clamp the initial (lowest) read
-  pointer to `&megaDataN.mainmap[0][0]` (`bg_clamp_map`); the draw loops only advance
-  downward, so one clamp covers every row. Result: the intended "uncovered edges" show
-  repeated row-0 / black tiles instead of crashing. Stock already sat at layer 3's
-  in-bounds limit (72 vs safe 71), which is why widening *requires* this clamp.
+- Over-pan past the map's side edge is handled by the edge mirror (next section),
+  which also subsumed the old `bg_clamp_map` out-of-bounds guard.
 - The legacy z-order can put a layer and its bound enemies on opposite sides of
   `JE_mainGamePlayerFunctions`, which also recalculates horizontal parallax. The
   entity may therefore carry the previous anchor while its layer carries the new
@@ -210,6 +203,54 @@ passes and two buffers:
   integer hundredths and evaluates the canonical layer offset in double precision;
   subtracting a large rate directly in `float` can turn an exact `-N.5` tick endpoint
   into `-N.500000004` and round it one pixel backward.
+
+### Extra Parallax edge mirror — `backgrnd.c`, `render_list.c`
+
+- The problem: with Extra Parallax on, the mid/deep layers over-pan far enough at
+  far-left that their map's left edge slides *into* the window (deep layer's plane-px 0
+  reaches screen x `mapX3Ofs − 36` = 89 at full pan, i.e. 65 px inside the 24-px window
+  edge; mid layer 36 − 72 → 12 px inside… up to ~2–3 tile columns). The maps are stored
+  row-major, so the columns read past the row start came from the *previous row's right
+  side* — a hard content seam where the layer visibly "ended".
+- The fix: columns outside `[0, row_width)` re-read the same row's columns in reflected
+  order and render horizontally FLIPPED (`bg_mirror_tile`): tile column `c < 0` →
+  column `−1−c` flipped, `c ≥ w` → `2w−1−c` flipped. Per-tile reflection + pixel flip
+  compose to the exact plane-pixel mirror `p → −1−p` about the edge, so the layer
+  continues as a seamless reflection of itself (mirrored-repeat, like GL's
+  `MIRRORED_REPEAT`). Same-row sourcing means vertical scroll stays coherent for free.
+- Gated by the **Mirrored Layers** toggle (`mirroredLayers`, default on, config key
+  `mirrored_layers`), an Enhancements row directly under Extra Parallax. Independent of
+  `extraParallax`: the stock span also uncovers ~12px of layer 3's left edge at
+  far-left (plane-px 0 sits at screen `mapX3Ofs − 36` = 36 vs window-left 24), so the
+  mirror covers that sliver too. Off = the original draw: adjacent-row wrap seam, with
+  the pointer clamp applied only under Extra Parallax (`bg_mirror_setup` reduces to the
+  old `bg_clamp_map` expression, `mirror_w` 0); stock+off is byte-for-byte original.
+  Adding the 11th row auto-compresses the Enhancements pitch 15→13 px (the `y<=172`
+  fit rule).
+- Ship cast-shadow re-centre: the shadow x rides `- mapX2Ofs + shadow_light_dx`
+  (`mainint.c` player draw), where the constant is mapX2Ofs at mid-travel so the swing
+  is symmetric. Extra Parallax widens the sweep (72..−1 vs stock 36..−1), moving the
+  mid-travel value from 18 to 34 (u=0.5 → w_f=69.5 → (69−17)*2/3), so
+  `shadow_light_dx = extraParallax ? 34 : 18`.
+- Plumbing: the row blitters (`blit_background_row`/`_blend`/`_scaled`) take
+  `mirror_w` (map row width in tiles: 14, layer 3 = 15; 0 = off → stock reads,
+  byte-for-byte) and `col0` (map-column index of `map[0]`). `rl_rec_bg_row` stores both
+  in the `RenderCmd` (`bg_mirror_w`/`bg_col0`) so every render-rate replay — 1x and
+  supersampled — mirrors identically. `col0` comes from the layer's `bpPos`:
+  `mapXbpPos − 1` for the 14-wide layers (the `mapYPos` pointers carry a −1 bias),
+  `mapX3bpPos` for the 15-wide layer 3; the smoothie x-sync and `background3x1` welds
+  inherit the right value because they redirect `bpPos` itself.
+- `bg_mirror_setup` replaced `bg_clamp_map`: reflected columns never dereference before
+  `mainmap[0][0]`, so the old top-of-scroll clamp (which snapped the whole call's X
+  phase to column 0) is only kept as a fallback for the level-end state that re-points
+  `mapYPos` at row 0 without the −1 bias. Normal top-of-scroll far-left now keeps its
+  column phase and mirrors instead of popping.
+- The near layer passes mirror params too but never triggers them in-window (it pans
+  flush by design); its lone boundary tile at `[0,24)` sits in the crop margin. The
+  right edge never exposes either (`mapX2Ofs` floor −1 above, layer 3's 15th column) —
+  the `c ≥ w` branch is defensive for any future span widening.
+- Enemies bound to the layers are sprites, not tiles: they slide over the mirrored
+  region unreflected (same as before; intentional).
 
 ### Slow-scroll smoothing — `endless.c`, `tyrian2.c`, `render_list.c`
 

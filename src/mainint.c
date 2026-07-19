@@ -7034,8 +7034,10 @@ redo:
 		// Cast-shadow horizontal light offset. The shadow rides the background-2
 		// parallax (- mapX2Ofs); this value equals mapX2Ofs at the centre of the ship's
 		// x-range, re-centring the shadow under the hull at mid-screen so it swings
-		// symmetrically. (The old 30 suited the original 320px parallax curve.)
-		const int shadow_light_dx = 18;
+		// symmetrically. (The old 30 suited the original 320px parallax curve.) Extra
+		// Parallax widens the mapX2Ofs sweep to 72..-1, putting its mid-travel value at
+		// 34 (u=0.5: w_f=69.5 -> (69-17)*2/3), so the offset follows the mode.
+		const int shadow_light_dx = extraParallax ? 34 : 18;
 
 		if (shipGr_ == 0)
 		{
@@ -7619,8 +7621,9 @@ void JE_mainGamePlayerFunctions(void)
 		// right edge). Normalized over the ship's ACTUAL x-travel so BOTH walls are reached: the stock
 		// [40,363] normalization only hits u~0.81 at the right wall, leaving mapXOfs at ~2 (the ~4px of
 		// map that was still off the right edge). w_f is back-derived (3*near + 17) so the mid/deep
-		// layers keep the coupled ratio and still over-pan/uncover their edges at far-left (bg_clamp_map
-		// guards the resulting out-of-bounds tile read there). notes.md §Sub-pixel parallax.
+		// layers keep the coupled ratio and still over-pan past their edges at far-left; the uncovered
+		// span renders as the layer's own mirror image (backgrnd.c bg_mirror_tile), which also covers
+		// the out-of-bounds tile read the old clamp guarded. notes.md §Sub-pixel parallax.
 		const float travel = (float)((PLAYFIELD_WIDTH - SHIP_RIGHT_MARGIN) - SHIP_LEFT_MARGIN);
 		float uu = (tempX - SHIP_LEFT_MARGIN) / travel;
 		if (uu < 0.0f)

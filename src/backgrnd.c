@@ -155,17 +155,36 @@ void JE_darkenBackground(JE_word neat)  /* wild detail level */
 	}
 }
 
-void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map)
+// Extra Parallax widens the horizontal pan (mainint.c parallax_span) enough that the mid/deep
+// layers' read window slides past the side edge of their map rows. Out-of-row columns used to
+// wrap into the adjacent map row (a visible content seam where the layer "ends"); now they
+// re-read the row's edge columns in reflected order and render horizontally FLIPPED, so the
+// layer continues past its edge as a pixel-exact mirror image. Activated per row batch by
+// bg_mirror_setup (mirror_w = row width in tiles, 0 = off; col0 = map-column index of map[0]).
+// notes.md §Extra Parallax edge mirror.
+static Uint8 *bg_mirror_tile(Uint8 **map, int tile, int mirror_w, int col0, bool *flip)
+{
+	*flip = false;
+	if (mirror_w == 0)
+		return map[tile];
+	const int c = col0 + tile;
+	if (c >= 0 && c < mirror_w)
+		return map[tile];
+	*flip = true;
+	return (map - col0)[c < 0 ? -1 - c : 2 * mirror_w - 1 - c];
+}
+
+void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map, int mirror_w, int col0)
 {
 	assert(surface->format->BitsPerPixel == 8);
 
 	if (render_list_recording)
-		rl_rec_bg_row(x, y, map, false);
+		rl_rec_bg_row(x, y, map, false, mirror_w, col0);
 
 	Uint8 *pixels = (Uint8 *)surface->pixels + (y * surface->pitch) + x,
 	      *pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	      *pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
-	
+
 	const int tile_count = BG_TILE_COUNT;
 	const int row_width = tile_count * BG_TILE_W;
 	for (int y = 0; y < 28; y++)
@@ -179,44 +198,46 @@ void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map)
 
 		for (int tile = 0; tile < tile_count; tile++)
 		{
-			Uint8* data = *(map + tile);
-			
+			bool flip;
+			Uint8* data = bg_mirror_tile(map, tile, mirror_w, col0, &flip);
+
 			// no tile; skip tile
 			if (data == NULL)
 			{
 				pixels += 24;
 				continue;
 			}
-			
-			data += y * 24;
-			
+
+			data += y * 24 + (flip ? 23 : 0);
+			const int step = flip ? -1 : 1;
+
 			for (int x = 24; x; x--)
 			{
 				if (pixels >= pixels_ul)
 					return;
 				if (pixels >= pixels_ll && *data != 0)
 					*pixels = *data;
-				
+
 				pixels++;
-				data++;
+				data += step;
 			}
 		}
-		
+
 		pixels += surface->pitch - row_width;
 	}
 }
 
-void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map)
+void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map, int mirror_w, int col0)
 {
 	assert(surface->format->BitsPerPixel == 8);
 
 	if (render_list_recording)
-		rl_rec_bg_row(x, y, map, true);
+		rl_rec_bg_row(x, y, map, true, mirror_w, col0);
 
 	Uint8 *pixels = (Uint8 *)surface->pixels + (y * surface->pitch) + x,
 	      *pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	      *pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
-	
+
 	const int tile_count = BG_TILE_COUNT;
 	const int row_width = tile_count * BG_TILE_W;
 	for (int y = 0; y < 28; y++)
@@ -230,36 +251,38 @@ void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map)
 
 		for (int tile = 0; tile < tile_count; tile++)
 		{
-			Uint8* data = *(map + tile);
-			
+			bool flip;
+			Uint8* data = bg_mirror_tile(map, tile, mirror_w, col0, &flip);
+
 			// no tile; skip tile
 			if (data == NULL)
 			{
 				pixels += 24;
 				continue;
 			}
-			
-			data += y * 24;
-			
+
+			data += y * 24 + (flip ? 23 : 0);
+			const int step = flip ? -1 : 1;
+
 			for (int x = 24; x; x--)
 			{
 				if (pixels >= pixels_ul)
 					return;
 				if (pixels >= pixels_ll && *data != 0)
 					*pixels = (*data & 0xf0) | (((*pixels & 0x0f) + (*data & 0x0f)) / 2);
-				
+
 				pixels++;
-				data++;
+				data += step;
 			}
 		}
-		
+
 		pixels += surface->pitch - row_width;
 	}
 }
 
 // Supersampled tile row (render-list replay only; see backgrnd.h). One loop serves
 // both the copy and blend ops — the pixel math matches the 1x blitters above.
-void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map, int scale, bool blend)
+void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map, int scale, bool blend, int mirror_w, int col0)
 {
 	assert(surface->format->BitsPerPixel == 8);
 
@@ -281,7 +304,8 @@ void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map,
 		int hx = x;
 		for (int tile = 0; tile < tile_count; ++tile)
 		{
-			const Uint8 *data = map[tile];
+			bool flip;
+			const Uint8 *data = bg_mirror_tile(map, tile, mirror_w, col0, &flip);
 
 			if (data == NULL)  // no tile; skip
 			{
@@ -289,9 +313,10 @@ void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map,
 				continue;
 			}
 
-			data += ty * BG_TILE_W;
+			data += ty * BG_TILE_W + (flip ? BG_TILE_W - 1 : 0);
+			const int dstep = flip ? -1 : 1;
 
-			for (int sx = 0; sx < BG_TILE_W; ++sx, ++data, hx += scale)
+			for (int sx = 0; sx < BG_TILE_W; ++sx, data += dstep, hx += scale)
 			{
 				const Uint8 d = *data;
 				if (d == 0)
@@ -323,17 +348,29 @@ void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map,
 	}
 }
 
-// Extra Parallax widens the horizontal pan (mainint.c parallax_span) enough that a layer's
-// 14-tile read window can run before the start of its map array at the top-of-scroll edge -- the
-// over-pan that intentionally uncovers the map's side edges. Clamp the read pointer to the map
-// base so that over-pan reads row 0 (repeat) instead of dereferencing tile pointers from out of
-// bounds. `base` is &megaDataN.mainmap[0][0]; the draw loops only advance the pointer downward
-// (higher rows), so clamping the initial (lowest) pointer covers every row drawn this call.
-// Gated on extraParallax: with the feature off the offsets stay in stock range and this is a
-// no-op, preserving the original (including its harmless 1-element edge read) byte-for-byte.
-static Uint8 **bg_clamp_map(Uint8 **map, Uint8 **base)
+// Prepare a layer's row walk. Mirrored Layers off: stock pointers -- with Extra Parallax on,
+// clamp the read pointer to the map base (the old bg_clamp_map out-of-bounds guard: uncovered
+// edges show the adjacent-row wrap / repeated row 0); with it off this is the original draw
+// byte-for-byte (including its harmless 1-element edge read). Mirrored Layers on works in
+// EITHER parallax mode -- even the stock span uncovers ~12px of layer 3's left edge at
+// far-left: enable edge mirroring for the batch; the walk keeps its column phase even when
+// `map` starts before `base`, because bg_mirror_tile resolves out-of-row columns from inside
+// the row -- which is the OOB dereference the clamp guarded against. If the first ROW itself
+// starts before the map (level-end re-points mapYPos at row 0), fall back to that clamp: draw
+// from row 0, mirroring inert. The draw loops only advance the pointer downward, so checking
+// the initial (lowest) row covers every row drawn this call.
+static Uint8 **bg_mirror_setup(Uint8 **map, Uint8 **base, int width, int col0, int *out_w, int *out_c0)
 {
-	return (extraParallax && map < base) ? base : map;
+	if (!mirroredLayers)
+		return (extraParallax && map < base) ? base : map;
+	if (map - col0 < base)
+	{
+		map = base;
+		col0 = 0;
+	}
+	*out_w = width;
+	*out_c0 = col0;
+	return map;
 }
 
 void draw_background_1(SDL_Surface *surface)
@@ -342,7 +379,8 @@ void draw_background_1(SDL_Surface *surface)
 
 	const int tile_count = BG_TILE_COUNT;
 	Uint8** map = (Uint8**)mapYPos + mapXbpPos - tile_count;
-	map = bg_clamp_map(map, (Uint8**)&megaData1.mainmap[0][0]);
+	int mirror_w = 0, col0 = 0;
+	map = bg_mirror_setup(map, (Uint8**)&megaData1.mainmap[0][0], 14, (int)mapXbpPos - 1, &mirror_w, &col0);
 
 	bg_update_scroll_delta(1, (int)mapY, (int)backPos);
 
@@ -350,7 +388,7 @@ void draw_background_1(SDL_Surface *surface)
 	bg_set_layer_dx(1, mapXOfs_f, mapXOfs);  // float delta + frac for smooth horizontal pan
 	for (int i = -1; i < 7; i++)
 	{
-		blit_background_row(surface, mapXPos + PLAYFIELD_X_SHIFT, (i * 28) + backPos, map);
+		blit_background_row(surface, mapXPos + PLAYFIELD_X_SHIFT, (i * 28) + backPos, map, mirror_w, col0);
 
 		map += 14;
 	}
@@ -358,7 +396,7 @@ void draw_background_1(SDL_Surface *surface)
 	// uncover the bottom; reuses the last row's tiles (map - 14) to avoid reading past the map.
 	// bgMarginRows grows under a speed modifier (scroll can exceed one tile per tick).
 	for (int m = 0; m < bgMarginRows; ++m)
-		blit_background_row(surface, mapXPos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos, map - 14);
+		blit_background_row(surface, mapXPos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos, map - 14, mirror_w, col0);
 	rl_current_id = 0;
 }
 
@@ -373,7 +411,9 @@ void draw_background_2(SDL_Surface *surface)
 		int x = (smoothies[1] ? mapXPos : mapX2Pos) + PLAYFIELD_X_SHIFT;
 
 		Uint8** map = (Uint8**)mapY2Pos + (smoothies[1] ? mapXbpPos : mapX2bpPos) - tile_count;
-		map = bg_clamp_map(map, (Uint8**)&megaData2.mainmap[0][0]);
+		int mirror_w = 0, col0 = 0;
+		map = bg_mirror_setup(map, (Uint8**)&megaData2.mainmap[0][0], 14,
+		                      (int)(smoothies[1] ? mapXbpPos : mapX2bpPos) - 1, &mirror_w, &col0);
 
 		bg_update_scroll_delta(2, (int)mapY2, (int)backPos2);
 
@@ -382,13 +422,13 @@ void draw_background_2(SDL_Surface *surface)
 		bg_set_layer_dx(2, smoothies[1] ? mapXOfs_f : mapX2Ofs_f, smoothies[1] ? mapXOfs : mapX2Ofs);
 		for (int i = -1; i < 7; i++)
 		{
-			blit_background_row(surface, x, (i * 28) + backPos2, map);
+			blit_background_row(surface, x, (i * 28) + backPos2, map, mirror_w, col0);
 
 			map += 14;
 		}
 		// Extra bottom margin row(s) for the interpolation (see draw_background_1).
 		for (int m = 0; m < bgMarginRows; ++m)
-			blit_background_row(surface, x, ((7 + m) * 28) + backPos2, map - 14);
+			blit_background_row(surface, x, ((7 + m) * 28) + backPos2, map - 14, mirror_w, col0);
 		rl_current_id = 0;
 	}
 
@@ -429,7 +469,8 @@ void draw_background_2_blend(SDL_Surface *surface)
 	
 	const int tile_count = BG_TILE_COUNT;
 	Uint8** map = (Uint8**)mapY2Pos + mapX2bpPos - tile_count;
-	map = bg_clamp_map(map, (Uint8**)&megaData2.mainmap[0][0]);
+	int mirror_w = 0, col0 = 0;
+	map = bg_mirror_setup(map, (Uint8**)&megaData2.mainmap[0][0], 14, (int)mapX2bpPos - 1, &mirror_w, &col0);
 
 	bg_update_scroll_delta(2, (int)mapY2, (int)backPos2);
 
@@ -437,13 +478,13 @@ void draw_background_2_blend(SDL_Surface *surface)
 	bg_set_layer_dx(2, mapX2Ofs_f, mapX2Ofs);  // blend variant always draws at mapX2Pos
 	for (int i = -1; i < 7; i++)
 	{
-		blit_background_row_blend(surface, mapX2Pos + PLAYFIELD_X_SHIFT, (i * 28) + backPos2, map);
+		blit_background_row_blend(surface, mapX2Pos + PLAYFIELD_X_SHIFT, (i * 28) + backPos2, map, mirror_w, col0);
 
 		map += 14;
 	}
 	// Extra bottom margin row(s) for the interpolation (see draw_background_1).
 	for (int m = 0; m < bgMarginRows; ++m)
-		blit_background_row_blend(surface, mapX2Pos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos2, map - 14);
+		blit_background_row_blend(surface, mapX2Pos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos2, map - 14, mirror_w, col0);
 	rl_current_id = 0;
 	
 	/*Set Movement of background*/
@@ -500,7 +541,10 @@ void draw_background_3(SDL_Surface *surface)
 
 	const int tile_count = BG_TILE_COUNT;
 	Uint8** map = (Uint8**)mapY3Pos + mapX3bpPos - tile_count;
-	map = bg_clamp_map(map, (Uint8**)&megaData3.mainmap[0][0]);
+	// Layer 3 rows are 15 tiles wide and mapY3Pos already carries the -1 pointer bias,
+	// so map[0] sits at column mapX3bpPos (no -1 like the 14-wide layers).
+	int mirror_w = 0, col0 = 0;
+	map = bg_mirror_setup(map, (Uint8**)&megaData3.mainmap[0][0], 15, (int)mapX3bpPos, &mirror_w, &col0);
 
 	bg_update_scroll_delta(3, (int)mapY3, (int)backPos3);
 
@@ -514,14 +558,14 @@ void draw_background_3(SDL_Surface *surface)
 	for (int i = -1; i < 7; i++)
 	{
 		// Layer 3 shares PLAYFIELD_X_SHIFT with layers 1/2; no per-layer correction.
-		blit_background_row(surface, mapX3Pos + PLAYFIELD_X_SHIFT, (i * 28) + backPos3, map);
+		blit_background_row(surface, mapX3Pos + PLAYFIELD_X_SHIFT, (i * 28) + backPos3, map, mirror_w, col0);
 
 		map += 15;
 	}
 	// Extra bottom margin row(s) for the interpolation (see draw_background_1; bg3 rows
 	// are 15 map entries wide).
 	for (int m = 0; m < bgMarginRows; ++m)
-		blit_background_row(surface, mapX3Pos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos3, map - 15);
+		blit_background_row(surface, mapX3Pos + PLAYFIELD_X_SHIFT, ((7 + m) * 28) + backPos3, map - 15, mirror_w, col0);
 	rl_current_id = 0;
 }
 

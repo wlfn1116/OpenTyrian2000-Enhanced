@@ -69,8 +69,12 @@ typedef struct
 	// sprite (table) family
 	unsigned int table;
 
-	// background row
+	// background row; bg_mirror_w/bg_col0 = Extra Parallax edge mirror (see
+	// bg_mirror_tile in backgrnd.c): map-row width in tiles (0 = off) and the
+	// map-column index of map[0].
 	Uint8 **map;
+	Sint8 bg_mirror_w;
+	Sint8 bg_col0;
 
 	// star: column (constant), float row, and this tick's row motion (for interp)
 	int star_x;
@@ -262,7 +266,7 @@ size_t rl_replay_and_compare(SDL_Surface *scratch, SDL_Surface *reference);
 void rl_rec_sprite2(int x, int y, Sprite2_array sheet, unsigned int index, RenderCmdKind kind);
 void rl_rec_sprite2_filter(int x, int y, Sprite2_array sheet, unsigned int index, Uint8 filter, bool clip);
 void rl_rec_sprite(int x, int y, unsigned int table, unsigned int index, RenderCmdKind kind, Uint8 hue, Sint8 value, bool black);
-void rl_rec_bg_row(int x, int y, Uint8 **map, bool blend);
+void rl_rec_bg_row(int x, int y, Uint8 **map, bool blend, int mirror_w, int col0);
 void rl_rec_star(int x, float y, float dy, Uint8 color);
 void rl_rec_superpixel(int x, int y, int dx, int dy, Uint8 z, Uint8 color);
 void rl_rec_hp_bar(int x, int y, int along, int fill, Uint8 col, bool vertical, Uint8 opacity);
