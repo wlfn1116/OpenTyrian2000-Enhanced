@@ -58,6 +58,13 @@ void JE_scaleInPicture(SDL_Surface *dst, const SDL_Surface *src);
 void JE_drawScore(void);
 void JE_menuFunction(JE_byte select);
 bool JE_debugLevelSelect(void);
+
+// The debug level browser drops straight into a level, skipping the campaign route that
+// normally leads there. debugLevelJumpTake() reports (once, then disarms) that the level
+// which just finished was reached that way; debugLevelJumpReturn() puts the player back in
+// the outpost the jump started from, with the loadout they had before it.
+bool debugLevelJumpTake(void);
+void debugLevelJumpReturn(void);
 bool JE_customWeaponCreator(bool canEquip);
 void JE_drawShipSpecs(SDL_Surface *, SDL_Surface *);
 void JE_weaponSimUpdate(void);

@@ -245,10 +245,32 @@ passes and two buffers:
   phase to column 0) is only kept as a fallback for the level-end state that re-points
   `mapYPos` at row 0 without the −1 bias. Normal top-of-scroll far-left now keeps its
   column phase and mirrors instead of popping.
-- The near layer passes mirror params too but never triggers them in-window (it pans
-  flush by design); its lone boundary tile at `[0,24)` sits in the crop margin. The
-  right edge never exposes either (`mapX2Ofs` floor −1 above, layer 3's 15th column) —
-  the `c ≥ w` branch is defensive for any future span widening.
+- The near layer passes mirror params too but never triggers them *in-window* (it pans
+  flush by design); its lone boundary tile at `[0,24)` sits in the crop margin.
+- **Right-edge margin strip** (`bg_edge_px`, Mirrored Layers only). A row is
+  `BG_TILE_COUNT*24` = 336 px — exactly the near map — so at the far-right pan extreme
+  (`mapXOfs` −1 → row x = −13) it ends *flush* with `PLAYFIELD_RIGHT` (322) and nothing
+  covers the columns past it. That is fine for what's displayed, but the lava and water
+  smoothie filters **sample to the right** of the pixel they write (`src_pixel + waver`,
+  `waver ∈ [−1,7]` lava / `[−1,3]` water), so along the screen's right edge they read
+  the black fill instead of terrain. `waver` is a triangle wave over the linear pixel
+  index (period ≈ 23 scanlines), which stamps the miss out as the sawtooth **"black
+  triangles"** reported on EP1 ASSASSIN / EP4 LAVA RUN. Both filters also read their own
+  row above/below at `+waver`, so black *beyond* the direct read range still bleeds
+  leftward across frames (steady-state deficit ≈ ½ per waver-step). And the smooth-motion
+  replay independently shifts a row up to a tick's pan (≤12 px) further left, uncovering
+  columns that are actually displayed.
+  Fix: append up to one more tile column to the right, clipped to `surface->w`, so a row
+  starting at `x ≤ 20` now runs all the way to buffer column 355 — no black fill to the
+  right of the terrain at any pan position, nothing for the filters to pick up. This is
+  the first live use of the `c ≥ w` branch; the appended column is a flipped copy of the
+  row's last column, sits entirely at x ≥ 323 (past the crop, invisible) at tick
+  positions, and only comes into view when a replay shift pulls it in — which is the
+  point. Clipped rather than whole-tile so the row can never run past `surface->w` and
+  wrap onto the next scanline; `blit_background_row_scaled` derives the same 1x px count
+  (`/ scale`) so hi-res replays cover the same columns. Zero when `mirror_w == 0`, so
+  Mirrored Layers off is unchanged (out-of-row columns there would wrap into the next
+  map row).
 - Enemies bound to the layers are sprites, not tiles: they slide over the mirrored
   region unreflected (same as before; intentional).
 

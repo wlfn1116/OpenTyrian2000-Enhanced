@@ -4365,6 +4365,62 @@ static void select_level(JE_word section, JE_byte file_num)
 	jumpSection = true;
 }
 
+/* ---- Debug level browser: return-to-outpost snapshot -----------------------------------
+ * The three ENGAGE mini-games (** ALE **, TIME WAR, SQUADRON) are dead ends in the campaign
+ * script: their ']L' next-level pointer is the episode's END GAME section, and their failure
+ * path reloads the "LAST LEVEL" backup save. Both are right when you fly there off the nav
+ * map at the end of an episode -- but a level picked out of the debug browser has neither a
+ * finished episode nor a matching backup save behind it, so either way the player is dumped
+ * at level 1 of the next episode. Snapshot where the jump came from (and the loadout ']e'
+ * is about to overwrite with the ENGAGE Stalker) so JE_main can hand the outpost back. */
+static struct
+{
+	bool armed;                        // a browser pick is in flight -- good for one level only
+	JE_byte episode, section;          // where the jump was made from
+	JE_byte lvlFile;
+	Player players[COUNTOF(player)];   // full loadout: ship, weapons, cash, armor
+	JE_boolean superTyrian, onePlayerAction, twoPlayerMode;
+}
+debugJump;
+
+/* Arm the snapshot; call right before the browser's select_level(), and before any
+ * JE_initEpisode() it does, so the recorded episode is the one being left. */
+static void select_debug_level_capture(void)
+{
+	debugJump.episode = (JE_byte)episodeNum;
+	debugJump.section = mainLevel;
+	debugJump.lvlFile = lvlFileNum;
+	memcpy(debugJump.players, player, sizeof(debugJump.players));
+	debugJump.superTyrian = superTyrian;
+	debugJump.onePlayerAction = onePlayerAction;
+	debugJump.twoPlayerMode = twoPlayerMode;
+	debugJump.armed = true;
+}
+
+bool debugLevelJumpTake(void)
+{
+	const bool armed = debugJump.armed;
+	debugJump.armed = false;  // always disarm: one level, so it can never apply to the next one
+	return armed;
+}
+
+void debugLevelJumpReturn(void)
+{
+	if (debugJump.episode != episodeNum)
+		JE_initEpisode(debugJump.episode);  // reloads level + item data; set the level fields after
+
+	memcpy(player, debugJump.players, sizeof(debugJump.players));
+	superTyrian     = debugJump.superTyrian;      // ']e' forced these on for the mini-game
+	onePlayerAction = debugJump.onePlayerAction;
+	twoPlayerMode   = debugJump.twoPlayerMode;
+
+	mainLevel = debugJump.section;
+	saveLevel = mainLevel;
+	nextLevel = mainLevel;
+	lvlFileNum = debugJump.lvlFile;
+	forcedLvlFileNum = 0;  // the browser's one-shot file override died with the mini-game
+}
+
 /* Map a screen point to the absolute row index of the scrolled list, or -1. */
 static int level_row_at(int mx, int my, int px0, int px1, int items_top,
                         int row_h, int visibleRows, int scrollTop, int count)
@@ -5138,7 +5194,9 @@ bool JE_debugLevelSelect(void)
 				if (count > 0)
 				{
 					// switch the game to the browsed episode if needed (reloads
-					// level + item data), then arm the jump to the chosen level
+					// level + item data), then arm the jump to the chosen level.
+					// Snapshot first, while episodeNum is still where we came from.
+					select_debug_level_capture();
 					JE_initEpisode((JE_byte)dispEp);  // no-op if already current
 					if (episodeNum != startEp)
 						initial_episode_num = episodeNum;
@@ -7235,6 +7293,7 @@ void JE_menuFunction(JE_byte select)
 		{
 			if (debugPlayMenu)
 			{
+				select_debug_level_capture();
 				select_level(debugMapSection[curSelect - 2],
 					debugLvlFileNum[curSelect - 2]);
 				debugPlayMenu = false;
@@ -7258,6 +7317,7 @@ void JE_menuFunction(JE_byte select)
 		// -> ignore (safe no-op) rather than load junk.
 		else if (curSelect >= 2 && (uint)(curSelect - 2) < debugLevelCount)
 		{
+			select_debug_level_capture();
 			select_level(debugMapSection[curSelect - 2],
 				debugLvlFileNum[curSelect - 2]);
 			debugPlayMenu = false;

@@ -168,6 +168,9 @@ extern JE_boolean filtrationAvail, filterActive, filterFade, filterFadeStart;
 extern JE_boolean gameJustLoaded;
 extern JE_boolean galagaMode;
 extern JE_boolean extraGame;
+// Set by the ']e' section command for the whole of the level it loads: an ENGAGE mini-game
+// (** ALE **, TIME WAR, SQUADRON). Cleared at the top of every JE_loadMap.
+extern JE_boolean engageMode;
 extern JE_boolean twoPlayerMode, twoPlayerLinked, onePlayerAction, timedBattleMode, superTyrian, trentWin;
 extern JE_boolean endlessMode;  // Endless roguelite mode (see endless.c)
 extern JE_byte superArcadeMode;

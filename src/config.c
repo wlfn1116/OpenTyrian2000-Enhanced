@@ -170,6 +170,8 @@ JE_boolean galagaMode;
 
 JE_boolean extraGame;
 
+JE_boolean engageMode;
+
 JE_boolean twoPlayerMode, twoPlayerLinked, onePlayerAction, timedBattleMode, superTyrian;
 JE_boolean endlessMode;  // Endless roguelite mode (see endless.c)
 JE_boolean trentWin = false;

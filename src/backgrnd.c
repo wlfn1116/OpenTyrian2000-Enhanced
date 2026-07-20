@@ -34,6 +34,9 @@
 #define BG_TILE_W 24
 #define BG_TILE_COUNT (PLAYFIELD_WIDTH / BG_TILE_W + 2)
 
+// Mirrored Layers only: extra tiles appended past the right end of a row (see bg_edge_px).
+#define BG_EDGE_TILES 1
+
 /*Special Background 2 and Background 3*/
 
 /*Back Pos 3*/
@@ -174,6 +177,31 @@ static Uint8 *bg_mirror_tile(Uint8 **map, int tile, int mirror_w, int col0, bool
 	return (map - col0)[c < 0 ? -1 - c : 2 * mirror_w - 1 - c];
 }
 
+// Mirrored Layers only: how much extra row to append past the right end of the nominal
+// BG_TILE_COUNT tiles, in 1x px (0 = none; up to BG_EDGE_TILES tiles, clipped to the surface).
+// A row is exactly BG_TILE_COUNT*24 = 336px -- the width of the near map -- so at the far-right
+// pan extreme it ends flush with PLAYFIELD_RIGHT and nothing covers the columns beyond it. The
+// lava and water smoothie filters SAMPLE up to 7px to the right of the pixel they write, so at
+// the screen's right edge they read that black fill; their per-scanline waver is a triangle wave,
+// which turns the miss into the sawtooth "black triangles" seen on EP1 ASSASSIN / EP4 LAVA RUN.
+// The filters also feed back through the row above/below, so black beyond the read range still
+// bleeds in over frames -- hence run the fill all the way to the surface edge rather than just
+// past +7. (The smooth-motion replay independently shifts a row up to a tick's pan further left,
+// which uncovers columns that ARE displayed.) bg_mirror_tile already resolves an out-of-row column
+// as a flipped edge column, so the appended strip is just more of the layer. Clipped so the row can
+// never run past surface->w and wrap onto the next scanline. Inert with Mirrored Layers off, where
+// out-of-row columns have no defined content (they wrap into the next map row).
+// notes.md §Extra Parallax edge mirror.
+static int bg_edge_px(int mirror_w, int x, int surface_w, int scale)
+{
+	if (mirror_w == 0)
+		return 0;
+	const int room = (surface_w - x - BG_TILE_COUNT * BG_TILE_W * scale) / scale;
+	if (room <= 0)
+		return 0;
+	return room < BG_EDGE_TILES * BG_TILE_W ? room : BG_EDGE_TILES * BG_TILE_W;
+}
+
 void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map, int mirror_w, int col0)
 {
 	assert(surface->format->BitsPerPixel == 8);
@@ -185,8 +213,9 @@ void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map, int mi
 	      *pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	      *pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
 
-	const int tile_count = BG_TILE_COUNT;
-	const int row_width = tile_count * BG_TILE_W;
+	const int edge_px = bg_edge_px(mirror_w, x, surface->w, 1);
+	const int tile_count = BG_TILE_COUNT + (edge_px > 0 ? 1 : 0);
+	const int row_width = BG_TILE_COUNT * BG_TILE_W + edge_px;
 	for (int y = 0; y < 28; y++)
 	{
 		// not drawing on screen yet; skip y
@@ -198,20 +227,23 @@ void blit_background_row(SDL_Surface *surface, int x, int y, Uint8 **map, int mi
 
 		for (int tile = 0; tile < tile_count; tile++)
 		{
+			// the appended edge tile (bg_edge_px) is clipped to the surface width
+			const int tile_w = (tile < BG_TILE_COUNT) ? BG_TILE_W : edge_px;
+
 			bool flip;
 			Uint8* data = bg_mirror_tile(map, tile, mirror_w, col0, &flip);
 
 			// no tile; skip tile
 			if (data == NULL)
 			{
-				pixels += 24;
+				pixels += tile_w;
 				continue;
 			}
 
 			data += y * 24 + (flip ? 23 : 0);
 			const int step = flip ? -1 : 1;
 
-			for (int x = 24; x; x--)
+			for (int x = tile_w; x; x--)
 			{
 				if (pixels >= pixels_ul)
 					return;
@@ -238,8 +270,9 @@ void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map, 
 	      *pixels_ll = (Uint8 *)surface->pixels,  // lower limit
 	      *pixels_ul = (Uint8 *)surface->pixels + (surface->h * surface->pitch);  // upper limit
 
-	const int tile_count = BG_TILE_COUNT;
-	const int row_width = tile_count * BG_TILE_W;
+	const int edge_px = bg_edge_px(mirror_w, x, surface->w, 1);
+	const int tile_count = BG_TILE_COUNT + (edge_px > 0 ? 1 : 0);
+	const int row_width = BG_TILE_COUNT * BG_TILE_W + edge_px;
 	for (int y = 0; y < 28; y++)
 	{
 		// not drawing on screen yet; skip y
@@ -251,20 +284,23 @@ void blit_background_row_blend(SDL_Surface *surface, int x, int y, Uint8 **map, 
 
 		for (int tile = 0; tile < tile_count; tile++)
 		{
+			// the appended edge tile (bg_edge_px) is clipped to the surface width
+			const int tile_w = (tile < BG_TILE_COUNT) ? BG_TILE_W : edge_px;
+
 			bool flip;
 			Uint8* data = bg_mirror_tile(map, tile, mirror_w, col0, &flip);
 
 			// no tile; skip tile
 			if (data == NULL)
 			{
-				pixels += 24;
+				pixels += tile_w;
 				continue;
 			}
 
 			data += y * 24 + (flip ? 23 : 0);
 			const int step = flip ? -1 : 1;
 
-			for (int x = 24; x; x--)
+			for (int x = tile_w; x; x--)
 			{
 				if (pixels >= pixels_ul)
 					return;
@@ -286,7 +322,8 @@ void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map,
 {
 	assert(surface->format->BitsPerPixel == 8);
 
-	const int tile_count = BG_TILE_COUNT;
+	const int edge_px = bg_edge_px(mirror_w, x, surface->w, scale);
+	const int tile_count = BG_TILE_COUNT + (edge_px > 0 ? 1 : 0);
 
 	for (int ty = 0; ty < 28; ++ty)
 	{
@@ -304,19 +341,22 @@ void blit_background_row_scaled(SDL_Surface *surface, int x, int y, Uint8 **map,
 		int hx = x;
 		for (int tile = 0; tile < tile_count; ++tile)
 		{
+			// the appended edge tile (bg_edge_px) is clipped to the surface width
+			const int tile_w = (tile < BG_TILE_COUNT) ? BG_TILE_W : edge_px;
+
 			bool flip;
 			const Uint8 *data = bg_mirror_tile(map, tile, mirror_w, col0, &flip);
 
 			if (data == NULL)  // no tile; skip
 			{
-				hx += BG_TILE_W * scale;
+				hx += tile_w * scale;
 				continue;
 			}
 
 			data += ty * BG_TILE_W + (flip ? BG_TILE_W - 1 : 0);
 			const int dstep = flip ? -1 : 1;
 
-			for (int sx = 0; sx < BG_TILE_W; ++sx, data += dstep, hx += scale)
+			for (int sx = 0; sx < tile_w; ++sx, data += dstep, hx += scale)
 			{
 				const Uint8 d = *data;
 				if (d == 0)

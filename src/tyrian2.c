@@ -1762,6 +1762,28 @@ start_level:
 			goto start_level_first;   // re-run the same level (endlessCaptureSortie re-snapshots + clears the lock)
 		}
 
+		// Was the level that just ran picked straight out of the debug level browser? Consume the
+		// flag whatever the answer, so it can never carry over to a campaign-reached level.
+		const bool fromDebugBrowser = debugLevelJumpTake();
+
+		// ENGAGE mini-games (** ALE **, TIME WAR, SQUADRON) are campaign dead ends: clearing one
+		// falls into the episode's END GAME section, dying reloads the "LAST LEVEL" backup save.
+		// Neither exists behind a browser jump, so both just restart the game at level 1 of the
+		// next episode. Show the level-complete screen if it was cleared, then give the player
+		// back the outpost they launched from instead of running the ending.
+		if (fromDebugBrowser && engageMode)
+		{
+			const bool cleared = (!all_players_dead() || normalBonusLevelCurrent || bonusLevelCurrent) && !playerEndLevel;
+			if (cleared)
+				JE_endLevelAni();
+			fade_song();
+			if (!cleared)
+				fade_black(10);
+
+			debugLevelJumpReturn();
+			goto start_level_first;
+		}
+
 		if ((!all_players_dead() || normalBonusLevelCurrent || bonusLevelCurrent) && !playerEndLevel)
 		{
 			if (endlessMode)
@@ -4100,6 +4122,7 @@ new_game:
 	galagaMode = false;
 	useLastBank = false;
 	extraGame = false;
+	engageMode = false;
 	haltGame = false;
 
 	gameLoaded = false;
@@ -4229,6 +4252,7 @@ new_game:
 						break;
 
 					case 'e': // ENGAGE mode, used for mini-games
+						engageMode = true;
 						doNotSaveBackup = true;
 						constantDie = false;
 						onePlayerAction = true;
