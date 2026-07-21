@@ -47,7 +47,7 @@ enum
 	DIFFICULTY_INSANITY,
 	DIFFICULTY_SUICIDE,
 	DIFFICULTY_MANIACAL,
-	DIFFICULTY_ZINGLON,  // aka Lord of the Game
+	DIFFICULTY_LORD_OF_GAME,  // "Lord of Game" on the Difficulty Level select screen
 	DIFFICULTY_NORTANEOUS,
 	DIFFICULTY_10,
 };

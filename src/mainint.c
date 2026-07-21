@@ -4521,7 +4521,7 @@ void adjust_difficulty(void)
 		2,     // Insanity
 		2,     // Suicide
 		3,     // Maniacal
-		3,     // Zinglon
+		3,     // Lord of Game
 		3,     // Nortaneous
 	};
 
@@ -4549,7 +4549,7 @@ void adjust_difficulty(void)
 		else if (adjusted_score < 400000)
 			new_difficulty = DIFFICULTY_MANIACAL;
 		else if (adjusted_score < 600000)
-			new_difficulty = DIFFICULTY_ZINGLON;
+			new_difficulty = DIFFICULTY_LORD_OF_GAME;
 		else
 			new_difficulty = DIFFICULTY_NORTANEOUS;
 	}
@@ -4570,7 +4570,7 @@ void adjust_difficulty(void)
 		else if (adjusted_score < 2000000)
 			new_difficulty = DIFFICULTY_MANIACAL;
 		else if (adjusted_score < 3000000)
-			new_difficulty = DIFFICULTY_ZINGLON;
+			new_difficulty = DIFFICULTY_LORD_OF_GAME;
 		else
 			new_difficulty = DIFFICULTY_NORTANEOUS;
 	}

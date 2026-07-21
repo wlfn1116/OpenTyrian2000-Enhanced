@@ -4446,7 +4446,7 @@ new_game:
 							{
 								// if completed Zinglon's Revenge, show SuperTyrian and Destruct codes
 								// if completed SuperTyrian, show Nort-Ship Z code
-								superArcadeMode = (initialDifficulty == DIFFICULTY_ZINGLON) ? 8 : 1;
+								superArcadeMode = (initialDifficulty == DIFFICULTY_LORD_OF_GAME) ? 8 : 1;
 							}
 
 							if (superArcadeMode < SA_ENGAGE)
@@ -5504,16 +5504,16 @@ bool newSuperTyrianGame(void)
 {
 	/* SuperTyrian */
 
-	initialDifficulty = keysactive[SDL_SCANCODE_SCROLLLOCK] ? DIFFICULTY_SUICIDE : DIFFICULTY_ZINGLON;
+	initialDifficulty = keysactive[SDL_SCANCODE_SCROLLLOCK] ? DIFFICULTY_SUICIDE : DIFFICULTY_LORD_OF_GAME;
 
 	JE_clr256(VGAScreen);
 	JE_outText(VGAScreen, 10, 10, superTyrianText[0], 15, 4);
-	if (initialDifficulty == DIFFICULTY_ZINGLON)
+	if (initialDifficulty == DIFFICULTY_LORD_OF_GAME)
 		JE_outText(VGAScreen, 10, 20, superTyrianText[1], 15, 4);
 	else
 		JE_outText(VGAScreen, 10, 20, superTyrianText[2], 15, 4);
 	JE_outText(VGAScreen, 10, 30, superTyrianText[3], 15, 4);
-	if (initialDifficulty == DIFFICULTY_ZINGLON)
+	if (initialDifficulty == DIFFICULTY_LORD_OF_GAME)
 		JE_outText(VGAScreen, 10, 40, superTyrianText[4], 15, 4);
 	JE_outText(VGAScreen, 10, 60, superTyrianText[5], 15, 4);
 
@@ -5957,7 +5957,7 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 			tempValue = enemyDat[eDatI].value * 2.5f;
 			break;
 		case DIFFICULTY_MANIACAL:
-		case DIFFICULTY_ZINGLON:
+		case DIFFICULTY_LORD_OF_GAME:
 			tempValue = enemyDat[eDatI].value * 4;
 			break;
 		case DIFFICULTY_NORTANEOUS:
@@ -6008,7 +6008,7 @@ uint JE_makeEnemy(struct JE_SingleEnemyType *enemy, Uint16 eDatI, Sint16 uniqueS
 			case DIFFICULTY_MANIACAL:
 				tempArmor = enemyDat[eDatI].armor * 3;
 				break;
-			case DIFFICULTY_ZINGLON:
+			case DIFFICULTY_LORD_OF_GAME:
 				tempArmor = enemyDat[eDatI].armor * 4;
 				break;
 			case DIFFICULTY_NORTANEOUS:

@@ -464,7 +464,7 @@ bool difficultySelect(void)
 
 	const size_t menuItemsCount = COUNTOF(difficulty_name) - 1;
 	// All difficulties are shown up front; the classic hidden-difficulty unlock codes
-	// (Shift+G for Impossible, Shift+] for Suicide, and typing L-O-R-D for Zinglon) are
+	// (Shift+G for Impossible, Shift+] for Suicide, and typing L-O-R-D for Lord of Game) are
 	// no longer required.
 	size_t menuItemsVisibleCount = menuItemsCount;
 	size_t selectedIndex = 1;
@@ -630,7 +630,7 @@ bool difficultySelect(void)
 				difficultyLevel = DIFFICULTY_SUICIDE;
 				break;
 			case 5:
-				difficultyLevel = DIFFICULTY_ZINGLON;
+				difficultyLevel = DIFFICULTY_LORD_OF_GAME;
 				break;
 			}
 
