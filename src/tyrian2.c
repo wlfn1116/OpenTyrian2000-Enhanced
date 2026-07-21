@@ -2347,7 +2347,13 @@ level_loop:
 	}
 	else if (!playing && firstGameOver)
 	{
-		play_song(levelSong - 1);
+		// Endless rolls a random per-zone track; one-shot songs otherwise just stop. Force the
+		// rolled track to loop when it ends (play_song is idempotent for the current song, so it
+		// won't restart it). Event 35 moves song_playing off levelSong, so its songs stay vanilla.
+		if (endlessMode && song_playing == (unsigned int)(levelSong - 1))
+			restart_song();
+		else
+			play_song(levelSong - 1);
 	}
 
 	if (!endLevel) // draw HUD
