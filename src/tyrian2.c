@@ -2829,6 +2829,22 @@ level_loop:
 				{
 					bool collided;
 
+					// On-screen gate: a shot may only damage an enemy while part of its
+					// sprite is inside the visible playfield -- otherwise a shot that flies
+					// up past the top of the screen kills enemies that haven't scrolled into
+					// view yet. Footprint matches JE_drawEnemy / the enemy health bars: a 2x2
+					// (size==1) enemy is 24x28 at (ex+mapoffset-6, ey-7), a normal 1x1 enemy
+					// is 12x14 at (ex+mapoffset, ey). Its box must overlap the playfield rect
+					// [PLAYFIELD_LEFT..PLAYFIELD_RIGHT] x [0..vga_height).
+					const bool enemyBig  = (enemy[b].size == 1);
+					const int  enemyBoxX = enemy[b].ex + enemy[b].mapoffset + (enemyBig ? -6 : 0);
+					const int  enemyBoxY = enemy[b].ey + (enemyBig ? -7 : 0);
+					const int  enemyBoxW = enemyBig ? 24 : 12;
+					const int  enemyBoxH = enemyBig ? 28 : 14;
+					const bool enemyOnPlayfield =
+					    (enemyBoxX + enemyBoxW > PLAYFIELD_LEFT) && (enemyBoxX <= PLAYFIELD_RIGHT) &&
+					    (enemyBoxY + enemyBoxH > 0)              && (enemyBoxY <  vga_height);
+
 					if (z == MAX_PWEAPON - 1)
 					{
 						temp = 25 - abs(zinglonDuration - 25);
@@ -2854,7 +2870,7 @@ level_loop:
 						            (abs(enemy[b].ex + enemy[b].mapoffset - tempShotX) < 13) && (abs(enemy[b].ey - tempShotY - 6) < 15));
 					}
 
-					if (collided)
+					if (collided && enemyOnPlayfield)
 					{
 						if (chain > 0)
 						{
