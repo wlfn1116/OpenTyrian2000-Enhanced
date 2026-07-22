@@ -515,8 +515,11 @@ mutable `last`, so a Quit-Level retry replays the same track.
 - MILESTONE ZONES (`endlessMilestoneKind`, keyed off the REAL zone
   `endlessRunDepth + 1`, not the difficulty-scaled one): every 50th zone charts a
   full FIVE-course slate of nothing but S-tier sectors. Zones 50/150/250/… run
-  S+/S++; every 100th zone (100/200/300/…) runs S++/S+++. The split is 2-of-one
-  and 3-of-the-other, which rung gets the pair decided by the seed.
+  S+/S++, split 2-of-one and 3-of-the-other with the seed deciding which rung gets
+  the pair. Every 100th zone (100/200/300/…) has a FIXED shape instead: **1 END +
+  2 S+++ + 2 S++** — the END course is "The End" (below), and the four generated
+  slots split evenly. The 2-or-3 roll still runs on a grand milestone and is then
+  overridden, so the seed stream stays aligned with a plain one.
   `endlessMakeRankCombo(rank)` builds each sector: shuffle
   `endlessMilestonePool[]`, greedily take bits that don't overshoot the rank's
   score band, stop the moment the score is inside it, then VERIFY with
@@ -565,9 +568,9 @@ mutable `last`, so a Quit-Level retry replays the same track.
   zone 100). Because the danger score sums that same table, the marker also puts
   the sector at 238-301 — far above the 95 ceiling `endlessMakeRankCombo` tops
   S+++ courses out at — so it is always strictly the worst course on the slate and
-  the sort always puts it last. It counts as one of the slate's high-rung courses,
-  so the 2-and-3 split still holds, and it is pinned into slot 0 so every later
-  draw sees it in `used`.
+  the sort always puts it last. It is its OWN rank, not one of the two generated
+  rungs, which is why the grand slate reads 1 END + 2 S+++ + 2 S++. Pinned into
+  slot 0 so every later draw sees it in `used`.
 - Moving The End onto the marker left the Cataclysm sub-pool (the `endlessRareThemes`
   rows carrying neither Apex nor Legion, dealt by the ~1/45 injection) without that
   bitset, so three rows were added at its top: **Ruination** (56, S++ — the same

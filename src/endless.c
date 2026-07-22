@@ -5069,28 +5069,31 @@ void endlessGenerateCourses(void)
 		}
 	}
 
-	// MILESTONE SLATE: on every 50th zone the whole chart is replaced by five S-tier sectors -- S+/S++
-	// on a plain milestone, S++/S+++ on a grand (100th) one -- split 2-and-3, which rung gets the pair
-	// decided by the seed. The LEVELS gathered above are kept; only the mutator sets are re-dealt, so
-	// the slate is still five different sectors. Runs after every ordinary generation step (nothing
-	// above can survive into it) and before the OMNI roll / sort / naming, which finish it off like any
-	// other chart.
+	// MILESTONE SLATE: on every 50th zone the whole chart is replaced by five S-tier sectors. A plain
+	// milestone deals S+/S++ split 2-and-3, which rung gets the pair decided by the seed; a GRAND
+	// (100th) one has a FIXED shape -- one END course, two S+++ and two S++. The LEVELS gathered above
+	// are kept; only the mutator sets are re-dealt, so the slate is still five different sectors. Runs
+	// after every ordinary generation step (nothing above can survive into it) and before the OMNI
+	// roll / sort / naming, which finish it off like any other chart.
 	if (milestone)
 	{
 		const int lowRank = (milestone == 2) ? 8 : 7;  // S++ / S+  (see endlessDangerRankLevel)
-		int lowN = 2 + (int)(endlessRand() % 2);       // 2 or 3 of the lower rung; the rest are one higher
+		int lowN = 2 + (int)(endlessRand() % 2);       // plain: 2 or 3 of the lower rung, the rest one higher
+		if (milestone == 2)
+			lowN = 2;                                  // grand: exactly 2 S++ (the roll above is still consumed,
+			                                           // so the seed stream stays aligned with a plain milestone)
 		if (lowN > endlessCourseCnt - 1)
 			lowN = endlessCourseCnt - 1;               // short slate (too few distinct levels): keep both rungs present
 		if (lowN < 1)
 			lowN = 1;
 
 		// A GRAND milestone always deals "The End" -- a run far enough to roll the credits ought to be
-		// able to chart something by that name -- with its dangers rolled fresh for this milestone.
-		// Its marker carries a 150 reward, so its danger score clears the 95 ceiling the builder tops
-		// S+++ courses out at by a mile: it is always the worst course offered and the sort puts it
-		// last. It counts as one of the slate's high-rung courses, keeping the 2-and-3 split. Pinned
-		// into slot 0 so every later draw sees it in `used`; the slot index itself is invisible, since
-		// that same sort re-orders the whole slate afterwards.
+		// able to chart something by that name -- with its dangers rolled fresh for this milestone. It
+		// is its OWN rank (END), not one of the two generated rungs, so the four remaining slots split
+		// 2 S++ / 2 S+++ evenly. Its marker carries a 150 reward, so its danger score clears the 95
+		// ceiling the builder tops S+++ courses out at by a mile: it is always the worst course offered
+		// and the sort puts it last. Pinned into slot 0 so every later draw sees it in `used`; the slot
+		// index itself is invisible, since that same sort re-orders the whole slate afterwards.
 		int first = 0;
 		if (milestone == 2)
 		{
