@@ -510,7 +510,62 @@ mutable `last`, so a Quit-Level retry replays the same track.
 - Rare whole-visit flavors (Jackpot ~1/25: all boons; Ambush ~1/20: one forced
   dangerous sector; Gauntlet ~1/7: all hostile). All three dice are rolled up
   front unconditionally so the seed stream stays aligned; precedence Jackpot >
-  Ambush > Gauntlet; none fire at depth 0.
+  Ambush > Gauntlet; none fire at depth 0. All three are suppressed on a
+  milestone zone (below) — the dice still roll, only the effect is gated.
+- MILESTONE ZONES (`endlessMilestoneKind`, keyed off the REAL zone
+  `endlessRunDepth + 1`, not the difficulty-scaled one): every 50th zone charts a
+  full FIVE-course slate of nothing but S-tier sectors. Zones 50/150/250/… run
+  S+/S++; every 100th zone (100/200/300/…) runs S++/S+++. The split is 2-of-one
+  and 3-of-the-other, which rung gets the pair decided by the seed.
+  `endlessMakeRankCombo(rank)` builds each sector: shuffle
+  `endlessMilestonePool[]`, greedily take bits that don't overshoot the rank's
+  score band, stop the moment the score is inside it, then VERIFY with
+  `endlessDangerRankLevel` before handing it back (so a retuned band can't
+  silently mislabel a slate) and reshuffle if it missed. Bit weights are read off
+  `endlessModTable` via `endlessModReward`, never duplicated. `group` in the pool
+  marks mutually redundant bits — at most one scroll mod, one homing tier, one
+  elite tier, one shield handicap. Out of the pool on purpose: ELITEPACK (the
+  deep-run redundancy swap would move the score), and the super-rare signatures
+  (Deadgen / evil kill-fire / Redline) — a milestone is a wall of ordinary
+  dangers, not a scheduled visit from the rarest sector in the game. Bands are
+  S+ 40-49, S++ 50-59, S+++ 60-95 (the rank itself is open-ended above 60; the
+  build stops at 95 so a slate stays flyable). The override runs after every
+  ordinary generation step and before the OMNI roll / danger sort / unique-name
+  pass, so a milestone chart is finished off like any other; it keeps the levels
+  gathered up top and re-deals only the mutator sets. Reward follows danger
+  automatically (same `endlessModTable` the payout reads), so these pay big.
+  The milestone constants and `endlessMilestoneKind` (the zone about to be
+  charted) / `endlessMilestoneClearedAt` (a depth that WAS one) live at the top of
+  `endless.c` with the other run-progress state, since the outpost needs them long
+  before the course generator does.
+- Forced perk picks are decided by ONE predicate, `endlessPerkDueAtDepth(depth)`
+  (depth = the zone just cleared), for three reasons: the every-3rd-zone cadence
+  (`ENDLESS_PERK_EVERY`, depths 1, 4, 7, …); a cleared MILESTONE zone, the payoff
+  for surviving the S-tier slate; or the zone right after a depth where those two
+  COLLIDED. A collision — depth 100, 250, 400, … i.e. every third milestone, the
+  ones where `depth % 50 == 0 && depth % 3 == 1` — would otherwise hand out one
+  perk where the player earned two, so the second is DEFERRED by a zone instead
+  of being swallowed (…97, 100, **101**, 103, 106…); the cadence is unaffected and
+  carries on from its own schedule. Derived purely from the depth, deliberately:
+  no "owed perk" flag to persist, so it needs no save field and comes out the same
+  across a save/reload or a mid-zone bail. `endlessPerkDepthDone` still caps it at
+  one pick per depth, so re-entering the same outpost can't farm a second.
+- Zone-100 credits: clearing zone 100 rolls `JE_playCredits` once, at the outpost
+  that follows (top of `endlessBetweenLevels`, before the course roll and the
+  auto-save), then the run carries on into zone 101. `endlessCreditsShown` gates
+  it and rides the save (v9), so reloading the zone-101 outpost — or bailing out
+  of zone 101 with Quit Level — never replays them. The test is `>=` so a debug
+  zone jump over the mark still gets its one showing.
+- The fork's credit — three consecutive rows, "OpenTyrian 2000" / "Engaged" /
+  "wlfn" — is SPLICED into the roll in code, leaving `tyrian.cdt` (and its
+  Switch/Vita romfs copies) untouched at exactly 126 records. `JE_playCredits`
+  reads the file, then finds the insert point by SCANNING — last non-blank line
+  (the "The   End" card, row 119), up to the top of the blank run above it (row
+  111), then +4 — rather than hardcoding a row, and memmoves the tail down.
+  Result: 4 spacers, the card, 4 spacers, "The End", which is the same gap the
+  roll puts between credited people. Everything below keeps its position relative
+  to the END of the roll, so the `lines_max - 8` song fade and the final held
+  frame (which parks "The End" at y=81) land exactly where they always did.
 - Deep-run danger escalation (`endlessDangerRamp`, a SCALE — not a percent). It's a
   TWO-STAGE ramp off `endlessDifficultyZone`: a gentle first stage 0→100 across
   zones 40→100 (`MID_SCALE`, byte-for-byte the old single-stage ramp — zone≤100
@@ -596,6 +651,11 @@ mutable `last`, so a Quit-Level retry replays the same track.
 - Auto-checkpoint into the "LAST LEVEL" continue slot happens at outpost entry
   (the one coherent resume point). Hardcore suppresses all saving, so dying or
   quitting ends the run with no reload.
+- Sidecar version history: v3 seed, v4 locked sortie, v5 buff recharge, v6
+  recent-level ring, v7 64-bit mods, v8 exact course files, v9 zone-100
+  credits-shown flag. Each new field is appended and read behind a
+  `version >= N` guard, so older sidecars still load (a missing field reads as
+  the memset-zero default).
 - Quit Level in endless reverts the level to its launch state and reopens the
   outpost. Hardcore relocks it (retry same level or quit run; no farm-then-bail);
   non-hardcore unlocks it (re-outfit freely, still no mid-zone farming).

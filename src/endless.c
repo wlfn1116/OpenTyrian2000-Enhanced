@@ -187,6 +187,56 @@ static bool endlessGambleRigged = false;   // Rigged: the NEXT gamble secretly r
 static int  endlessLongCon = 0;            // The Long Con: sectors until a paid-and-forgotten APEX ambush comes due (0 = none)
 static bool endlessArmorHudDirty = false;  // set when the Overheat DoT shaves hull; the game loop repaints the (event-driven) armor bar
 static bool endlessResumeVisit   = false;  // a save was just loaded: the next outpost restores its snapshot instead of rerolling (consumed by endlessBetweenLevels)
+static bool endlessCreditsShown  = false;  // the zone-100 credits roll has already played this run; rides the save so reloading the zone-101 outpost doesn't replay it
+#define ENDLESS_CREDITS_ZONE 100           // zones cleared before the run rolls the credits (once per run, at the outpost that follows)
+
+// --- Milestone zones -------------------------------------------------------------------------
+// Every 50th zone is a set-piece: Chart-a-Course offers a full slate of five S-tier sectors and
+// nothing else (endlessGenerateCourses), and clearing one is worth a guaranteed perk pick
+// (endlessBetweenLevels). The plain milestone (50, 150, 250, ...) charts S+/S++; the GRAND
+// milestone -- every 100th zone -- charts S++/S+++. Keyed off the REAL zone the player sees, not
+// the difficulty-scaled one, so the numbers match the HUD.
+#define ENDLESS_MILESTONE_EVERY 50
+#define ENDLESS_MILESTONE_GRAND 100
+
+// The zone ABOUT to be charted: 0 = an ordinary zone, 1 = the S+/S++ milestone, 2 = the S++/S+++ one.
+static int endlessMilestoneKind(void)
+{
+	const int zone = endlessRunDepth + 1;
+	if (zone % ENDLESS_MILESTONE_GRAND == 0)
+		return 2;
+	if (zone % ENDLESS_MILESTONE_EVERY == 0)
+		return 1;
+	return 0;
+}
+
+// Was run depth `depth` a milestone zone? (A run depth IS the zone just cleared, so this is the
+// test for "the outpost I'm standing in follows a milestone".)
+static bool endlessMilestoneClearedAt(int depth)
+{
+	return depth > 0 && depth % ENDLESS_MILESTONE_EVERY == 0;
+}
+
+// Forced perk picks come on a fixed cadence: after the first cleared zone, then every 3rd zone
+// (depths 1, 4, 7, ...). Perks are strong, so they stay sparing.
+#define ENDLESS_PERK_EVERY 3
+
+// Is a forced perk pick due at the outpost for run depth `depth` (the zone just cleared)? Three
+// reasons: the cadence above; a cleared MILESTONE zone (50, 100, 150, ...); or the zone right
+// after a depth where those two COLLIDED. A collision (depth 100, 250, 400, ... -- every third
+// milestone) would otherwise hand out one perk where the player earned two, so the second is
+// deferred by a zone instead of being swallowed; the cadence itself is unaffected and carries on
+// from its own schedule. Derived purely from the depth, so it needs no persisted state and comes
+// out the same across a save/reload or a mid-zone bail.
+static bool endlessPerkDueAtDepth(int depth)
+{
+	if (depth <= 0)
+		return false;
+	if (depth % ENDLESS_PERK_EVERY == 1 || endlessMilestoneClearedAt(depth))
+		return true;
+	const int prev = depth - 1;  // deferred half of a collision on the previous zone
+	return endlessMilestoneClearedAt(prev) && prev % ENDLESS_PERK_EVERY == 1;
+}
 
 // Hardcore mode for the current run (see endless.h): no saving at all + a locked outpost on a
 // mid-zone bail. Chosen on the seed screen, applied in newEndlessGame, cleared by endlessResetRun.
@@ -588,6 +638,7 @@ void endlessResetRun(void)
 	endlessPerkChoiceN = 0;
 	endlessPerkDepthDone = -1;
 	endlessResumeVisit = false;
+	endlessCreditsShown = false;   // fresh run: the zone-100 credits are still ahead (a resume reloads this in endlessApplyCurrent)
 	endlessRegenTick = 0;
 	endlessBuffCharge = 0;
 	endlessReviveHeld = false;
@@ -2844,6 +2895,18 @@ void endlessBetweenLevels(void)
 
 	mouseSetRelative(false);  // menus use absolute mouse; start_level_first re-enables relative for gameplay
 
+	// Clearing ZONE 100 rolls the credits once, then the run carries straight on into zone 101. The
+	// flag is set BEFORE the roll and the outpost auto-saves right below it, so watching them through
+	// or skipping them both leave a zone-101 save that won't play them again on reload. (`>=` rather
+	// than `==` so a debug zone jump over the mark still gets its one showing.)
+	if (endlessRunDepth >= ENDLESS_CREDITS_ZONE && !endlessCreditsShown)
+	{
+		endlessCreditsShown = true;
+		VGAScreen = VGAScreenSeg;  // the level loop may have left it on VGAScreen2 (as JE_itemScreen does)
+		fade_black(10);            // the level-complete screen is still up; JE_playCredits fades in from black
+		JE_playCredits();
+	}
+
 	// Label anything saved from this outpost as the zone the player resumes into, and make sure
 	// the slot reads as occupied. (The first outpost runs before any level has set these.)
 	snprintf(levelName, sizeof(levelName), "ZONE %d", endlessRunDepth + 1);
@@ -2879,11 +2942,11 @@ void endlessBetweenLevels(void)
 		endlessFillShop();
 
 		// Queue the forced perk pick that opens the shop ahead of its normal front menu (see
-		// JE_itemScreen), then roll this visit's offers. Offered after the first cleared zone, then
-		// every 3rd zone after that (depths 1, 4, 7, ...); perks are strong, so they come sparingly.
+		// JE_itemScreen), then roll this visit's offers. endlessPerkDueAtDepth decides: the every-3rd-
+		// zone cadence, a cleared milestone zone, or the deferred half of a collision between the two.
 		// Skip it if this depth's perk was already resolved, so re-opening the same outpost after a
 		// save/reload doesn't hand out a second perk (endlessPerkDepthDone is part of the save).
-		if (endlessRunDepth > 0 && endlessRunDepth % 3 == 1 && endlessPerkDepthDone != endlessRunDepth)
+		if (endlessPerkDueAtDepth(endlessRunDepth) && endlessPerkDepthDone != endlessRunDepth)
 		{
 			endlessGeneratePerkChoices();
 			endlessPerkPending = true;
@@ -4325,13 +4388,108 @@ static void endlessFixRedundantElitePack(int c)
 	endlessCourseMod[c] = fallback;           // every stand-in collided/was present -- best effort
 }
 
+// --- Milestone slates (see endlessMilestoneKind, up top) -------------------------------------
+// Hostile bits a milestone slate is built from. `group` marks mutually redundant bits -- at most one
+// per nonzero group lands on a course: one scroll modifier (Overclock already carries Slipstream's
+// scroll), one homing tier, one elite tier, one shield handicap. The super-rare signatures (dead
+// generator, the evil kill-fire mirrors, reactor redline) stay out: a milestone should be a wall of
+// ordinary dangers, not a scheduled visit from the rarest sector in the game.
+static const struct { Uint64 bit; int group; } endlessMilestonePool[] = {
+	{ ENDLESS_MOD_FORTIFIED,   0 },
+	{ ENDLESS_MOD_FRENZY,      0 },
+	{ ENDLESS_MOD_SWIFT,       0 },
+	{ ENDLESS_MOD_DEVASTATING, 0 },
+	{ ENDLESS_MOD_ENRAGE,      0 },
+	{ ENDLESS_MOD_GRAVITY,     0 },
+	{ ENDLESS_MOD_TOPSY,       0 },
+	{ ENDLESS_MOD_SLUGGISH,    0 },
+	{ ENDLESS_MOD_SLIPSTREAM,  1 },  // scroll pace
+	{ ENDLESS_MOD_OVERCLOCK,   1 },
+	{ ENDLESS_MOD_OVERLOAD,    1 },
+	{ ENDLESS_MOD_WARP,        1 },
+	{ ENDLESS_MOD_HOMING,      2 },  // homing tier
+	{ ENDLESS_MOD_KAMIKAZE,    2 },
+	{ ENDLESS_MOD_APEX,        3 },  // elite tier
+	{ ENDLESS_MOD_LEGION,      3 },
+	{ ENDLESS_MOD_SHIELDLESS,  4 },  // shield handicap
+};
+
+// The danger weight one modifier bit contributes, read straight off endlessModTable so a milestone's
+// target rank can never drift from the table the rank bands are computed from.
+static int endlessModReward(Uint64 bit)
+{
+	for (unsigned i = 0; i < COUNTOF(endlessModTable); ++i)
+		if (endlessModTable[i].bit == bit)
+			return endlessModTable[i].reward;
+	return 0;
+}
+
+// Build a random pure-hostile combo whose letter grade is exactly `rank` (7 = S+, 8 = S++, 9 = S+++),
+// distinct from the `usedN` bitsets already dealt this visit. The bands mirror endlessDangerRankLevel
+// -- keep the two in lockstep -- and the built combo is checked against it before being handed back,
+// so a retuned band can never silently mislabel a milestone. S+++ is open-ended, but the build stops
+// well short of piling on every bit in the pool: brutal, still flyable.
+static Uint64 endlessMakeRankCombo(int rank, const Uint64 *used, int usedN)
+{
+	const int lo = (rank <= 7) ? 40 : (rank == 8) ? 50 : 60;
+	const int hi = (rank <= 7) ? 49 : (rank == 8) ? 59 : 95;
+
+	Uint64 best = 0;  // first in-band combo seen, used if every attempt collides with an offered one
+	for (int attempt = 0; attempt < 60; ++attempt)
+	{
+		int ord[COUNTOF(endlessMilestonePool)];
+		for (unsigned k = 0; k < COUNTOF(endlessMilestonePool); ++k)
+			ord[k] = (int)k;
+		for (int k = (int)COUNTOF(endlessMilestonePool) - 1; k > 0; --k)
+		{
+			const int j = endlessRand() % (k + 1);
+			const int t = ord[k]; ord[k] = ord[j]; ord[j] = t;
+		}
+
+		// Randomised greedy: walk the shuffled pool taking every bit that doesn't overshoot the band,
+		// and stop the moment the running score is inside it.
+		Uint64 combo = 0;
+		int score = 0;
+		unsigned groups = 0;
+		for (unsigned k = 0; k < COUNTOF(endlessMilestonePool) && score < lo; ++k)
+		{
+			const int g = endlessMilestonePool[ord[k]].group;
+			if (g != 0 && (groups & (1u << g)))
+				continue;
+			const int w = endlessModReward(endlessMilestonePool[ord[k]].bit);
+			if (score + w > hi)
+				continue;
+			combo |= endlessMilestonePool[ord[k]].bit;
+			score += w;
+			if (g != 0)
+				groups |= 1u << g;
+		}
+		if (endlessDangerRankLevel(combo) != rank)
+			continue;  // this shuffle couldn't reach the band -- reshuffle
+
+		if (best == 0)
+			best = combo;
+		bool clash = false;
+		for (int k = 0; k < usedN && !clash; ++k)
+			if (used[k] == combo)
+				clash = true;
+		if (!clash)
+			return combo;
+	}
+	return best;
+}
+
 void endlessGenerateCourses(void)
 {
 	endlessCourseCnt = 0;
 
+	const int milestone = endlessMilestoneKind();  // 0 ordinary zone, 1 S+/S++ slate, 2 S++/S+++ slate
+
 	// This visit offers a random 2..5 course choices (fewer only if there aren't enough
-	// distinct safe levels to fill them).
-	const int wantCourses = 2 + (int)(endlessRand() % (ENDLESS_MAX_COURSES - 1));  // 2..5
+	// distinct safe levels to fill them); a milestone always asks for the full slate.
+	int wantCourses = 2 + (int)(endlessRand() % (ENDLESS_MAX_COURSES - 1));  // 2..5
+	if (milestone)
+		wantCourses = ENDLESS_MAX_COURSES;
 
 	// Gather up to wantCourses candidate levels. endlessRandomSafeLevel already keeps each pick out
 	// of the recent-play window (so no course repeats the just-played zone or the few before it);
@@ -4625,9 +4783,12 @@ void endlessGenerateCourses(void)
 	const bool jackpotRoll  = ((endlessRand() % (25 + dangerRamp * 25 / 100)) == 0);  // 1/25 -> 1/50 (mid) -> ~1/112 (cap)
 	const bool gauntletRoll = ((int)(endlessRand() % 100) < gauntletPct);
 	const bool ambushRoll   = ((int)(endlessRand() % 100) < ambushPct);
-	const bool doJackpot  = jackpotRoll && (endlessRunDepth > 0);
-	const bool doAmbush   = !doJackpot && ambushRoll && (endlessRunDepth > 0);
-	const bool doGauntlet = !doJackpot && !doAmbush && gauntletRoll && (endlessRunDepth > 0);
+	// A milestone zone deals its own fixed slate below, so none of the three may fire there (an
+	// Ambush would collapse the visit to one course). The dice are still rolled above, so the seed
+	// stream stays aligned whether or not this zone is a milestone.
+	const bool doJackpot  = jackpotRoll && (endlessRunDepth > 0) && !milestone;
+	const bool doAmbush   = !doJackpot && ambushRoll && (endlessRunDepth > 0) && !milestone;
+	const bool doGauntlet = !doJackpot && !doAmbush && gauntletRoll && (endlessRunDepth > 0) && !milestone;
 
 	if (doJackpot)
 	{
@@ -4749,6 +4910,25 @@ void endlessGenerateCourses(void)
 					endlessCourseMod[best] = keep;
 			}
 		}
+	}
+
+	// MILESTONE SLATE: on every 50th zone the whole chart is replaced by five S-tier sectors -- S+/S++
+	// on a plain milestone, S++/S+++ on a grand (100th) one -- split 2-and-3, which rung gets the pair
+	// decided by the seed. The LEVELS gathered above are kept; only the mutator sets are re-dealt, so
+	// the slate is still five different sectors. Runs after every ordinary generation step (nothing
+	// above can survive into it) and before the OMNI roll / sort / naming, which finish it off like any
+	// other chart.
+	if (milestone)
+	{
+		const int lowRank = (milestone == 2) ? 8 : 7;  // S++ / S+  (see endlessDangerRankLevel)
+		int lowN = 2 + (int)(endlessRand() % 2);       // 2 or 3 of the lower rung; the rest are one higher
+		if (lowN > endlessCourseCnt - 1)
+			lowN = endlessCourseCnt - 1;               // short slate (too few distinct levels): keep both rungs present
+		if (lowN < 1)
+			lowN = 1;
+		for (int c = 0; c < endlessCourseCnt; ++c)
+			endlessCourseMod[c] = endlessMakeRankCombo((c < lowN) ? lowRank : lowRank + 1,
+			                                           endlessCourseMod, c);
 	}
 
 	// GRAVITY WELL variant: whenever a course carries a gravity well (from any source above -- a named
@@ -5136,7 +5316,7 @@ void endlessEndRunToTitle(void)
 // by the same slot; restoring the snapshot rather than regenerating stops reload rerolling the shop. notes.md §Save / resume.
 
 #define ENDLESS_SAVE_FILE    "endless.sav"
-#define ENDLESS_SAVE_VERSION 8      // v1 run-state only; v2 outpost snapshot; v3 seed; v4 locked sortie; v5 buff recharge; v6 recent-level ring; v7 64-bit mods; v8 exact course files
+#define ENDLESS_SAVE_VERSION 9      // v1 run-state only; v2 outpost snapshot; v3 seed; v4 locked sortie; v5 buff recharge; v6 recent-level ring; v7 64-bit mods; v8 exact course files; v9 credits-shown flag
 #define ENDLESS_SAVE_PERKS   16     // fixed perk-array width on disk; now == PERK_COUNT (headroom used up).
                                     // Adding a 17th perk means bumping this (and the save version) or it won't persist.
 
@@ -5191,6 +5371,9 @@ typedef struct {
 	Uint8  recentCount;
 	Sint32 recentEp[ENDLESS_LEVEL_HISTORY];
 	Uint8  recentSec[ENDLESS_LEVEL_HISTORY];
+
+	// --- zone-100 credits (v9) ---
+	Uint8  creditsShown;  // 1 = this run has already rolled the credits, so resuming won't replay them
 } EndlessSlotRec;
 
 // One record per save slot, mirrored to endless.sav. Read-modify-write on each save keeps the
@@ -5303,6 +5486,8 @@ static void endlessWriteRec(FILE *f, const EndlessSlotRec *r)
 	for (unsigned i = 0; i < ENDLESS_LEVEL_HISTORY; ++i)
 		endlessPutU32(f, (Uint32)r->recentEp[i]);
 	endlessPutBytes(f, r->recentSec, ENDLESS_LEVEL_HISTORY);
+
+	endlessPutU8(f, r->creditsShown);                // v9 zone-100 credits
 }
 
 static bool endlessReadRec(FILE *f, EndlessSlotRec *r, int version)
@@ -5444,6 +5629,11 @@ static bool endlessReadRec(FILE *f, EndlessSlotRec *r, int version)
 		if (r->recentCount > ENDLESS_LEVEL_HISTORY)
 			r->recentCount = ENDLESS_LEVEL_HISTORY;
 	}
+
+	// v9 zone-100 credits. Older records lack it -- the memset above left creditsShown = 0, so a
+	// pre-v9 run already past zone 100 gets one (harmless) showing at its next outpost.
+	if (version >= 9 && !endlessGetU8(f, &r->creditsShown))
+		return false;
 	return true;
 }
 
@@ -5565,6 +5755,8 @@ static void endlessCaptureCurrent(EndlessSlotRec *r)
 		r->recentEp[i]  = endlessRecentEp[i];
 		r->recentSec[i] = endlessRecentSec[i];
 	}
+
+	r->creditsShown = endlessCreditsShown ? 1 : 0;  // v9 zone-100 credits
 }
 
 // Lay a saved record back over the live state. endlessResetRun first, so per-zone/per-visit
@@ -5628,6 +5820,10 @@ static void endlessApplyCurrent(const EndlessSlotRec *r)
 		endlessRecentEp[i]  = r->recentEp[i];
 		endlessRecentSec[i] = r->recentSec[i];
 	}
+
+	// Zone-100 credits (v9): endlessResetRun above cleared the flag, so a pre-v9 record simply reads
+	// as "not shown yet".
+	endlessCreditsShown = r->creditsShown != 0;
 
 	endlessRestoreSavedCourses(r);
 

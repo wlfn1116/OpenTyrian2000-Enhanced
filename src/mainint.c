@@ -4762,9 +4762,21 @@ void JE_SFCodes(JE_byte playerNum_, JE_integer PX_, JE_integer PY_, JE_integer m
 	}
 }
 
+// A credits row is a blank spacer when it's the lone "." marker (or empty) -- the same test the
+// roll's draw loop below uses.
+static bool credits_line_blank(const char *s)
+{
+	return s[0] == '\0' || strcmp(s, ".") == 0;
+}
+
 void JE_playCredits(void)
 {
-	enum { lines_max = 126 };
+	// tyrian.cdt holds exactly lines_file encrypted records; the fork's credit is spliced into them
+	// in code, so the shipped data file is left untouched. Each line is a colour byte (colour =
+	// c - 65, see the draw below) followed by the text; "." is a blank spacer row.
+	enum { lines_file = 126 };
+	enum { lines_extra = 3 };
+	enum { lines_max = lines_file + lines_extra };
 	enum { line_max_length = 65 };
 
 	char credstr[lines_max][line_max_length + 1];
@@ -4785,11 +4797,36 @@ void JE_playCredits(void)
 
 	// load credits text
 	FILE *f = dir_fopen_die(data_dir(), "tyrian.cdt", "rb");
-	for (lines = 0; lines < lines_max; ++lines)
+	for (lines = 0; lines < lines_file; ++lines)
 	{
 		read_encrypted_pascal_string(credstr[lines], sizeof(credstr[lines]), f);
 	}
 	fclose(f);
+
+	// The fork's credit, spliced into the blank run just ABOVE the closing "The   End" card so it
+	// reads as one more credited entry rather than a postscript. Located by scanning rather than by
+	// a hardcoded row: find the last non-blank line (the End card), walk up to the top of the blank
+	// run above it, and land the card a few rows in, leaving spacers on both sides. Everything below
+	// keeps its position relative to the end of the roll, so the song fade and the final held frame
+	// land exactly where they always did.
+	static const char *const credits_extra[lines_extra] = {
+		"LOpenTyrian 2000",
+		"LEngaged",
+		"Mwlfn",
+	};
+	int endLine = lines_file - 1;
+	while (endLine > 0 && credits_line_blank(credstr[endLine]))
+		--endLine;
+	int ins = endLine;
+	while (ins > 0 && credits_line_blank(credstr[ins - 1]))
+		--ins;
+	ins += 4;
+	if (ins > endLine)
+		ins = endLine;  // a blank run too short to sit inside: go directly above the End card
+	memmove(credstr[ins + lines_extra], credstr[ins], (lines_file - ins) * sizeof(credstr[0]));
+	for (int i = 0; i < lines_extra; ++i)
+		SDL_strlcpy(credstr[ins + i], credits_extra[i], sizeof(credstr[0]));
+	lines = lines_max;
 
 	memcpy(colors, palettes[6-1], sizeof(colors));
 	JE_clr256(VGAScreen);
