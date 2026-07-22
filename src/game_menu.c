@@ -4466,6 +4466,8 @@ static const struct { Uint64 bit; const char *name; } endlessDebugSectorMods[] =
 	{ ENDLESS_MOD_DILATION,    "Time Dilation"  },
 	{ ENDLESS_MOD_FAVOR,       "Merchant Favor" },
 	{ ENDLESS_MOD_CURSED,      "Cursed Bounty"  },
+	{ ENDLESS_MOD_NOCHAMP,     "No Champions"   },  // boon: champions demoted to elites
+	{ ENDLESS_MOD_NOELITE,     "No Elites"      },  // boon: no elite/champion tier at all (supersedes No Champions)
 	{ ENDLESS_MOD_OVERCLOCK,   "Overclock"      },
 	{ ENDLESS_MOD_SLIPSTREAM,  "Slipstream"     },
 	{ ENDLESS_MOD_OVERLOAD,    "Overload"       },

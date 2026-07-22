@@ -8107,6 +8107,10 @@ void JE_playerCollide(Player *this_player, JE_byte playerNum_)
 					// the unscaled collision damage, so enemies aren't ground down any faster by ramming.
 					if (endlessMode)
 						playerHit = playerHit * endlessContactDamagePercent() / 100;
+					// Elite/champion tiers ram harder than a plain enemy: elites +25%, champions +50%.
+					// Stacks on top of the depth ramp, so a deep-run champion is a serious hull threat.
+					if (endlessMode && enemy[z].eliteState >= 2)
+						playerHit = playerHit * (enemy[z].eliteState == 3 ? 150 : 125) / 100;
 					if (playerHit > 255)
 						playerHit = 255;
 					JE_playerDamage((JE_byte)playerHit, this_player);

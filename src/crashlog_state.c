@@ -204,6 +204,7 @@ static void write_endless_mods(FILE *f, Uint64 mods)
 		{ ENDLESS_MOD_TOPSY,       "Topsy"       }, { ENDLESS_MOD_SLUGGISH,   "Sluggish"   },
 		{ ENDLESS_MOD_SHIELDLESS,  "Shieldless"  }, { ENDLESS_MOD_DEADGEN,    "DeadGen"    },
 		{ ENDLESS_MOD_GRAVITY_OMNI,"GravityOmni" },
+		{ ENDLESS_MOD_NOCHAMP,     "NoChamp"     }, { ENDLESS_MOD_NOELITE,    "NoElite"    },
 	};
 
 	fprintf(f, "  Active mods:  0x%016llX", (unsigned long long)mods);

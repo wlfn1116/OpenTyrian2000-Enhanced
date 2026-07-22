@@ -318,7 +318,7 @@ JE_boolean  debugAutofireTwiddle = false;  /* debug: auto-fire the selected twid
 JE_boolean  debugTwiddleTrigger = false;   /* debug: one-shot "fire the twiddle now" request from the menu */
 JE_boolean  debugToggleFire = false;       /* debug: fire button toggles auto-fire instead of hold-to-fire */
 JE_boolean  debugToggleFireActive = false; /* debug: the Toggle Fire latch -- ship is currently auto-firing */
-JE_byte     chargeSidekickAutofire = CHARGE_AUTOFIRE_OFF;
+JE_byte     chargeSidekickAutofire = CHARGE_AUTOFIRE_ON;  /* default On; edited by the debug menu + Weapon Tweaks */
 JE_boolean  difficultyAdjust = true;
 JE_boolean  expertMode = false;
 

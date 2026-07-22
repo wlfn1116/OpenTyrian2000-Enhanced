@@ -741,6 +741,12 @@ mutable `last`, so a Quit-Level retry replays the same track.
 - Charge autofire "Yes (fastest)": `player_shot_create` has just set `shotRepeat`
   from the fired stage; override it with the quickest charge stage's shotrepeat
   (scan all stages) so max-power blasts fire at stage-0 cadence.
+- Charge-sidekick autofire (`chargeSidekickAutofire`, per-slot, default On) has two
+  edit points on one byte: the debug menu's "Autofire Charge Sidekicks" row cycles
+  all four modes (Off / On / Charged / Fast=fastest), while Setup → Enhancements →
+  Weapon Tweaks → "Sidekick Autofire" cycles only the three player-visible ones and
+  skips `CHARGE_AUTOFIRE_FAST`. Fast still *renders* as "Fast" in the Weapon Tweaks
+  row if the debug menu set it, but the visible cycle can never land back on it.
 - Custom weapon creator: designs compile into `weapons[910+]` and a "Test" port
   60. The sidekick variant fires mode-0 levels; with charge (pwr > 0) the engine
   fires `wpnum + charge`, and consecutive level slots make the per-level curve the

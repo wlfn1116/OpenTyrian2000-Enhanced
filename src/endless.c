@@ -1122,12 +1122,24 @@ static int endlessNaturalEliteChancePercent(void)
 	return pct;
 }
 
+// Whether the no-elite-tier boons (NOCHAMP / NOELITE) are eligible to be charted yet. They only start
+// appearing once the natural special-enemy share climbs PAST 25% -- below that, elites/champions are a
+// rare trickle and "no champions / no elites" would be a near-empty boon. The 25% shoulder lands around
+// effective depth 47 (~zone 47 on Normal, sooner on harder modes). Gates every generation path that can
+// emit either bit; a leaked bit below the threshold is also scrubbed in endlessGenerateCourses.
+static bool endlessEliteBoonsUnlocked(void)
+{
+	return endlessNaturalEliteChancePercent() > 25;
+}
+
 // Chance (percent) that an eligible enemy becomes SPECIAL: the natural depth share above, except
 // Elite Pack forces half and Apex/Legion force all (notes.md §Difficulty ramp). Elite Pack is only
 // ever meant to RAISE the share, so the generator stops charting it once the natural share tops 50%
 // -- otherwise it would CAP elites BELOW the natural rate (a stealth boon on a danger course).
 static int endlessEliteChancePercent(void)
 {
+	if (endlessActiveMods & ENDLESS_MOD_NOELITE)
+		return 0;                               // "no elites or champions" boon: nothing spawns special (wins over Elite Pack / Apex / Legion)
 	if (endlessActiveMods & (ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION))
 		return 100;
 	if (endlessActiveMods & ENDLESS_MOD_ELITEPACK)
@@ -1141,6 +1153,8 @@ static int endlessPickTier(void)
 {
 	if ((int)(endlessEliteRand() % 100) >= endlessEliteChancePercent())  // seeded elite stream, per (seed, zone)
 		return 1;  // normal
+	if (endlessActiveMods & ENDLESS_MOD_NOCHAMP)
+		return 2;  // "no champions" boon: this special stays an ELITE, never a champion (even under Legion)
 	if (endlessActiveMods & ENDLESS_MOD_LEGION)
 		return 3;  // every special is a champion
 	// Among specials, the champion share climbs with the tide (tougher shooters deeper),
@@ -1970,6 +1984,8 @@ static const EndlessMod endlessModTable[] = {
 	{ ENDLESS_MOD_OVERBLAST,   0, "kills stack damage" },
 	{ ENDLESS_MOD_BOUNTY,        30, "big cash payout" },
 	{ ENDLESS_MOD_CURSED,        40, "cash now, empty shop" },
+	{ ENDLESS_MOD_NOCHAMP,        0, "no champion enemies" },     // no clear-cash: the boon already costs you the elite/champion bounties
+	{ ENDLESS_MOD_NOELITE,        0, "no elites or champions" },  // (same -- these thin the very enemies that pay the fat bounties)
 };
 
 // The base level-clear reward, before per-modifier bonuses. It scales up with the run so the
@@ -3132,6 +3148,8 @@ static const EndlessTheme endlessBoonThemes[] = {
 	{ ENDLESS_MOD_DILATION,   "Time Dilation" },
 	{ ENDLESS_MOD_FAVOR,      "Merchant's Favor" },
 	{ ENDLESS_MOD_CURSED,     "Cursed Bounty" },
+	{ ENDLESS_MOD_NOCHAMP,    "Leaderless" },     // no champions -- the elite pack loses its purple overlords
+	{ ENDLESS_MOD_NOELITE,    "Rank and File" },  // no elites or champions -- only ordinary troops (the stronger, rarer boon)
 	// -- boon pairs (stack your buffs) --
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE, "Ascendant" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERCHARGE,  "Bullet Time" },
@@ -3161,6 +3179,13 @@ static const EndlessTheme endlessBoonThemes[] = {
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_BOUNTY, "Lucky Break" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERDRIVE, "Fire Sale" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_CURSED, "Discount" },
+	// -- no-elite-tier boon pairs. NOCHAMP gets the wider set (three), NOELITE fewer (two), one of the
+	//    several levers keeping the stronger NOELITE the rarer sight. Never pair NOCHAMP with NOELITE. --
+	{ ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_OVERCHARGE, "Purge" },
+	{ ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_BOUNTY,     "Trophy Room" },
+	{ ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_FRAGILE,    "Mop Up" },
+	{ ENDLESS_MOD_NOELITE | ENDLESS_MOD_OVERCHARGE, "Marksman" },
+	{ ENDLESS_MOD_NOELITE | ENDLESS_MOD_FAVOR,      "Clean Slate" },
 };
 
 // WARP (Slipstream cranked way up -- the level hurtles past) is a rare scroll THREAT with its own
@@ -3438,6 +3463,17 @@ static const EndlessTheme endlessMixedThemes[] = {
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_SWIFT,   "Elite Overmatch" },
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,      "Feeding Frenzy" },
 
+	// -- pairs: no champions (NOCHAMP) vs one threat. Rides an Elite Pack fine -- the elites remain, only
+	//    the champion spikes are gone -- but NEVER Legion (all-champion; NOCHAMP would erase the whole threat) --
+	{ ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_FORTIFIED,   "Tough Crowd" },
+	{ ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_FRENZY,      "Crowd Control" },
+	{ ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_SWIFT,       "Skeleton Crew" },
+	{ ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_ELITEPACK,   "Demotion" },   // an elite pack with its champions busted down to elites
+	// -- pairs: no elite tier at all (NOELITE) vs one threat. Only levers OTHER than the elite share, so
+	//    nothing cancels (never rides Elite Pack / Apex / Legion -- those would be fully negated) --
+	{ ENDLESS_MOD_NOELITE | ENDLESS_MOD_FORTIFIED,   "Grunt Work" },
+	{ ENDLESS_MOD_NOELITE | ENDLESS_MOD_DEVASTATING, "Green Troops" },
+
 	// -- rare gambits: TWO boons welded to real danger (bigger upside, bigger risk) --
 	{ ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_DILATION | ENDLESS_MOD_FORTIFIED | ENDLESS_MOD_DEVASTATING, "Perfect Storm" },
 	{ ENDLESS_MOD_FRAGILE | ENDLESS_MOD_OVERCHARGE | ENDLESS_MOD_FRENZY | ENDLESS_MOD_SWIFT,           "Blood Bargain" },
@@ -3534,7 +3570,7 @@ static Uint64 endlessPickThemeMods(const EndlessTheme *tbl, unsigned count, Uint
 #define ENDLESS_BOON_MASK ( \
 	ENDLESS_MOD_FRAGILE | ENDLESS_MOD_BOUNTY | ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE | \
 	ENDLESS_MOD_DILATION | ENDLESS_MOD_FAVOR | ENDLESS_MOD_OVERDRIVE | \
-	ENDLESS_MOD_OVERBLAST )
+	ENDLESS_MOD_OVERBLAST | ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_NOELITE )
 
 // Evocative names for un-curated (randomly generated) combos, picked deterministically per bitset so a
 // given combo always reads the same. Three flavors so an un-named combo still reads the RIGHT tone: an
@@ -3643,9 +3679,11 @@ const char *endlessComboName(Uint64 mods)
 // endlessDangerScore credits these against the hostile total so the tier reads net danger. Credits
 // are in the same reward-tenths as endlessModTable. Pure-cash boons (Bounty, Favor, Cursed) buy no
 // safety, so they grant no credit and don't appear here.
-static const struct { unsigned bit; int credit; } endlessBoonMitigation[] = {
+static const struct { Uint64 bit; int credit; } endlessBoonMitigation[] = {
 	{ ENDLESS_MOD_DILATION,    8 },  // enemy shots crawl: the biggest dodge cushion
 	{ ENDLESS_MOD_FRAGILE,     8 },  // frail foes die fast: fewer guns left firing
+	{ ENDLESS_MOD_NOELITE,     8 },  // no elite/champion tier at all: the tanky, hard-hitting shooters simply never appear
+	{ ENDLESS_MOD_NOCHAMP,     5 },  // no champions: drops the nastiest tier (1.7x fire, +50% shot dmg, fat HP)
 	{ ENDLESS_MOD_OVERCHARGE,  5 },  // shots hit harder: quicker kills
 	{ ENDLESS_MOD_OVERDRIVE,   5 },  // each kill stacks fire and damage
 	{ ENDLESS_MOD_OVERBLAST,   4 },  // each kill stacks damage
@@ -3880,6 +3918,8 @@ static const struct { Uint64 mods; const char *desc; } endlessCuratedDesc[] = {
 	{ ENDLESS_MOD_OVERDRIVE,   "kills stack fire and damage" },
 	{ ENDLESS_MOD_OVERBLAST,   "kills stack weapon damage" },
 	{ ENDLESS_MOD_CURSED,      "more cash; next shop empty" },
+	{ ENDLESS_MOD_NOCHAMP,     "no champion enemies spawn" },
+	{ ENDLESS_MOD_NOELITE,     "no elite or champion enemies" },
 	// -- stacked boons --
 	{ ENDLESS_MOD_TURBODRIVE | ENDLESS_MOD_OVERCHARGE, "+50% damage; kill-fire boost" },
 	{ ENDLESS_MOD_DILATION | ENDLESS_MOD_OVERCHARGE,   "+50% damage; enemy shots slow" },
@@ -4104,6 +4144,23 @@ static Uint64 endlessPickMixBoon(Uint64 hostiles)
 	if (endlessRand() % 100 < 4)
 		return (endlessRand() % 2) ? ENDLESS_MOD_TURBODRIVE : ENDLESS_MOD_OVERBLAST;
 
+	// The no-elite-tier boons get a small roll of their own too, so a gambit that thins the specials stays
+	// uncommon. NOELITE wipes the whole elite/champion tier, so it's held back when the course's danger IS
+	// that tier (it would cancel, not gamble); NOCHAMP only clips the champion spikes, so it may ride an
+	// Elite Pack (a real trade) but not an all-champion Legion. Weighted ~2:1 toward the milder NOCHAMP, so
+	// NOELITE gambits are the rarer sight; if an on-lever threat blocks the pick, fall through to the pool.
+	// Gated on the 25%-share unlock like every other no-elite-tier path (roll first so the stream is stable).
+	if ((endlessRand() % 100 < 6) && endlessEliteBoonsUnlocked())
+	{
+		if ((endlessRand() % 3) == 0)  // ~1/3 of the roll aims for the stronger, rarer NOELITE
+		{
+			if (!(hostiles & (ENDLESS_MOD_ELITEPACK | ENDLESS_MOD_APEX | ENDLESS_MOD_LEGION)))
+				return ENDLESS_MOD_NOELITE;
+		}
+		else if (!(hostiles & ENDLESS_MOD_LEGION))
+			return ENDLESS_MOD_NOCHAMP;
+	}
+
 	Uint64 cand[5];
 	int n = 0;
 	cand[n++] = ENDLESS_MOD_OVERCHARGE;   // more player damage -- always safe
@@ -4135,24 +4192,33 @@ static Uint64 endlessSwapTurbodriveOverblast(Uint64 mods)
 
 // Build a random emergent PURE-BOON combo (2, sometimes 3 bits) for a boon course -- more variety than
 // the named boon themes alone. The pool holds only ONE kill-fire boon (Overblast), so two can never
-// stack, and every pair is on an independent lever, so nothing cancels.
+// stack, and every pair is on an independent lever, so nothing cancels. Only NOCHAMP is in the pool of
+// the two no-elite-tier boons: they SHARE the elite lever (NOELITE supersedes NOCHAMP), so pooling both
+// could roll a self-cancelling pair -- keeping NOELITE out of the emergent pool sidesteps that and leaves
+// NOELITE to the named themes alone, one lever keeping the stronger boon the rarer one.
 static Uint64 endlessMakeBoonCombo(void)
 {
-	static const Uint64 pool[] = {
-		ENDLESS_MOD_FRAGILE, ENDLESS_MOD_BOUNTY, ENDLESS_MOD_OVERCHARGE, ENDLESS_MOD_DILATION,
-		ENDLESS_MOD_FAVOR, ENDLESS_MOD_OVERBLAST,
-	};
+	Uint64 pool[7];
+	int poolN = 0;
+	pool[poolN++] = ENDLESS_MOD_FRAGILE;
+	pool[poolN++] = ENDLESS_MOD_BOUNTY;
+	pool[poolN++] = ENDLESS_MOD_OVERCHARGE;
+	pool[poolN++] = ENDLESS_MOD_DILATION;
+	pool[poolN++] = ENDLESS_MOD_FAVOR;
+	pool[poolN++] = ENDLESS_MOD_OVERBLAST;
+	if (endlessEliteBoonsUnlocked())        // NOCHAMP only once elites are a real presence (>25% share)
+		pool[poolN++] = ENDLESS_MOD_NOCHAMP;
 	int ord[COUNTOF(pool)];
-	for (unsigned k = 0; k < COUNTOF(pool); ++k)
-		ord[k] = (int)k;
-	for (int k = (int)COUNTOF(pool) - 1; k > 0; --k)
+	for (int k = 0; k < poolN; ++k)
+		ord[k] = k;
+	for (int k = poolN - 1; k > 0; --k)
 	{
 		const int j = endlessRand() % (k + 1);
 		const int t = ord[k]; ord[k] = ord[j]; ord[j] = t;
 	}
 	const int want = 2 + (endlessRand() % 100 < 40);   // 2, sometimes 3
 	Uint64 combo = 0;
-	for (int k = 0; k < want && k < (int)COUNTOF(pool); ++k)
+	for (int k = 0; k < want && k < poolN; ++k)
 		combo |= pool[ord[k]];
 	return combo;
 }
@@ -4376,8 +4442,11 @@ void endlessGenerateCourses(void)
 		if (endlessRand() % 100 < 40)
 			endlessCourseMod[slot] = endlessMakeBoonCombo();
 		else
+			// Forbid the no-elite-tier boons until the 25%-share unlock, so a shallow boon course draws a
+			// different theme instead of a near-empty "no elites" one.
 			endlessCourseMod[slot] = endlessSwapTurbodriveOverblast(
-				endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0, 0));
+				endlessPickThemeMods(endlessBoonThemes, COUNTOF(endlessBoonThemes), 0,
+				                     endlessEliteBoonsUnlocked() ? 0 : (ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_NOELITE)));
 	}
 
 	// MIXED "gambit" sectors: graft a compatible boon onto some ORDINARY hostile courses, welding a real
@@ -4564,11 +4633,14 @@ void endlessGenerateCourses(void)
 	{
 		// Every course a pure boon. Deal DISTINCT boon themes (shuffle the table, take one per
 		// course), skipping the Cursed entries -- those read as Traps, not clean boons -- so the
-		// jackpot is all upside.
+		// jackpot is all upside. Below the 25%-share unlock, skip the no-elite-tier boons too (they'd
+		// be near-empty this shallow), so the jackpot deals only themes that actually help here.
+		const Uint64 jackpotSkip = ENDLESS_MOD_CURSED
+			| (endlessEliteBoonsUnlocked() ? 0 : (ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_NOELITE));
 		int bidx[COUNTOF(endlessBoonThemes)];
 		int bn = 0;
 		for (unsigned i = 0; i < COUNTOF(endlessBoonThemes); ++i)
-			if ((endlessBoonThemes[i].mods & ENDLESS_MOD_CURSED) == 0)
+			if ((endlessBoonThemes[i].mods & jackpotSkip) == 0)
 				bidx[bn++] = (int)i;
 		for (int i = bn - 1; i > 0; --i)
 		{
@@ -4688,6 +4760,20 @@ void endlessGenerateCourses(void)
 	for (int c = 0; c < endlessCourseCnt; ++c)
 		if ((endlessCourseMod[c] & ENDLESS_MOD_GRAVITY) && (endlessRand() % 2))
 			endlessCourseMod[c] |= ENDLESS_MOD_GRAVITY_OMNI;
+
+	// Below the 25%-share unlock the no-elite-tier boons must not appear at all: scrub both bits from every
+	// course as the final guarantee, in case any generation path above leaked one this shallow. The pick
+	// sites already avoid emitting them here, so this normally does nothing.
+	if (!endlessEliteBoonsUnlocked())
+		for (int c = 0; c < endlessCourseCnt; ++c)
+			endlessCourseMod[c] &= ~(Uint64)(ENDLESS_MOD_NOCHAMP | ENDLESS_MOD_NOELITE);
+
+	// NOELITE (no elites or champions) supersedes NOCHAMP (no champions) -- the two must never ride one
+	// sector, so strip the redundant NOCHAMP wherever both landed. The generators above never pair them on
+	// purpose, but this makes the "can't have both" guarantee hold no matter how the bits were assembled.
+	for (int c = 0; c < endlessCourseCnt; ++c)
+		if ((endlessCourseMod[c] & ENDLESS_MOD_NOELITE) && (endlessCourseMod[c] & ENDLESS_MOD_NOCHAMP))
+			endlessCourseMod[c] &= ~(Uint64)ENDLESS_MOD_NOCHAMP;
 
 	// Deep runs: the natural elite share can climb past the 50% that "half enemies elite" (ELITEPACK)
 	// pins it to, at which point ELITEPACK would CAP elites below the natural rate -- a stealth boon on
@@ -4950,6 +5036,8 @@ JE_byte endlessSelectCourse(int i)
 		JE_initEpisode(endlessCourseEp[i]);  // load that episode's data (arsenal is shared)
 	forcedLvlFileNum = endlessCourseFile[i];  // load this course's exact level file (see JE_loadMap)
 	endlessActiveMods = endlessCourseMod[i] | endlessPurchasedMods;  // fold in E-Shop buffs
+	if ((endlessActiveMods & ENDLESS_MOD_NOELITE) && (endlessActiveMods & ENDLESS_MOD_NOCHAMP))
+		endlessActiveMods &= ~(Uint64)ENDLESS_MOD_NOCHAMP;          // NOELITE supersedes NOCHAMP -- never both at once
 	endlessPurchasedMods = 0;                                        // consumed by this sector
 	for (int c = 0; c < endlessCleanseChargeCount; ++c)  // Sabotage: strip the worst hostile bit per charge
 		endlessActiveMods = endlessStripWorstMod(endlessActiveMods);

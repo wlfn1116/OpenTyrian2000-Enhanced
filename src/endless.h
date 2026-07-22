@@ -71,6 +71,12 @@ enum {
 #define ENDLESS_MOD_GRAVITY_OMNI ((Uint64)1 << 34)  // omnidirectional gravity well: pull along a random heading, not just down (hostile)
 #define ENDLESS_MOD_SHIELDLESS ((Uint64)1 << 35)  // shields do NOT recharge -- you keep what you have, then run on armor (hostile)
 #define ENDLESS_MOD_DEADGEN    ((Uint64)1 << 36)  // the generator is dead: no shield regen AND the main gun is starved of power (hostile, super-rare nightmare)
+// Two boons that thin the special-enemy tier. NOELITE is strictly better than NOCHAMP (it removes the
+// elites too), so it's charted slightly rarer, and the two NEVER co-occur on one sector -- NOELITE
+// supersedes NOCHAMP wherever both would land (endlessGenerateCourses + the per-level fold-in). Both
+// cost you the elite/champion bounty income, a built-in drawback, so neither adds clear-cash.
+#define ENDLESS_MOD_NOCHAMP    ((Uint64)1 << 37)  // no champions: any enemy that would be a champion spawns as an elite instead (boon)
+#define ENDLESS_MOD_NOELITE    ((Uint64)1 << 38)  // no elites OR champions: every enemy stays normal-tier (boon, the stronger of the pair)
 
 // The six kill-fire mods -- boons Turbodrive/Overdrive/Overblast, evil mirrors Backfire/Burnout/
 // Misfire -- a sector carries at most one (notes.md §Course generation & danger labels).

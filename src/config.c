@@ -1465,7 +1465,7 @@ void JE_loadConfiguration(void)
 
 			saveFiles[z].autoFireSpecial = false;
 
-			saveFiles[z].chargeSidekickAutofire = CHARGE_AUTOFIRE_OFF;
+			saveFiles[z].chargeSidekickAutofire = CHARGE_AUTOFIRE_ON;
 			saveFiles[z].difficultyAdjust = true;
 			saveFiles[z].cheatInfiniteSidekickAmmo = false;
 			saveFiles[z].cheatInfiniteShields = false;

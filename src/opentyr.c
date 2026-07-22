@@ -305,6 +305,21 @@ static void enforcePlainScalerForSupersample(void)
 	}
 }
 
+// Advance the Weapon Tweaks "Sidekick Autofire" row through its three
+// player-visible modes (Off / On / Charged), skipping the debug-only "Fast"
+// mode (CHARGE_AUTOFIRE_FAST). This edits the very same chargeSidekickAutofire
+// the debug menu's own autofire row uses, so the two stay in sync -- and a value
+// the debug menu set to Fast collapses into the visible cycle on the first press
+// here and can never be selected back to.
+static void cycleSidekickAutofire(int dir)
+{
+	int v = chargeSidekickAutofire;
+	do
+		v = (v + CHARGE_AUTOFIRE_NUM + dir) % CHARGE_AUTOFIRE_NUM;
+	while (v == CHARGE_AUTOFIRE_FAST);
+	chargeSidekickAutofire = (JE_byte)v;
+}
+
 typedef enum
 {
 	MENU_ITEM_NONE = 0,
@@ -372,6 +387,7 @@ typedef enum
 	MENU_ITEM_EPDIFF_DRAGON,
 	MENU_ITEM_EPDIFF_MODE,          // shared "Version:" row inside those submenus (see currentDiffWeapon)
 	MENU_ITEM_CHARGE_LASER,
+	MENU_ITEM_SIDEKICK_AUTOFIRE,    // charge-sidekick autofire (shares chargeSidekickAutofire with the debug menu)
 	MENU_ITEM_CUSTOM_WEAPONS,
 	MENU_ITEM_CUSTOM_CREATOR,
 	MENU_ITEM_SUPERTYRIAN,
@@ -545,6 +561,10 @@ static void adjustMenuItemValue(MenuItemId id, int dir)
 		chargeLaserCannon = !chargeLaserCannon;
 		JE_playSampleNum(S_CURSOR);
 		break;
+	case MENU_ITEM_SIDEKICK_AUTOFIRE:
+		cycleSidekickAutofire(dir);
+		JE_playSampleNum(S_CURSOR);
+		break;
 	case MENU_ITEM_CUSTOM_WEAPONS:
 		customWeaponEnabled = !customWeaponEnabled;
 		JE_playSampleNum(S_CURSOR);
@@ -695,6 +715,7 @@ static bool runOptionsMenu(MenuId startMenu)
 				{ MENU_ITEM_SUPERSPARKS, "Superspark Weapons...", "Weapons whose spark trails differ per episode." },
 				{ MENU_ITEM_EPDIFFS, "Episode Differences...", "Other weapons that differ between Ep 1-3 and Ep 4-5." },
 				{ MENU_ITEM_CHARGE_LASER, "Charge-Laser:", "Re-add the cut DOS charge sidekick to its shops." },
+				{ MENU_ITEM_SIDEKICK_AUTOFIRE, "Sidekick Autofire:", "Charge sidekicks autofire on the held fire button." },
 				{ MENU_ITEM_DONE, "Done", "Return to the previous menu." },
 				{ -1 }
 			},
@@ -1121,6 +1142,15 @@ static bool runOptionsMenu(MenuId startMenu)
 				draw_font_hv_shadow(VGAScreen, xMenuItemValue, y, chargeLaserCannon ? "On" : "Off", normal_font, left_aligned, 15, -3 + (selected ? 2 : 0) + (disabled ? -4 : 0), false, 2);
 				break;
 
+			case MENU_ITEM_SIDEKICK_AUTOFIRE:
+			{
+				// Off/On/Charged are the reachable modes; "Fast" only shows if the
+				// debug menu set CHARGE_AUTOFIRE_FAST -- it can't be selected here.
+				static const char *const names[CHARGE_AUTOFIRE_NUM] = { "Off", "On", "Charged", "Fast" };
+				draw_font_hv_shadow(VGAScreen, xMenuItemValue, y, names[chargeSidekickAutofire % CHARGE_AUTOFIRE_NUM], normal_font, left_aligned, 15, -3 + (selected ? 2 : 0) + (disabled ? -4 : 0), false, 2);
+				break;
+			}
+
 			case MENU_ITEM_CUSTOM_WEAPONS:
 				draw_font_hv_shadow(VGAScreen, xMenuItemValue, y, customWeaponEnabled ? "On" : "Off", normal_font, left_aligned, 15, -3 + (selected ? 2 : 0) + (disabled ? -4 : 0), false, 2);
 				break;
@@ -1294,6 +1324,7 @@ static bool runOptionsMenu(MenuId startMenu)
 									case MENU_ITEM_SPARKS_CAP:
 									case MENU_ITEM_WALLOP_BOLT:
 									case MENU_ITEM_EPDIFF_MODE:
+									case MENU_ITEM_SIDEKICK_AUTOFIRE:
 									case MENU_ITEM_RICH_MODE:
 									case MENU_ITEM_CONSTANT_PLAY:
 									case MENU_ITEM_CONSTANT_DIE:
@@ -1863,6 +1894,12 @@ static bool runOptionsMenu(MenuId startMenu)
 				case MENU_ITEM_CHARGE_LASER:
 				{
 					chargeLaserCannon = !chargeLaserCannon;
+					JE_playSampleNum(S_CLICK);
+					break;
+				}
+				case MENU_ITEM_SIDEKICK_AUTOFIRE:
+				{
+					cycleSidekickAutofire(+1);
 					JE_playSampleNum(S_CLICK);
 					break;
 				}
