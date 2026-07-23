@@ -440,6 +440,25 @@ endless files (shared run state, shared helpers) and maps out which file owns wh
 | `endless_course.c` | Chart-a-Course: generating and committing the next sector |
 | `endless_save.c` | the `endless.sav` sidecar and the Quit Level sortie snapshot |
 
+### Where the tuning knobs live
+
+Retuning endless mode means editing a named block, not hunting literals:
+
+| what | where |
+| --- | --- |
+| enemy intensity (HP, boss HP, fire rate, shot speed, shot damage) | "Enemy intensity tuning" block, `endless_combat.c` |
+| rising tide, contact damage, elite share | the `ENDLESS_TIDE_*` / `ENDLESS_CONTACT_*` blocks, `endless_combat.c` |
+| perk strengths | `ENDLESS_PERK_*`, `endless_internal.h` |
+| outpost prices and their per-visit escalation | "Outpost price tuning" block, `endless_shop.c` |
+| how rare each signature sector is | `endlessRareInjections[]`, `endless_course.c` |
+| what a danger score reads as (tier word + letter grade) | `endlessDangerBands[]`, `endless_mods.c` |
+| deep-run danger tilt | `ENDLESS_DANGER_RAMP_*`, `endless_course.c` |
+
+`endlessGenerateCourses` is a sequence of named phases (deal themes → widen → boon → gambits →
+rare injections → dedupe → visit flavor → milestone slate → sort → name). **Order is behaviour**:
+every phase that draws does so off the seeded structural stream, so moving one — or inserting a
+new one that draws — changes what every existing seed generates. Append rather than insert.
+
 ### Seeded structure RNG
 
 Endless draws its structure (level order, course mutators, perk offers, shop
@@ -596,9 +615,9 @@ mutable `last`, so a Quit-Level retry replays the same track.
   without an Apex/Legion tier — a rare shot at a genuine nightmare outside the
   milestones. The sub-pool now spans 46-73 across 20 rows.
 - The marker's `word` in `endlessModTable` is **NULL**, meaning "label, not
-  mechanic": `endlessCourseModRows` and `endlessAutoBody` both skip NULL-word bits,
-  so the monitor's threat column and the help line list only the sector's real
-  dangers — 6-10 rows (11 when Overload/Overclock adds its display-only scroll
+  mechanic": `endlessCourseModRows` skips NULL-word bits, so the monitor's threat
+  column lists only the sector's real dangers — 6-10 rows (11 when
+  Overload/Overclock adds its display-only scroll
   row), against a 16-row monitor. That is the point of the design:
   the finale is read as a long wall of threats plus an off-scale rank, not as a
   curated one-liner. (Any future label-only bit gets this behaviour for free.)
@@ -724,7 +743,7 @@ mutable `last`, so a Quit-Level retry replays the same track.
   Compatibility avoids same-lever cancels (no frail+fortified, no
   dilation+swift/overclock) and keeps the one-kill-fire rule (only one boon
   added). Un-named combos read with the right tone via three generic-name pools
-  (ominous / fortunate / gambit), chosen in `endlessComboName` off
+  (ominous / fortunate / gambit), chosen in `endlessComboNameSalted` off
   `ENDLESS_HOSTILE_MASK` vs `ENDLESS_BOON_MASK`.
 - Names are unique per chart: distinct bitsets can hash to the same generic
   word, so a final RNG-free pass in `endlessGenerateCourses` (after the danger

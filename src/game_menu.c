@@ -632,9 +632,9 @@ static void configure_endless_shop_menu(void)
 		SDL_strlcpy(e[3], endlessHullMaxed() ? "Hull Maxed" : "Buy Reinforce", sizeof(e[3]));
 		SDL_strlcpy(e[4], "Buy Extra Perk", sizeof(e[4]));
 		SDL_strlcpy(e[5], "Buy Special Weapon", sizeof(e[5]));
-		SDL_strlcpy(e[6], endlessBuffKindBought() == 1 ? "Turbodrive ON" : "Buy Turbodrive", sizeof(e[6]));
-		SDL_strlcpy(e[7], endlessBuffKindBought() == 3 ? "Overblast ON" : "Buy Overblast", sizeof(e[7]));
-		SDL_strlcpy(e[8], endlessBuffKindBought() == 2 ? "Overdrive ON" : "Buy Overdrive", sizeof(e[8]));
+		SDL_strlcpy(e[6], endlessBuffKindBought() == ENDLESS_BUFF_KIND_TURBODRIVE ? "Turbodrive ON" : "Buy Turbodrive", sizeof(e[6]));
+		SDL_strlcpy(e[7], endlessBuffKindBought() == ENDLESS_BUFF_KIND_OVERBLAST ? "Overblast ON" : "Buy Overblast", sizeof(e[7]));
+		SDL_strlcpy(e[8], endlessBuffKindBought() == ENDLESS_BUFF_KIND_OVERDRIVE ? "Overdrive ON" : "Buy Overdrive", sizeof(e[8]));
 		SDL_strlcpy(e[9], endlessReviveArmed() ? "Revive Ready" : "Buy Revive", sizeof(e[9]));
 		SDL_strlcpy(e[10], endlessBombFull() ? "Bombs Full" : "Buy Bomb", sizeof(e[10]));
 		SDL_strlcpy(e[11], "Buy Gamble", sizeof(e[11]));
@@ -3852,9 +3852,9 @@ void JE_drawMainMenuHelpText(void)
 				}
 				break;
 			case 7:
-				if (endlessBuffKindBought() == 1)
+				if (endlessBuffKindBought() == ENDLESS_BUFF_KIND_TURBODRIVE)
 					SDL_strlcpy(tempStr, "Turbodrive active for next sector.", sizeof(tempStr));
-				else if (endlessBuffKindBought() != 0)
+				else if (endlessBuffKindBought() != ENDLESS_BUFF_KIND_NONE)
 					SDL_strlcpy(tempStr, "A kill-fire buff is already bought.", sizeof(tempStr));
 				else if (endlessBuffOnCooldown())
 					snprintf(tempStr, sizeof(tempStr), "Drives recharge in %d sector(s).", endlessBuffCooldownLeft());
@@ -3865,9 +3865,9 @@ void JE_drawMainMenuHelpText(void)
 				}
 				break;
 			case 8:
-				if (endlessBuffKindBought() == 3)
+				if (endlessBuffKindBought() == ENDLESS_BUFF_KIND_OVERBLAST)
 					SDL_strlcpy(tempStr, "Overblast active for next sector.", sizeof(tempStr));
-				else if (endlessBuffKindBought() != 0)
+				else if (endlessBuffKindBought() != ENDLESS_BUFF_KIND_NONE)
 					SDL_strlcpy(tempStr, "A kill-fire buff is already bought.", sizeof(tempStr));
 				else if (endlessBuffOnCooldown())
 					snprintf(tempStr, sizeof(tempStr), "Drives recharge in %d sector(s).", endlessBuffCooldownLeft());
@@ -3878,9 +3878,9 @@ void JE_drawMainMenuHelpText(void)
 				}
 				break;
 			case 9:
-				if (endlessBuffKindBought() == 2)
+				if (endlessBuffKindBought() == ENDLESS_BUFF_KIND_OVERDRIVE)
 					SDL_strlcpy(tempStr, "Overdrive active for next sector.", sizeof(tempStr));
-				else if (endlessBuffKindBought() != 0)
+				else if (endlessBuffKindBought() != ENDLESS_BUFF_KIND_NONE)
 					SDL_strlcpy(tempStr, "A kill-fire buff is already bought.", sizeof(tempStr));
 				else if (endlessBuffOnCooldown())
 					snprintf(tempStr, sizeof(tempStr), "Drives recharge in %d sector(s).", endlessBuffCooldownLeft());

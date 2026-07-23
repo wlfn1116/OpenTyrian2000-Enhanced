@@ -98,10 +98,6 @@ enum {
 #define ENDLESS_MOD_KILLFIRE_EVIL  (ENDLESS_MOD_BACKFIRE | ENDLESS_MOD_BURNOUT | ENDLESS_MOD_MISFIRE)
 #define ENDLESS_MOD_KILLFIRE_ANY   (ENDLESS_MOD_KILLFIRE_GOOD | ENDLESS_MOD_KILLFIRE_EVIL)
 
-// An enemy type at/above this base armor counts as a "boss" -- excluded from elite rolls
-// (bosses get their own HP scaling) and tallied separately on the run-end screen.
-#define ENDLESS_BOSS_ARMOR 200
-
 // Palette bank (high nibble) the elite/champion tints remap enemy sprites into via the blit
 // filter (see blit_sprite2_filter). The exact hue depends on the level's palette; tuned by
 // eye. The tiny enemy HP bars reuse these banks so a bar matches its enemy's tint.
@@ -267,8 +263,15 @@ long endlessTurbodrivePrice(void);         // Turbodrive cost (66% of entry cash
 long endlessOverblastPrice(void);    // Overblast cost (75% of entry cash), for the label
 long endlessOverdrivePrice(void);   // Overdrive cost (95% of entry cash), for the label
 long endlessSpecialPrice(void);      // Buy-Special cost (80% of entry cash), for the label
-bool endlessBuffBought(void);        // true once ANY kill-fire buff is bought this visit
-int  endlessBuffKindBought(void);    // which buff this visit: 0 none, 1 Turbodrive, 2 Overdrive, 3 Overblast
+// Which kill-fire buff was bought this shop visit. THESE IDS ARE PERSISTED in endless.sav --
+// never renumber them, only append.
+enum {
+	ENDLESS_BUFF_KIND_NONE = 0,
+	ENDLESS_BUFF_KIND_TURBODRIVE,
+	ENDLESS_BUFF_KIND_OVERDRIVE,
+	ENDLESS_BUFF_KIND_OVERBLAST,
+};
+int  endlessBuffKindBought(void);
 bool endlessBuffOnCooldown(void);    // a kill-fire buy is on recharge (a prior buy locked all three); no buy this visit
 int  endlessBuffCooldownLeft(void);  // sectors until the kill-fire buys unlock again (0 = ready now)
 bool endlessTryBuyTurbodrive(void);        // buy Turbodrive; false if unaffordable / a buff already owned / on recharge
@@ -402,11 +405,6 @@ bool endlessKillFireIsEvil(void);            // is the active kill-fire window a
 int  endlessKillFireJamTicks(void);          // extra shotRepeat cooldown per shot while an evil curse is up (0 otherwise)
 int  endlessKillBuffEvilDamagePenalty(void); // Evil Overdrive: shot-damage REDUCTION % currently applied (0 otherwise), for the HUD
 const char *endlessKillFireEvilName(void);   // one-word HUD label for the active curse: JAMMED (Backfire) / BURNOUT / MISFIRE ("" if none)
-
-// Display name / help for an arbitrary modifier bitset: a curated theme name if one exists,
-// otherwise a generated one -- so the course generator can offer any combination.
-const char *endlessComboName(Uint64 mods);
-const char *endlessComboHelp(Uint64 mods);
 
 // Special enemies come in two tiers: ELITE (tougher, tinted, pays a bounty) and CHAMPION
 // (an elite that also fires faster and hits harder, a distinct tint, ~half as common). A

@@ -82,38 +82,79 @@ int endlessDifficultyZone(void)
 	return 1 + endlessRunDepth * endlessDifficultyRampPercent() / 100;
 }
 
+// --- Enemy intensity tuning ------------------------------------------------------
+// The four intensity levers all have the same shape: a stock value of 100 (or 1x), a slope per
+// EFFECTIVE depth, a set of per-mutator deltas, and a clamp. Every number one of them uses is
+// named here, so retuning the ramp means editing this block rather than hunting literals in the
+// bodies below. The clamps matter as much as the slopes: each lever tops out at a different
+// zone, which is what makes the run's difficulty arrive in waves rather than as one wall
+// (notes.md §Difficulty ramp).
+
+// Ordinary-enemy HP, percent of stock.
+#define ENDLESS_HP_PER_DEPTH       4    // +% per effective depth
+#define ENDLESS_HP_FORTIFIED     120    // FORTIFIED: +% (2.2x HP, clearly felt)
+#define ENDLESS_HP_FRAGILE        50    // FRAGILE: -%
+#define ENDLESS_HP_MIN            25    // floor: a FRAGILE zone-0 enemy still takes a hit
+#define ENDLESS_HP_MAX           600    // reached at effective depth 125
+
+// Boss HP, as a whole multiplier (1 = stock).
+#define ENDLESS_BOSS_DEPTH_PER_X   8    // +1x per this many effective depths
+#define ENDLESS_BOSS_FORTIFIED     3    // FORTIFIED: +this many x (a 4x boss at depth 0)
+#define ENDLESS_BOSS_MARKED        2    // gamble "Marked": the boss you paid to forget comes back bulked up
+#define ENDLESS_BOSS_MAX          16    // reached at run depth ~96 on Normal
+
+// Enemy shot cooldown, percent of stock. This one counts DOWN: the deltas are subtracted, so a
+// bigger number means faster enemy fire.
+#define ENDLESS_FIRE_PER_DEPTH_NUM 3    // -% per effective depth, as NUM/DEN (0.75%)
+#define ENDLESS_FIRE_PER_DEPTH_DEN 4
+#define ENDLESS_FIRE_FRENZY       50    // FRENZY: -% (about 2x fire on its own)
+#define ENDLESS_FIRE_ENRAGE_TICKS 25    // ENRAGE: -1% per this many ticks spent in the zone...
+#define ENDLESS_FIRE_ENRAGE_MAX   55    // ...up to -this%
+#define ENDLESS_FIRE_OVERCLOCK    30    // OVERCLOCK: -% (everything runs hot)
+#define ENDLESS_FIRE_OVERLOAD     55    // OVERLOAD: -% (Overclock cranked way up)
+#define ENDLESS_FIRE_MAX_REDUCE   75    // floor of 25% cooldown, i.e. 4x fire rate
+
+// Enemy projectile speed, percent of stock.
+#define ENDLESS_SPEED_PER_DEPTH_NUM 5   // +% per effective depth, as NUM/DEN (1.67%)
+#define ENDLESS_SPEED_PER_DEPTH_DEN 3
+#define ENDLESS_SPEED_SWIFT       70    // SWIFT: +% (1.7x shots)
+#define ENDLESS_SPEED_DILATION    45    // DILATION: -% (time dilation, shots crawl)
+#define ENDLESS_SPEED_OVERCLOCK   40    // OVERCLOCK: +%
+#define ENDLESS_SPEED_OVERLOAD    90    // OVERLOAD: +%
+#define ENDLESS_SPEED_MIN         40    // floor: even a dilated shot still travels
+#define ENDLESS_SPEED_MAX        240    // 2.4x, reached at run depth ~67 on Normal
+
+// Enemy shot damage, percent of stock. Capped lower than the other levers because the tide
+// resumes the climb past the cap (see endlessShotDamagePercent).
+#define ENDLESS_DMG_PER_DEPTH_NUM  7    // +% per effective depth, as NUM/DEN (1.75%)
+#define ENDLESS_DMG_PER_DEPTH_DEN  4
+#define ENDLESS_DMG_DEVASTATING   75    // DEVASTATING: +%
+#define ENDLESS_DMG_MAX          220    // intensity cap; the tide climbs on from here
+
 // Ordinary-enemy HP multiplier (100 = normal): +4% per (effective) level; FORTIFIED +120%
 // (2.2x HP, clearly felt); FRAGILE -50%.
 int endlessArmorPercent(void)
 {
-	int pct = 100 + endlessEffectiveDepth() * 4;
+	int pct = 100 + endlessEffectiveDepth() * ENDLESS_HP_PER_DEPTH;
 	if (endlessActiveMods & ENDLESS_MOD_FORTIFIED)
-		pct += 120;
+		pct += ENDLESS_HP_FORTIFIED;
 	if (endlessActiveMods & ENDLESS_MOD_FRAGILE)
-		pct -= 50;
-	if (pct < 25)
-		pct = 25;
-	if (pct > 600)
-		pct = 600;
-	return pct;
+		pct -= ENDLESS_HP_FRAGILE;
+	return endlessClamp(pct, ENDLESS_HP_MIN, ENDLESS_HP_MAX);
 }
 
 // Boss HP multiplier (1 = normal): +1x every 8 (effective) levels, reaching the 16x cap at run
 // depth ~96 on Normal; FORTIFIED +3x (a 4x boss at depth 0); FRAGILE ~halves it.
 int endlessBossHpMult(void)
 {
-	int mult = 1 + endlessEffectiveDepth() / 8;
+	int mult = 1 + endlessEffectiveDepth() / ENDLESS_BOSS_DEPTH_PER_X;
 	if (endlessActiveMods & ENDLESS_MOD_FORTIFIED)
-		mult += 3;
-	if (endlessActiveMods & ENDLESS_MOD_MARKED)  // gamble "Marked": the boss you paid to forget comes back bulked up
-		mult += 2;
+		mult += ENDLESS_BOSS_FORTIFIED;
+	if (endlessActiveMods & ENDLESS_MOD_MARKED)
+		mult += ENDLESS_BOSS_MARKED;
 	if (endlessActiveMods & ENDLESS_MOD_FRAGILE)
-		mult = (mult + 1) / 2;
-	if (mult > 16)
-		mult = 16;
-	if (mult < 1)
-		mult = 1;
-	return mult;
+		mult = (mult + 1) / 2;   // halve, rounding up: FRAGILE softens a boss, never erases it
+	return endlessClamp(mult, 1, ENDLESS_BOSS_MAX);
 }
 
 // Enemy shot-cooldown multiplier (100 = normal; LOWER = fires faster): -0.75% per (effective)
@@ -121,20 +162,17 @@ int endlessBossHpMult(void)
 // fire), floored at 25% so deep FRENZY runs reach ~4x.
 int endlessFireDelayPercent(void)
 {
-	int reduce = endlessEffectiveDepth() * 3 / 4;
+	int reduce = endlessEffectiveDepth() * ENDLESS_FIRE_PER_DEPTH_NUM / ENDLESS_FIRE_PER_DEPTH_DEN;
 	if (endlessActiveMods & ENDLESS_MOD_FRENZY)
-		reduce += 50;
+		reduce += ENDLESS_FIRE_FRENZY;
 	if (endlessActiveMods & ENDLESS_MOD_ENRAGE)  // ramps up the longer you linger in the zone
-	{
-		int e = endlessZoneTicks / 25;
-		reduce += (e > 55) ? 55 : e;
-	}
-	if (endlessActiveMods & ENDLESS_MOD_OVERCLOCK)  // everything runs hot
-		reduce += 30;
-	if (endlessActiveMods & ENDLESS_MOD_OVERLOAD)   // Overclock cranked way up
-		reduce += 55;
-	if (reduce > 75)
-		reduce = 75;
+		reduce += endlessClamp(endlessZoneTicks / ENDLESS_FIRE_ENRAGE_TICKS, 0, ENDLESS_FIRE_ENRAGE_MAX);
+	if (endlessActiveMods & ENDLESS_MOD_OVERCLOCK)
+		reduce += ENDLESS_FIRE_OVERCLOCK;
+	if (endlessActiveMods & ENDLESS_MOD_OVERLOAD)
+		reduce += ENDLESS_FIRE_OVERLOAD;
+	if (reduce > ENDLESS_FIRE_MAX_REDUCE)
+		reduce = ENDLESS_FIRE_MAX_REDUCE;
 	return 100 - reduce;
 }
 
@@ -142,20 +180,16 @@ int endlessFireDelayPercent(void)
 // 2.4x cap at run depth ~67 on Normal; SWIFT +70% (1.7x shots).
 int endlessShotSpeedPercent(void)
 {
-	int pct = 100 + endlessEffectiveDepth() * 5 / 3;
+	int pct = 100 + endlessEffectiveDepth() * ENDLESS_SPEED_PER_DEPTH_NUM / ENDLESS_SPEED_PER_DEPTH_DEN;
 	if (endlessActiveMods & ENDLESS_MOD_SWIFT)
-		pct += 70;
-	if (endlessActiveMods & ENDLESS_MOD_DILATION)  // time dilation: shots crawl
-		pct -= 45;
-	if (endlessActiveMods & ENDLESS_MOD_OVERCLOCK)  // everything runs hot
-		pct += 40;
-	if (endlessActiveMods & ENDLESS_MOD_OVERLOAD)   // Overclock cranked way up
-		pct += 90;
-	if (pct > 240)
-		pct = 240;
-	if (pct < 40)
-		pct = 40;
-	return pct;
+		pct += ENDLESS_SPEED_SWIFT;
+	if (endlessActiveMods & ENDLESS_MOD_DILATION)
+		pct -= ENDLESS_SPEED_DILATION;
+	if (endlessActiveMods & ENDLESS_MOD_OVERCLOCK)
+		pct += ENDLESS_SPEED_OVERCLOCK;
+	if (endlessActiveMods & ENDLESS_MOD_OVERLOAD)
+		pct += ENDLESS_SPEED_OVERLOAD;
+	return endlessClamp(pct, ENDLESS_SPEED_MIN, ENDLESS_SPEED_MAX);
 }
 
 // The tide resumes the shot-DAMAGE climb past its intensity cap (notes.md §Difficulty ramp).
@@ -167,11 +201,11 @@ int endlessShotSpeedPercent(void)
 // Capped lower than the others, then the tide resumes a SLOW climb (notes.md §Difficulty ramp).
 int endlessShotDamagePercent(void)
 {
-	int pct = 100 + endlessEffectiveDepth() * 7 / 4;
+	int pct = 100 + endlessEffectiveDepth() * ENDLESS_DMG_PER_DEPTH_NUM / ENDLESS_DMG_PER_DEPTH_DEN;
 	if (endlessActiveMods & ENDLESS_MOD_DEVASTATING)
-		pct += 75;
-	if (pct > 220)
-		pct = 220;
+		pct += ENDLESS_DMG_DEVASTATING;
+	if (pct > ENDLESS_DMG_MAX)
+		pct = ENDLESS_DMG_MAX;
 	// The tide (0 until effective zone 35, then +1 per effective zone, uncapped) adds a gentle
 	// +1% per ENDLESS_TIDE_DMG_STEP ON TOP of the intensity cap: ~+30% by zone 100, ~+70% by
 	// zone 200 on NORMAL. The high ENDLESS_TIDE_DMG_CAP is only a backstop; the consumer

@@ -130,7 +130,8 @@ static long endlessClearBase(void)
 
 // Clear payout for an ARBITRARY modifier set at the current depth: the base plus the summed
 // per-modifier reward (each in tenths of the base). Used both to pay out (endlessClearBonus)
-// and to SHOW the payout on a course's help line (endlessComboHelp) -- so the two can't disagree.
+// and to SHOW the payout on the Chart-a-Course monitor (endlessCoursePayout) -- so the two
+// can't disagree.
 long endlessClearBonusFor(Uint64 mods)
 {
 	const long base = endlessClearBase();
@@ -287,13 +288,49 @@ static void endlessFillShop(void)
 // own front menu when endlessMode is on (see game_menu.c), so the economy reuses the
 // in-game shop rather than a bespoke screen. Prices escalate per use, reset each visit.
 
+// --- Outpost price tuning ----------------------------------------------------------------
+// Every per-visit price is `BASE + zone * PER_ZONE`, so the whole outpost inflates as the run
+// deepens; buying the same thing twice in one visit then escalates it again by the REBUY rule
+// next to each buy. Retune the outpost here.
+#define ENDLESS_PRICE_REROLL_BASE        6000
+#define ENDLESS_PRICE_REROLL_PER_ZONE    1000
+#define ENDLESS_PRICE_HULL_BASE         15000
+#define ENDLESS_PRICE_HULL_PER_ZONE      2000
+#define ENDLESS_PRICE_BOMB_BASE          2500
+#define ENDLESS_PRICE_BOMB_PER_ZONE       400
+#define ENDLESS_PRICE_EXTRAPERK_BASE    70000  // EXTREME: ~100k with 1 perk owned (x1.4 surcharge);
+#define ENDLESS_PRICE_EXTRAPERK_PER_ZONE 2500  // extra perks are a luxury on top of the free picks
+#define ENDLESS_PRICE_CLEANSE_BASE      25000
+#define ENDLESS_PRICE_CLEANSE_PER_ZONE   2500
+
+// Buying the same thing again WITHIN one visit escalates its price: cost = cost * NUM/DEN + ADD.
+// Steeper numbers mean "one per visit, really"; gentler ones allow a restock.
+#define ENDLESS_REBUY_REROLL_NUM      8      // reroll: x1.6 and a flat bump on top
+#define ENDLESS_REBUY_REROLL_DEN      5
+#define ENDLESS_REBUY_REROLL_ADD   3000
+#define ENDLESS_REBUY_HULL_NUM        3      // hull tier: x1.5 and a flat bump
+#define ENDLESS_REBUY_HULL_DEN        2
+#define ENDLESS_REBUY_HULL_ADD     5000
+#define ENDLESS_REBUY_BOMB_NUM        3      // bombs: x1.5, so a full restock costs more each time
+#define ENDLESS_REBUY_BOMB_DEN        2
+#define ENDLESS_REBUY_EXTRAPERK_NUM   2      // extra perk: doubles -- perks are strong and bounded
+#define ENDLESS_REBUY_EXTRAPERK_DEN   1
+#define ENDLESS_REBUY_CLEANSE_NUM     2      // sabotage charge: doubles
+#define ENDLESS_REBUY_CLEANSE_DEN     1
+
+// Apply one of the escalations above.
+static long endlessRebuy(long cost, long num, long den, long add)
+{
+	return cost * num / den + add;
+}
+
 void endlessResetShopPrices(void)
 {
-	endlessRerollCost = 6000 + (long)endlessRunDepth * 1000;
-	endlessHullCost   = 15000 + endlessRunDepth * 2000;
-	endlessBombCost   = 2500 + (long)endlessRunDepth * 400;
-	endlessExtraPerkCost = 70000 + (long)endlessRunDepth * 2500;  // EXTREME: ~100k with 1 perk owned (x1.4 surcharge); extra perks are a rare luxury on top of the free post-zone picks
-	endlessCleanseCost = 25000 + (long)endlessRunDepth * 2500;
+	endlessRerollCost = ENDLESS_PRICE_REROLL_BASE + (long)endlessRunDepth * ENDLESS_PRICE_REROLL_PER_ZONE;
+	endlessHullCost   = ENDLESS_PRICE_HULL_BASE + endlessRunDepth * ENDLESS_PRICE_HULL_PER_ZONE;
+	endlessBombCost   = ENDLESS_PRICE_BOMB_BASE + (long)endlessRunDepth * ENDLESS_PRICE_BOMB_PER_ZONE;
+	endlessExtraPerkCost = ENDLESS_PRICE_EXTRAPERK_BASE + (long)endlessRunDepth * ENDLESS_PRICE_EXTRAPERK_PER_ZONE;
+	endlessCleanseCost = ENDLESS_PRICE_CLEANSE_BASE + (long)endlessRunDepth * ENDLESS_PRICE_CLEANSE_PER_ZONE;
 	endlessCleanseChargeCount = 0;  // fresh visit: no pending sabotage strips carried in
 	endlessGambleMsg[0] = '\0';
 	endlessPurchasedMods = 0;   // fresh visit: no pending buff
@@ -306,13 +343,18 @@ long endlessRerollPrice(void) { return endlessRerollCost; }
 int  endlessHullPrice(void)   { return endlessHullCost; }
 bool endlessHullMaxed(void)   { return endlessArmorBonus >= endlessHullMax(); }
 
-// E-Shop cash-fraction buys, all priced off the shop-entry cash and applied to the NEXT sector.
+// E-Shop cash-fraction buys, all priced off the cash the player WALKED IN WITH (frozen at entry,
+// so spending inside the shop can't move the price mid-visit) and applied to the NEXT sector.
 // Only one of the three kill-fire buffs per visit; Buy Special is a single premium buy.
-long endlessTurbodrivePrice(void)       { return endlessShopEntryCash * 2 / 3; }    // 66%
-long endlessOverblastPrice(void) { return endlessShopEntryCash * 3 / 4; }   // 75% (Overblast)
-long endlessOverdrivePrice(void) { return endlessShopEntryCash * 19 / 20; } // 95% (Overdrive)
-long endlessSpecialPrice(void)    { return endlessShopEntryCash * 4 / 5; }    // 80%
-bool endlessBuffBought(void)      { return endlessBuffKind != 0; }
+static long endlessCashFraction(long num, long den)
+{
+	return endlessShopEntryCash * num / den;
+}
+
+long endlessTurbodrivePrice(void) { return endlessCashFraction(2, 3); }    // 66% -- the cheapest kill-fire buy
+long endlessOverblastPrice(void)  { return endlessCashFraction(3, 4); }    // 75% -- damage stacks only
+long endlessOverdrivePrice(void)  { return endlessCashFraction(19, 20); }  // 95% -- both, and nearly everything you have
+long endlessSpecialPrice(void)    { return endlessCashFraction(4, 5); }    // 80% -- a random special weapon
 int  endlessBuffKindBought(void)  { return endlessBuffKind; }
 
 // Kill-fire buff recharge. After any Turbodrive/Overblast/Overdrive buy, all three lock until the
@@ -335,43 +377,39 @@ static void endlessArmBuffCooldown(void) { endlessBuffCooldownUntil = endlessRun
 bool endlessBuffOnCooldown(void)   { return endlessRunDepth < endlessBuffCooldownUntil; }
 int  endlessBuffCooldownLeft(void) { int d = endlessBuffCooldownUntil - endlessRunDepth; return (d > 0) ? d : 0; }
 
-bool endlessTryBuyTurbodrive(void)  // Turbodrive
+// The three kill-fire buys differ only in what they cost, which mod bit they arm and the kind id
+// that rides the save. Everything else is shared: the "one buff per visit, not while recharging,
+// must be affordable" gate, the charge tier scaled off the cash actually paid, the one-kill-fire-
+// effect-at-a-time rule, and the recharge lock that closes all three.
+//
+// The ENDLESS_BUFF_KIND_* ids live in endless.h -- the shop menu reads them too.
+static bool endlessTryBuyKillFire(long cost, unsigned bit, int kind)
 {
-	long cost = endlessTurbodrivePrice();
 	if (endlessBuffKind != 0 || endlessBuffOnCooldown() || cost < 1 || player[0].cash < (ulong)cost)
 		return false;
 	player[0].cash -= cost;
 	endlessBuffCharge = endlessBuffChargeFromPaid(cost);  // bigger spend -> longer window + more damage
-	endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_TURBODRIVE;  // OR'd into the next sector in endlessSelectCourse; one kill-fire effect at a time (clears any gambled curse)
-	endlessBuffKind = 1;
+	// OR'd into the next sector in endlessSelectCourse. Replacing the whole kill-fire field keeps it
+	// to one effect at a time, which also clears any gambled curse.
+	endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | bit;
+	endlessBuffKind = kind;
 	endlessArmBuffCooldown();  // lock all three kill-fire buys for the scaled recharge
 	return true;
 }
 
-bool endlessTryBuyOverdrive(void)  // Overdrive: Turbodrive + Overblast fire-rate/damage stacks
+bool endlessTryBuyTurbodrive(void)  // quickened fire for a window after each kill
 {
-	long cost = endlessOverdrivePrice();
-	if (endlessBuffKind != 0 || endlessBuffOnCooldown() || cost < 1 || player[0].cash < (ulong)cost)
-		return false;
-	player[0].cash -= cost;
-	endlessBuffCharge = endlessBuffChargeFromPaid(cost);  // bigger spend -> longer window + more damage
-	endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_OVERDRIVE;  // implies the base kill-fire window (see endlessCountKill); one kill-fire effect at a time (clears any gambled curse)
-	endlessBuffKind = 2;
-	endlessArmBuffCooldown();  // lock all three kill-fire buys for the scaled recharge
-	return true;
+	return endlessTryBuyKillFire(endlessTurbodrivePrice(), ENDLESS_MOD_TURBODRIVE, ENDLESS_BUFF_KIND_TURBODRIVE);
 }
 
-bool endlessTryBuyOverblast(void)  // Overblast: Overdrive's per-kill DAMAGE stacks only -- no fire boost
+bool endlessTryBuyOverdrive(void)   // Turbodrive + per-kill fire/damage stacks (implies the base window)
 {
-	long cost = endlessOverblastPrice();
-	if (endlessBuffKind != 0 || endlessBuffOnCooldown() || cost < 1 || player[0].cash < (ulong)cost)
-		return false;
-	player[0].cash -= cost;
-	endlessBuffCharge = endlessBuffChargeFromPaid(cost);  // bigger spend -> longer window + more damage
-	endlessPurchasedMods = (endlessPurchasedMods & ~ENDLESS_MOD_KILLFIRE_ANY) | ENDLESS_MOD_OVERBLAST;  // one kill-fire effect at a time (clears any gambled curse)
-	endlessBuffKind = 3;
-	endlessArmBuffCooldown();  // lock all three kill-fire buys for the scaled recharge
-	return true;
+	return endlessTryBuyKillFire(endlessOverdrivePrice(), ENDLESS_MOD_OVERDRIVE, ENDLESS_BUFF_KIND_OVERDRIVE);
+}
+
+bool endlessTryBuyOverblast(void)   // Overdrive's per-kill DAMAGE stacks only -- no fire boost
+{
+	return endlessTryBuyKillFire(endlessOverblastPrice(), ENDLESS_MOD_OVERBLAST, ENDLESS_BUFF_KIND_OVERBLAST);
 }
 
 // The kill-fire buff bits bought this shop visit but not yet applied (endlessSelectCourse ORs
@@ -397,7 +435,7 @@ bool endlessTryBuyBomb(void)
 		return false;
 	player[0].cash -= endlessBombCost;
 	++player[0].superbombs;
-	endlessBombCost = endlessBombCost * 3 / 2;  // escalate within the visit so a full restock costs more
+	endlessBombCost = endlessRebuy(endlessBombCost, ENDLESS_REBUY_BOMB_NUM, ENDLESS_REBUY_BOMB_DEN, 0);
 	return true;
 }
 
@@ -455,7 +493,7 @@ bool endlessTryBuyExtraPerk(void)
 	if (player[0].cash < (ulong)price)
 		return false;
 	player[0].cash -= price;
-	endlessExtraPerkCost = endlessExtraPerkCost * 2;  // escalate the base steeply (perks are strong and bounded)
+	endlessExtraPerkCost = endlessRebuy(endlessExtraPerkCost, ENDLESS_REBUY_EXTRAPERK_NUM, ENDLESS_REBUY_EXTRAPERK_DEN, 0);
 	endlessGeneratePerkChoices();                     // dispatch opens MENU_PERKS to pick one
 	return true;
 }
@@ -470,7 +508,7 @@ bool endlessTryBuyCleanse(void)
 		return false;
 	player[0].cash -= endlessCleanseCost;
 	++endlessCleanseChargeCount;
-	endlessCleanseCost = endlessCleanseCost * 2;
+	endlessCleanseCost = endlessRebuy(endlessCleanseCost, ENDLESS_REBUY_CLEANSE_NUM, ENDLESS_REBUY_CLEANSE_DEN, 0);
 	return true;
 }
 // Strip the single most-dangerous hostile bit from a modifier set (one per cleanse charge).
@@ -844,7 +882,7 @@ bool endlessTryReroll(void)
 	if (player[0].cash < (ulong)endlessRerollCost)
 		return false;
 	player[0].cash -= endlessRerollCost;
-	endlessRerollCost = endlessRerollCost * 8 / 5 + 3000;
+	endlessRerollCost = endlessRebuy(endlessRerollCost, ENDLESS_REBUY_REROLL_NUM, ENDLESS_REBUY_REROLL_DEN, ENDLESS_REBUY_REROLL_ADD);
 	endlessFillShop();
 	return true;
 }
@@ -856,7 +894,7 @@ bool endlessTryReinforce(void)
 		return false;
 	player[0].cash -= endlessHullCost;
 	endlessArmorBonus += ENDLESS_HULL_STEP;
-	endlessHullCost = endlessHullCost * 3 / 2 + 5000;
+	endlessHullCost = endlessHullCost * ENDLESS_REBUY_HULL_NUM / ENDLESS_REBUY_HULL_DEN + ENDLESS_REBUY_HULL_ADD;  // int-typed: kept in int arithmetic
 	return true;
 }
 

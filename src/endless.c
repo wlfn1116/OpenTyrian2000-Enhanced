@@ -190,8 +190,8 @@ void endlessCountKill(int linknum)
 
 	++endlessRunKills;
 	// Boss kills are tallied in draw_boss_bar (when a boss's health bar empties), so the
-	// "Bosses slain" stat counts only real bar-spawning bosses, not the high-armor regulars the
-	// old armor >= ENDLESS_BOSS_ARMOR test here wrongly swept in.
+	// "Bosses slain" stat counts only real bar-spawning bosses, not the high-armor regulars an
+	// armor-threshold test here used to wrongly sweep in.
 	if (endlessActiveMods & ENDLESS_MOD_KILLFIRE_ANY)
 	{
 		endlessTurbodriveTimer = endlessBuffWindowTicks();  // refresh the window (boost OR evil jam; charge lengthens it)

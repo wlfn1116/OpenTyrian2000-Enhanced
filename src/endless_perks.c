@@ -69,6 +69,22 @@ int endlessPerkArmorBonus(void)
 	return bonus;
 }
 
+// Turn a PERCENT-PER-TICK rate into whole steps, carrying the remainder in *accum so a
+// fractional rate (say 20%/tick = one step every fifth tick) comes out smooth instead of
+// lumpy. A rate of 0 clears the carry, so a perk that stops applying leaves no drip behind.
+static int endlessAccumSteps(int *accum, int rate)
+{
+	if (rate == 0)
+	{
+		*accum = 0;
+		return 0;
+	}
+	*accum += rate;
+	const int steps = *accum / 100;
+	*accum -= steps * 100;
+	return steps;
+}
+
 // Rapid Cyclers perk: extra shotRepeat decrements this tick, as a smooth fractional rate via an
 // accumulator (like the scroll-step boost). Applied every tick from the player fire block.
 int endlessPerkFireDecrements(void)
@@ -84,15 +100,7 @@ int endlessPerkFireDecrements(void)
 	if (endlessPerkOwned[PERK_ADRENALINE] > 0 && player[0].initial_armor > 0
 	    && player[0].armor * ENDLESS_PERK_ADRENALINE_HP < player[0].initial_armor)
 		rate += endlessPerkOwned[PERK_ADRENALINE] * ENDLESS_PERK_ADRENALINE_PCT;
-	if (rate == 0)
-	{
-		accum = 0;
-		return 0;
-	}
-	accum += rate;
-	int steps = accum / 100;
-	accum -= steps * 100;
-	return steps;
+	return endlessAccumSteps(&accum, rate);
 }
 
 // Rapid Recharge perk: extra cooldown decrements/tick (fractional accumulator). The caller
@@ -100,15 +108,12 @@ int endlessPerkFireDecrements(void)
 int endlessPerkSpecialCooldownDecrements(void)
 {
 	static int accum = 0;
-	if (!endlessMode || endlessPerkOwned[PERK_SPECIALCD] == 0)
+	if (!endlessMode)
 	{
 		accum = 0;
 		return 0;
 	}
-	accum += endlessPerkOwned[PERK_SPECIALCD] * ENDLESS_PERK_SPECIALCD_PCT;
-	int steps = accum / 100;
-	accum -= steps * 100;
-	return steps;
+	return endlessAccumSteps(&accum, endlessPerkOwned[PERK_SPECIALCD] * ENDLESS_PERK_SPECIALCD_PCT);
 }
 
 // Autofire Special perk: while owned, the equipped special weapon fires on its own as long as the
@@ -125,28 +130,35 @@ int endlessPerkPowerUsePercent(void)
 {
 	if (!endlessMode)
 		return 100;
-	int pct = 100 - endlessPerkOwned[PERK_POWERUSE] * ENDLESS_PERK_POWERUSE_PCT;
-	return pct < 20 ? 20 : pct;
+	const int pct = 100 - endlessPerkOwned[PERK_POWERUSE] * ENDLESS_PERK_POWERUSE_PCT;
+	return pct < ENDLESS_PERK_POWERUSE_MIN ? ENDLESS_PERK_POWERUSE_MIN : pct;
+}
+
+// Shorten an interval by `step` ticks per stack of `perk`, never below `minimum`. Outside
+// endless, or with no stacks, `base` comes back untouched -- so callers can hand their stock
+// interval straight through with no endless-specific branch of their own.
+static int endlessPerkShorten(int base, int perk, int step, int minimum)
+{
+	if (!endlessMode || endlessPerkOwned[perk] == 0)
+		return base;
+	const int v = base - endlessPerkOwned[perk] * step;
+	return v < minimum ? minimum : v;
 }
 
 // Shield Matrix perk: shortens the shield-regen interval from `base` (tyrian2.c), floored; a
 // no-op outside endless / with no stacks. A quicker shield still drains the generator quicker.
 int endlessPerkShieldWait(int base)
 {
-	if (!endlessMode || endlessPerkOwned[PERK_SHIELDREGEN] == 0)
-		return base;
-	int wait = base - endlessPerkOwned[PERK_SHIELDREGEN] * ENDLESS_PERK_SHIELDRGN_STEP;
-	return wait < ENDLESS_PERK_SHIELDRGN_MIN ? ENDLESS_PERK_SHIELDRGN_MIN : wait;
+	return endlessPerkShorten(base, PERK_SHIELDREGEN,
+	                          ENDLESS_PERK_SHIELDRGN_STEP, ENDLESS_PERK_SHIELDRGN_MIN);
 }
 
 // Rapid Charger perk: shortens the charge-sidekick charge interval from `base` (mainint.c),
 // floored; a no-op outside endless / with no stacks.
 int endlessPerkChargeTicks(int base)
 {
-	if (!endlessMode || endlessPerkOwned[PERK_CHARGERATE] == 0)
-		return base;
-	int t = base - endlessPerkOwned[PERK_CHARGERATE] * ENDLESS_PERK_CHARGE_STEP;
-	return t < ENDLESS_PERK_CHARGE_MIN ? ENDLESS_PERK_CHARGE_MIN : t;
+	return endlessPerkShorten(base, PERK_CHARGERATE,
+	                          ENDLESS_PERK_CHARGE_STEP, ENDLESS_PERK_CHARGE_MIN);
 }
 
 // High-Velocity Rounds perk: shot travel-speed scale (100 = normal), applied in shots.c

@@ -27,6 +27,14 @@
 
 #include "endless.h"
 
+// Clamp v into [lo, hi]. Every scaled lever in endless mode ends in one of these, so it is worth
+// a name: the clamp is the tuning knob that decides WHEN a lever stops growing (opentyr.h's
+// MIN/MAX are macros and would evaluate their arguments twice).
+static inline int endlessClamp(int v, int lo, int hi)
+{
+	return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
 // --- endless_rng.c: run seed & structural RNG -----------------------------------
 // Structure (level order, mutators, perks, shop stock) draws from a dedicated
 // SplitMix64 stream, isolated from the shared gameplay mt_rand.
@@ -103,6 +111,7 @@ void endlessRollGravityDir(void);              // pick this sector's gravity hea
 #define ENDLESS_PERK_GLASS_ARMOR    8  // Glass Cannon: -max armor (the drawback)
 #define ENDLESS_PERK_SPECIALCD_PCT 25  // extra special-cooldown-decrement accumulator % per stack
 #define ENDLESS_PERK_POWERUSE_PCT  15  // -% generator power drawn per main-weapon shot, per Efficient Coils stack
+#define ENDLESS_PERK_POWERUSE_MIN  20  // ...but firing never costs less than this % of stock power
 #define ENDLESS_PERK_SHIELDRGN_STEP 3  // shield-regen interval cut by this many ticks per Shield Matrix stack (base 15)
 #define ENDLESS_PERK_SHIELDRGN_MIN  3  // ...but never quicker than +1 shield per this many ticks (floor)
 #define ENDLESS_PERK_CHARGE_STEP    4  // ticks cut from the charge-sidekick charge interval per Rapid Charger stack (base 20)
@@ -183,7 +192,7 @@ typedef struct {
 } EndlessMod;
 
 // Named course themes: a NAME dictionary of evocative labels for combos worth naming
-// (endlessComboName looks up an exact bit-set here; anything unlisted gets a generated name).
+// (endlessComboNameSalted looks up an exact bit-set here; anything unlisted gets a generated name).
 // Generation and payout are driven by endlessModTable, not these rows -- so this is purely
 // cosmetic naming, free to extend or trim without touching behaviour.
 typedef struct { Uint64 mods; const char *name; } EndlessTheme;
