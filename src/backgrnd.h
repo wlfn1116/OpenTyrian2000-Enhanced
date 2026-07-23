@@ -29,7 +29,7 @@ extern JE_word backPos, backPos2, backPos3;
 extern JE_word backMove, backMove2, backMove3;
 // Endless SMOOTH scroll boost: per-layer extra scroll px this tick (fractional carry). Set
 // once/tick in tyrian2.c; makes the boosted scroll advance smoothly instead of in whole
-// backMove lumps. See backgrnd.c and endlessScrollExtraPx() (endless.c).
+// backMove lumps. See backgrnd.c and endlessScrollExtraPx() (endless_combat.c).
 extern int endlessScrollExtraPx1, endlessScrollExtraPx2, endlessScrollExtraPx3;
 
 // TRUE per-tick vertical scroll (px) of each background layer [1..3], computed at draw

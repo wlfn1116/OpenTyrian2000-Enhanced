@@ -91,7 +91,7 @@ struct JE_SingleEnemyType
 	JE_word     edgr;
 	JE_shortint edlevel;
 	JE_shortint edani;
-	JE_byte     eliteState; /* endless: 0=undecided, 1=normal, 2=elite, 3=champion (endless.c) */
+	JE_byte     eliteState; /* endless: 0=undecided, 1=normal, 2=elite, 3=champion (endless_combat.c) */
 	JE_byte     filter;
 	JE_integer  evalue;
 	JE_integer  fixedmovey;

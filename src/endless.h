@@ -5,6 +5,10 @@
  *
  * A run of real, UNMODIFIED shipped levels: outpost + Chart-a-Course between zones,
  * difficulty via depth- and mutator-scaled enemy STATS (notes.md §Endless mode).
+ *
+ * This is the interface the rest of the game calls. The implementation is split
+ * across endless.c and its endless_*.c siblings; endless_internal.h is private to
+ * that group and lists which file owns what.
  */
 #ifndef ENDLESS_H
 #define ENDLESS_H

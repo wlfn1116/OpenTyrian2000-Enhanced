@@ -127,6 +127,14 @@
     <ClCompile Include="..\src\destruct.c" />
     <ClCompile Include="..\src\editship.c" />
     <ClCompile Include="..\src\endless.c" />
+    <ClCompile Include="..\src\endless_combat.c" />
+    <ClCompile Include="..\src\endless_course.c" />
+    <ClCompile Include="..\src\endless_level.c" />
+    <ClCompile Include="..\src\endless_mods.c" />
+    <ClCompile Include="..\src\endless_perks.c" />
+    <ClCompile Include="..\src\endless_rng.c" />
+    <ClCompile Include="..\src\endless_save.c" />
+    <ClCompile Include="..\src\endless_shop.c" />
     <ClCompile Include="..\src\episodes.c" />
     <ClCompile Include="..\src\file.c" />
     <ClCompile Include="..\src\font.c" />
@@ -346,6 +354,7 @@
     <ClInclude Include="..\src\destruct.h" />
     <ClInclude Include="..\src\editship.h" />
     <ClInclude Include="..\src\endless.h" />
+    <ClInclude Include="..\src\endless_internal.h" />
     <ClInclude Include="..\src\episodes.h" />
     <ClInclude Include="..\src\file.h" />
     <ClInclude Include="..\src\font.h" />

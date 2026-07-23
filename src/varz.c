@@ -188,7 +188,7 @@ JE_byte lvlFileNum;
 // (which otherwise snaps it to the section's first ']L'). Lets a level pool entry / debug pick reach
 // a section's non-first level file -- e.g. Episode 1 section 3's second TYRIAN cut (file 15). Set by
 // select_level (from its file_num arg) and by the endless commit paths; consumed + cleared by
-// JE_loadMap. 0 = use the section default. See endless.c / game_menu.c.
+// JE_loadMap. 0 = use the section default. See endless_level.c / game_menu.c.
 JE_byte forcedLvlFileNum = 0;
 JE_word maxEvent, eventLoc;
 /*JE_word maxenemies;*/

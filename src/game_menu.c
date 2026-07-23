@@ -3224,7 +3224,7 @@ void JE_drawMenuChoices(void)
 // Rank-letter tint, 0 (F) .. 10 (END): a green-to-red ramp -- greens in palette-18 bank 8, the
 // yellow/orange/red half in bank 15. {bank, brightness}, brightness kept in [-1,+5] so the glyph's
 // shades never leave the bank. Indexed by endlessCourseRankLevel, so this MUST stay as long as
-// endless.c's endlessRankName[]. notes.md §Menus & shop.
+// endless_mods.c's endlessRankName[]. notes.md §Menus & shop.
 static const struct { unsigned int bank; int bright; } endlessRankHue[11] = {
 	{  8,  3 },  // F     green
 	{  8,  4 },  // E     green
