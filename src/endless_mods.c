@@ -872,11 +872,12 @@ static unsigned endlessDangerBand(int score)
 }
 
 // Tier word shown before a course's description: a one-glance risk read off the net danger score.
-// Cursed sectors are Traps; no hostile bits is a Boon (Calm with no mods at all).
+// No hostile bits is a Boon (Calm with no mods at all). A Cursed sector has no COMBAT danger, so it
+// reads Boon too -- its economic catch (big cash now, empty shop next) is carried by its own red
+// "cash now, empty shop" modifier row, not a separate tier/help label.
 const char *endlessDangerTierEx(Uint64 mods, int baseDanger)
 {
 	if (mods & ENDLESS_MOD_THEEND) return "FINALITY";  // the 100th-zone finale, a rung above APOCALYPSE
-	if (mods & ENDLESS_MOD_CURSED) return "Trap";
 	const int score = endlessDangerScoreEx(mods, baseDanger);
 	if (score == 0) return (mods == 0) ? "Calm" : "Boon";  // no danger at all: clean/boon AND a gentle level
 	return endlessDangerBands[endlessDangerBand(score)].tier;
@@ -887,15 +888,15 @@ const char *endlessDangerTier(Uint64 mods)
 	return endlessDangerTierEx(mods, 0);
 }
 
-// Letter-grade twin of endlessDangerTier, off the same ladder: level 0 (F, no hostile bits at
-// all) up to 9 (S+++). The numeric level is the single source of truth for both the letter string
-// and the green-to-red tint the monitor draws it in (game_menu.c endlessRankHue[]), so those two
-// can never drift either.
+// Letter-grade twin of endlessDangerTier, off the same ladder: level 0 (F, no hostile bits at all)
+// up to 9 (S+++), plus one off-ladder slot -- 10 (END, the finale). The numeric level is the single
+// source of truth for both the letter string and the green-to-red tint the monitor draws it in
+// (game_menu.c endlessRankHue[]), so those two can never drift either.
 int endlessDangerRankLevelEx(Uint64 mods, int baseDanger)
 {
 	if (mods & ENDLESS_MOD_THEEND) return 10;   // END -- the 100th-zone finale's own grade
 	const int score = endlessDangerScoreEx(mods, baseDanger);
-	if (score == 0) return 0;                   // F -- genuinely no danger
+	if (score == 0) return 0;                   // F -- genuinely no danger (a Cursed sector too: no COMBAT danger)
 	return 1 + (int)endlessDangerBand(score);   // E .. S+++
 }
 

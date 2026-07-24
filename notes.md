@@ -525,6 +525,26 @@ mutable `last`, so a Quit-Level retry replays the same track.
   same net danger score; keep their thresholds in lockstep so the pair never
   disagree. Tier thresholds: ≤9 Low, ≤13 Moderate, ≤19 Tough, ≤26 High, ≤33
   Severe, ≤39 Deadly, ≤49 Extreme, ≤59 NIGHTMARE, >59 APOCALYPSE.
+- One grade sits OFF that scale: **END** (level 10, the finale marker, tier word
+  FINALITY), keyed BEFORE the score in `endlessDangerRankLevelEx`.
+  `endlessRankName[]` and game_menu.c's `endlessRankHue[]` are both indexed by the
+  level, so both are length 11 — keep them equal.
+- Rank-letter tint (`endlessRankHue`; the chart palette is palette.dat block 17,
+  applied via newPal 18): easy grades F/E/D are GREEN from **bank 0** (that
+  palette's clean green ramp, shades 3-7 — the same green the boon mod rows use);
+  C..S+++ and END ride **bank 15**, the pale-yellow → orange → deep-red fire ramp.
+  bank 8 was used for the greens originally but renders brown/gray at the shades
+  F/E/D need in this palette (that's why the easy ranks looked muddy). brightness
+  kept in [-2,+5] so a glyph's shades never leave the bank.
+- A Cursed sector has NO combat danger (score 0), so it reads **Boon** (rank F,
+  green) like any score-0 course — there is no separate "Trap" tier/rank/help
+  label. Its catch (big cash now, empty shop next) is carried entirely by its own
+  red "cash now, empty shop" modifier row; an earlier "!" rank + "Trap" help line
+  were removed as redundant with that row. It still isn't a pure win, so the chart
+  sort key (`endlessDangerSortKey`) gives it a slot of its own — just right of the
+  calm/boon routes (key 0), just left of the mildest combat danger (every combat
+  score lifted +1 to open the key-1 slot) — so it never sits at the far-left
+  "safest pick" end.
 - Faster scroll always reads hostile (2026-07). Mechanics unchanged: Overclock
   (+70%) / Overload (+220%) still speed fire + shots + scroll together, and
   Slipstream / Warp are the scroll-only versions at the same strengths — but
@@ -555,19 +575,24 @@ mutable `last`, so a Quit-Level retry replays the same track.
   2 S+++ + 2 S++** — the END course is "The End" (below), and the four generated
   slots split evenly. The 2-or-3 roll still runs on a grand milestone and is then
   overridden, so the seed stream stays aligned with a plain one.
-  `endlessMakeRankCombo(rank)` builds each sector: shuffle
+  `endlessMakeRankComboForLevel(rank, baseDanger)` builds each sector: shuffle
   `endlessMilestonePool[]`, greedily take bits that don't overshoot the rank's
   score band, stop the moment the score is inside it, then VERIFY with
-  `endlessDangerRankLevel` before handing it back (so a retuned band can't
-  silently mislabel a slate) and reshuffle if it missed. Bit weights are read off
+  `endlessDangerRankLevelEx` before handing it back (so a retuned band can't
+  silently mislabel a slate) and reshuffle if it missed. The score band is first
+  shifted DOWN by the target LEVEL's own `baseDanger`, and the verify folds that
+  same `baseDanger` in — so the rank a slate GUARANTEES (S / S+ / S++ …) is the
+  rank it still DISPLAYS after the level is attached and the chart sorts, rather
+  than drifting a grade on a gentle (−2) or harsh (+5) stage. Bit weights are read off
   `endlessModTable` via `endlessModReward`, never duplicated. `group` in the pool
   marks mutually redundant bits — at most one scroll mod, one homing tier, one
   elite tier, one shield handicap. Out of the pool on purpose: ELITEPACK (the
   deep-run redundancy swap would move the score), and the super-rare signatures
   (Deadgen / evil kill-fire / Redline) — a milestone is a wall of ordinary
-  dangers, not a scheduled visit from the rarest sector in the game. Bands are
-  S+ 40-49, S++ 50-59, S+++ 60-95 (the rank itself is open-ended above 60; the
-  build stops at 95 so a slate stays flyable). The override runs after every
+  dangers, not a scheduled visit from the rarest sector in the game. Bands (at
+  baseDanger 0, before the per-level shift above) are S+ 40-49, S++ 50-59,
+  S+++ 60-95 (the rank itself is open-ended above 60; the build stops at 95 so a
+  slate stays flyable). The override runs after every
   ordinary generation step and before the OMNI roll / danger sort / unique-name
   pass, so a milestone chart is finished off like any other; it keeps the levels
   gathered up top and re-deals only the mutator sets. Reward follows danger
@@ -601,8 +626,8 @@ mutable `last`, so a Quit-Level retry replays the same track.
   danger word (a rung above APOCALYPSE in `endlessDangerTier`), and the bounty: its
   `endlessModTable` reward is 150, so the finale pays ~25-31x base (≈570-710k at
   zone 100). Because the danger score sums that same table, the marker also puts
-  the sector at 238-301 — far above the 95 ceiling `endlessMakeRankCombo` tops
-  S+++ courses out at — so it is always strictly the worst course on the slate and
+  the sector at 238-301 — far above the 95 ceiling `endlessMakeRankComboForLevel`
+  tops S+++ courses out at — so it is always strictly the worst course on the slate and
   the sort always puts it last. It is its OWN rank, not one of the two generated
   rungs, which is why the grand slate reads 1 END + 2 S+++ + 2 S++. Pinned into
   slot 0 so every later draw sees it in `used`.

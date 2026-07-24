@@ -359,18 +359,28 @@ static int endlessModReward(Uint64 bit)
 	return 0;
 }
 
-// Build a random pure-hostile combo whose letter grade is exactly `rank` (6 = S, 7 = S+, 8 = S++,
-// 9 = S+++), distinct from the `usedN` bitsets already dealt this visit. The bands mirror
-// endlessDangerRankLevel -- keep the two in lockstep -- and the built combo is checked against it
-// (synergy included) before being handed back, so a retuned band/synergy can never silently mislabel
-// a milestone. S+++ is open-ended, but the build stops well short of piling on every bit in the pool:
-// brutal, still flyable.
-static Uint64 endlessMakeRankCombo(int rank, const Uint64 *used, int usedN)
+// Build a random pure-hostile combo whose letter grade -- AS DISPLAYED, with the target shipped
+// level's own baseDanger folded in -- is exactly `rank` (6 = S, 7 = S+, 8 = S++, 9 = S+++), distinct
+// from the `usedN` bitsets already dealt this visit. The score band mirrors endlessDangerRankLevel,
+// then is shifted DOWN by baseDanger: the level contributes that much to the final score at the
+// display/sort sites, so the modifier-only build must aim lower to hit `rank` there. Without this a
+// combo built to rank at baseDanger 0 drifts a grade once attached to a gentle (-2) or harsh (+5)
+// level. The built combo is verified against endlessDangerRankLevelEx (synergy AND baseDanger
+// included) before being handed back, so a retuned band / synergy / level profile can never silently
+// mislabel a milestone. S+++ is open-ended, but the build stops well short of piling on every bit in
+// the pool: brutal, still flyable.
+static Uint64 endlessMakeRankComboForLevel(int rank, int baseDanger, const Uint64 *used, int usedN)
 {
-	const int lo = (rank <= 6) ? 34 : (rank == 7) ? 40 : (rank == 8) ? 50 : 60;
-	const int hi = (rank <= 6) ? 39 : (rank == 7) ? 49 : (rank == 8) ? 59 : 95;
+	int lo = (rank <= 6) ? 34 : (rank == 7) ? 40 : (rank == 8) ? 50 : 60;
+	int hi = (rank <= 6) ? 39 : (rank == 7) ? 49 : (rank == 8) ? 59 : 95;
+	lo -= baseDanger;  // aim the modifier-only build low by the level's own contribution; the verify
+	hi -= baseDanger;  // below still checks the TRUE displayed rank, so synergy overshoot is caught too
+	if (hi < 1) hi = 1;
+	if (lo > hi) lo = hi;
+	if (lo < 1) lo = 1;
 
-	Uint64 best = 0;  // first in-band combo seen, used if every attempt collides with an offered one
+	Uint64 best = 0;   // first buildable combo, an absolute fallback if no attempt lands the exact rank
+	Uint64 exact = 0;  // first combo whose DISPLAYED rank matches, kept if every such combo collides
 	for (int attempt = 0; attempt < 60; ++attempt)
 	{
 		int ord[COUNTOF(endlessMilestonePool)];
@@ -383,7 +393,7 @@ static Uint64 endlessMakeRankCombo(int rank, const Uint64 *used, int usedN)
 		}
 
 		// Randomised greedy: walk the shuffled pool taking every bit that doesn't overshoot the band,
-		// and stop the moment the running score is inside it.
+		// and stop the moment the running (modifier-only) score is inside it.
 		Uint64 combo = 0;
 		int score = 0;
 		unsigned groups = 0;
@@ -400,11 +410,13 @@ static Uint64 endlessMakeRankCombo(int rank, const Uint64 *used, int usedN)
 			if (g != 0)
 				groups |= 1u << g;
 		}
-		if (endlessDangerRankLevel(combo) != rank)
-			continue;  // this shuffle couldn't reach the band -- reshuffle
-
-		if (best == 0)
+		if (combo != 0 && best == 0)
 			best = combo;
+		if (endlessDangerRankLevelEx(combo, baseDanger) != rank)
+			continue;  // synergy or the level's baseDanger pushed the displayed rank off the band -- reshuffle
+
+		if (exact == 0)
+			exact = combo;
 		bool clash = false;
 		for (int k = 0; k < usedN && !clash; ++k)
 			if (used[k] == combo)
@@ -412,7 +424,7 @@ static Uint64 endlessMakeRankCombo(int rank, const Uint64 *used, int usedN)
 		if (!clash)
 			return combo;
 	}
-	return best;
+	return exact ? exact : best;
 }
 
 // --- Chart-a-Course generation ------------------------------------------------------------
@@ -652,8 +664,8 @@ static void endlessDedupeCourseMods(const int *idx)
 }
 
 // JACKPOT: every course a pure boon. Deal DISTINCT boon themes (shuffle the table, take one per
-// course), skipping the Cursed entries -- those read as Traps, not clean boons -- so the jackpot
-// is all upside. Below the 25%-share unlock, skip the no-elite-tier boons too (they'd be
+// course), skipping the Cursed entries -- those carry a catch (empty next shop), not clean boons -- so
+// the jackpot is all upside. Below the 25%-share unlock, skip the no-elite-tier boons too (they'd be
 // near-empty this shallow), so the jackpot deals only themes that actually help here.
 static void endlessDealJackpot(void)
 {
@@ -798,7 +810,9 @@ static void endlessDealMilestoneSlate(int milestone)
 		const int rank = (lowLeft > 0) ? lowRank : lowRank + 1;
 		if (lowLeft > 0)
 			--lowLeft;
-		endlessCourseMod[c] = endlessMakeRankCombo(rank, endlessCourseMod, c);
+		// Build to the rank the course will DISPLAY (its level's baseDanger folded in), not the bare
+		// modifier rank, so the slate's guaranteed grades hold after the level is attached and sorted.
+		endlessCourseMod[c] = endlessMakeRankComboForLevel(rank, endlessCourseBaseDanger(c), endlessCourseMod, c);
 	}
 }
 
@@ -850,12 +864,27 @@ static void endlessEnforceEliteRules(void)
 // Low/Moderate/.../NIGHTMARE tier word. A stable insertion sort over this tiny list keeps equal-
 // danger courses in their generated order and consumes no RNG (it runs after every draw), so the
 // seed's structure is unchanged. Ambush already collapsed to one course above, so it's a no-op there.
-// Course i's danger score WITH its level's intrinsic baseDanger folded in -- the metric the chart
-// sorts on (and the same one endlessCourseRank/Tier show), so a course backed by a harder level
-// sorts rightward even when its modifier set is milder.
-static int endlessCourseDangerScore(int i)
+// The key the chart sorts on: a course's danger score WITH its level's intrinsic baseDanger folded in
+// (so a course backed by a harder level sorts rightward even when its modifier set is milder), with
+// one twist. A Cursed sector's COMBAT danger is zero -- its cost is economic (big cash now, empty shop
+// next), not a threat to survive -- so it reads as a Boon and by raw score would tie the calm/boon
+// routes at the far-left "safe" end. It isn't quite a pure win, though (its red "cash now, empty shop"
+// modifier row flags the catch), so give it a slot of its own just right of the safe routes and just
+// left of the mildest real combat danger. Combat scores floor at 1, so lifting every combat course by
+// one opens the score-1 slot without disturbing the combat order.
+static int endlessDangerSortKey(Uint64 mods, int baseDanger)
 {
-	return endlessDangerScoreEx(endlessCourseMod[i], endlessCourseBaseDanger(i));
+	const int score = endlessDangerScoreEx(mods, baseDanger);
+	if (score > 0)
+		return score + 1;                    // real combat danger: sorts from 2 upward
+	if (mods & ENDLESS_MOD_CURSED)
+		return 1;                            // economic catch: between the safe routes and combat danger
+	return 0;                                // calm / pure boon: the safe left end
+}
+
+static int endlessCourseSortKey(int i)
+{
+	return endlessDangerSortKey(endlessCourseMod[i], endlessCourseBaseDanger(i));
 }
 
 static void endlessSortCoursesByDanger(void)
@@ -866,11 +895,11 @@ static void endlessSortCoursesByDanger(void)
 		const JE_byte  sec  = endlessCourseSec[i];
 		const JE_byte  file = endlessCourseFile[i];
 		const Uint64   mod  = endlessCourseMod[i];
-		// The insertion element is out of the arrays during the shift below, so score it from the
-		// captured (mod, ep, file) rather than endlessCourseDangerScore(i).
-		const int      key  = endlessDangerScoreEx(mod, endlessLevelBaseDanger(ep, file, difficultyLevel));
+		// The insertion element is out of the arrays during the shift below, so key it from the
+		// captured (mod, ep, file) rather than endlessCourseSortKey(i).
+		const int      key  = endlessDangerSortKey(mod, endlessLevelBaseDanger(ep, file, difficultyLevel));
 		int j = i - 1;
-		while (j >= 0 && endlessCourseDangerScore(j) > key)
+		while (j >= 0 && endlessCourseSortKey(j) > key)
 		{
 			endlessCourseEp[j + 1]   = endlessCourseEp[j];
 			endlessCourseSec[j + 1]  = endlessCourseSec[j];
@@ -1051,11 +1080,11 @@ const char *endlessCourseHelp(int i)
 		// The letter rank (F easiest .. S+++ hardest) is drawn separately, on the planet monitor's
 		// RANK field (endlessCourseRank + game_menu.c's overlay), so the help line is just the tier.
 		// A clean/boon course always reads Calm/Boon (its score ignores baseDanger, so the safe route
-		// is never demoted); the level's danger surfaces in its PAYOUT instead. bd only bites on the
-		// hostile branch below, where it lifts the tier to match the shipped stage.
-		if (mods & ENDLESS_MOD_CURSED)
-			snprintf(buf, sizeof buf, "Trap: rich now, barren shop next");
-		else if (endlessDangerScoreEx(mods, bd) == 0)
+		// is never demoted); the level's danger surfaces in its PAYOUT instead. A Cursed sector reads
+		// Boon too -- it has no COMBAT danger -- with its economic catch carried by its own red "cash
+		// now, empty shop" modifier row, not a separate help label. bd only bites on the hostile
+		// branch below, where it lifts the tier to match the shipped stage.
+		if (endlessDangerScoreEx(mods, bd) == 0)
 			snprintf(buf, sizeof buf, "%s", (mods == 0) ? "Calm: clear skies ahead" : "Boon: no danger here");
 		else
 			snprintf(buf, sizeof buf, "Danger: %s", endlessDangerTierEx(mods, bd));
@@ -1121,14 +1150,14 @@ int endlessCourseModRows(int i, EndlessCourseModRow *rows, int max)
 	if (n < max && (mods & ENDLESS_MOD_OVERLOAD) && !(mods & ENDLESS_MOD_WARP))
 	{
 		rows[n].word    = "much faster scrolling";
-		rows[n].weight  = 14;  // sorts right under Overload's 15; same deep-red band as Warp's 20
+		rows[n].weight  = 14;  // deep-red tint band (>=14, same as Warp's 20); sorts below Overload's own 30 attack row
 		rows[n].hostile = true;
 		++n;
 	}
 	else if (n < max && (mods & ENDLESS_MOD_OVERCLOCK) && !(mods & (ENDLESS_MOD_SLIPSTREAM | ENDLESS_MOD_WARP)))
 	{
 		rows[n].word    = "faster scrolling";
-		rows[n].weight  = 9;  // sorts right under Overclock's 10; same pale-red band as Slipstream's 6
+		rows[n].weight  = 9;  // pale-red tint band (<10, same as Slipstream's 6); sorts below Overclock's own 16 attack row
 		rows[n].hostile = true;
 		++n;
 	}

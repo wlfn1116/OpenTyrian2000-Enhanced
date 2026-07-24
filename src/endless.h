@@ -218,8 +218,8 @@ void        endlessGenerateCourses(void);  // build this visit's courses
 int         endlessCourseCount(void);      // how many courses (up to 3)
 const char *endlessCourseName(int i);      // short label for the menu list
 const char *endlessCourseHelp(int i);      // one-line risk summary (tier) for the help line
-const char *endlessCourseRank(int i);      // letter danger grade (F..S+++) for the monitor RANK field
-int         endlessCourseRankLevel(int i); // numeric danger level 0(F)..9(S+++), or -1; drives the tint
+const char *endlessCourseRank(int i);      // letter danger grade (F..S+++, END) for the monitor RANK field
+int         endlessCourseRankLevel(int i); // danger level 0(F)..9(S+++), 10(END), or -1; drives the tint
 JE_byte     endlessCoursePlanet(int i);    // star-map planet index for the monitor (cosmetic)
 JE_byte     endlessCourseSection(int i);   // the course's level section (for mapSection[])
 JE_byte     endlessSelectCourse(int i);    // apply course i (mutators + episode); returns its section

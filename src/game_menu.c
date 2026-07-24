@@ -3278,15 +3278,17 @@ void JE_drawMenuChoices(void)
 #define ENDLESS_RANK_CX        MENU_MONITOR_CENTER_X
 #define ENDLESS_RANK_Y        173   // endlessModText draws the body AT this row (no +1 like DARKEN)
 
-// Rank-letter tint, 0 (F) .. 10 (END): a green-to-red ramp -- greens in palette-18 bank 8, the
-// yellow/orange/red half in bank 15. {bank, brightness}, brightness kept in [-1,+5] so the glyph's
-// shades never leave the bank. Indexed by endlessCourseRankLevel, so this MUST stay as long as
-// endless_mods.c's endlessRankName[]. notes.md §Menus & shop.
+// Rank-letter tint, 0 (F) .. 10 (END): a green-to-red ramp. The easy grades are GREEN from bank 0 --
+// the nav palette's clean green ramp (shades 3-7), the same green the boon mod rows use -- and C..END
+// ride bank 15, the pale-yellow -> orange -> deep-red fire ramp. {bank, brightness}; brightness kept
+// in [-2,+5] so the glyph's shades never leave the bank. (bank 8 was used for the greens before, but
+// its shades 10-12 render brown/gray in this palette, not green.) Indexed by endlessCourseRankLevel,
+// so this MUST stay as long as endless_mods.c's endlessRankName[]. notes.md §Menus & shop.
 static const struct { unsigned int bank; int bright; } endlessRankHue[11] = {
-	{  8,  3 },  // F     green
-	{  8,  4 },  // E     green
-	{  8,  5 },  // D     yellow-green
-	{ 15,  5 },  // C     yellow
+	{  0,  0 },  // F     green        (bank 0 shade 7)
+	{  0, -1 },  // E     green
+	{  0, -2 },  // D     deep green
+	{ 15,  5 },  // C     pale yellow
 	{ 15,  4 },  // B     amber
 	{ 15,  3 },  // A     orange
 	{ 15,  2 },  // S     orange
