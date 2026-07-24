@@ -9,6 +9,7 @@
 
 #include "endless.h"
 #include "endless_internal.h"
+#include "endless_levelprofile.h"  // GENERATED endlessLevelProfiles[] (per-level intrinsic danger)
 
 
 const EndlessMod endlessModTable[] = {
@@ -23,12 +24,12 @@ const EndlessMod endlessModTable[] = {
 	{ ENDLESS_MOD_ENRAGE,        10, "enemy fire rate climbs" },
 	{ ENDLESS_MOD_GRAVITY,        8, "downward pull" },
 	{ ENDLESS_MOD_ELITEPACK,     20, "half enemies elite" },
-	{ ENDLESS_MOD_OVERCLOCK,     10, "faster enemy attacks" },  // fire rate + shot speed; ALSO speeds the scroll -- the monitor adds a separate scroll row (endlessCourseModRows) so "+ fire" ambiguity never returns
+	{ ENDLESS_MOD_OVERCLOCK,     16, "faster enemy attacks" },  // THREE effects at once: fire rate (-30%) + shot speed (+40%) + Slipstream-level scroll (70%). Weighted above plain Slipstream/Frenzy for that stack (the monitor adds a separate scroll row in endlessCourseModRows so "+ fire" ambiguity never returns)
 	{ ENDLESS_MOD_SLIPSTREAM,     6, "faster scrolling" },      // the level rushes at you -- less reaction time
 	{ ENDLESS_MOD_KAMIKAZE,      12, "enemies home in" },   // moderate homing, NO ram -- the mid sector tier (what Homing used to be)
 	{ ENDLESS_MOD_HOMING,         6, "light homing" },      // the gentlest homing tier -- enemies barely lean toward you
 	{ ENDLESS_MOD_RAMPAGE,       50, "enemies ram you" },   // gamble-only brutal Kamikaze: strong homing + extra ram damage (top-tier danger weight)
-	{ ENDLESS_MOD_OVERLOAD,      15, "extreme enemy attacks" },
+	{ ENDLESS_MOD_OVERLOAD,      30, "extreme enemy attacks" },  // Overclock cranked way up: WARP-level scroll (220%, same as Warp) PLUS heavy fire (-55%) and shot speed (+90%). Must outrank Warp's scroll-only 20 -- it does everything Warp does and more
 	{ ENDLESS_MOD_APEX,          40, "all enemies elite" },
 	{ ENDLESS_MOD_LEGION,        50, "all champion enemies" },
 	{ ENDLESS_MOD_WARP,          20, "much faster scrolling" },  // Slipstream cranked way up (rare injected)
@@ -782,15 +783,50 @@ static const struct { Uint64 bit; int credit; } endlessBoonMitigation[] = {
 	{ ENDLESS_MOD_TURBODRIVE, 3 },  // each kill quickens the guns
 };
 
+// COMBO SYNERGIES: pairs whose danger is worse than the sum of their parts -- one bit makes the other
+// harder to survive, so the pairing earns a bonus on top of the two rewards. Folded into BOTH the
+// danger score (endlessDangerScoreEx) and the clear payout (endlessClearBonusForEx), so a synergy
+// course both READS and PAYS like the nastier sector it is. Every entry whose bits are ALL present
+// fires, and entries stack. Bits are all hostile, so a pure-boon course never triggers one; bonus is
+// in the same reward-tenths as endlessModTable.
+static const struct { Uint64 combo; int bonus; } endlessSynergies[] = {
+	{ ENDLESS_MOD_SLUGGISH   | ENDLESS_MOD_GRAVITY,     8 },  // Tar Pit: a crawling ship dragged down -- the classic inescapable pairing
+	{ ENDLESS_MOD_SLUGGISH   | ENDLESS_MOD_KAMIKAZE,    7 },  // slowed WHILE the rammers home in: you can't outrun them
+	{ ENDLESS_MOD_DEADGEN    | ENDLESS_MOD_FORTIFIED,   6 },  // starved guns against tanky hulls -- kills slow to a crawl
+	{ ENDLESS_MOD_SLUGGISH   | ENDLESS_MOD_HOMING,      5 },  // slowed vs light homing: dodging no longer shakes it
+	{ ENDLESS_MOD_FORTIFIED  | ENDLESS_MOD_ENRAGE,      5 },  // tanky fights drag on while the fire rate climbs -- the long fight gets deadlier
+	{ ENDLESS_MOD_SHIELDLESS | ENDLESS_MOD_DEVASTATING, 5 },  // no regen and every hit lands harder: one mistake sticks
+	{ ENDLESS_MOD_SLUGGISH   | ENDLESS_MOD_FRENZY,      4 },  // half the reach to thread twice the bullets
+	{ ENDLESS_MOD_SWIFT      | ENDLESS_MOD_HOMING,      4 },  // homing shots that are ALSO fast -- hard to outrun and hard to sidestep
+	{ ENDLESS_MOD_TOPSY      | ENDLESS_MOD_GRAVITY,     4 },  // a flipped view AND a pull: which way is up, and away?
+};
+
+// Total synergy bonus for a modifier set: every combo whose bits are all present, summed (they stack).
+int endlessSynergyBonus(Uint64 mods)
+{
+	int b = 0;
+	for (unsigned i = 0; i < COUNTOF(endlessSynergies); ++i)
+		if ((mods & endlessSynergies[i].combo) == endlessSynergies[i].combo)
+			b += endlessSynergies[i].bonus;
+	return b;
+}
+
 // The sector's net danger: its hostile modifiers' summed reward (endlessModTable, in tenths of the
 // base) minus any survival-boon credit above. A course with no hostile bits scores 0, so the tier
 // words it as Boon/Calm and never needs a number. A hostile course floors at 1, so even a heavily
 // mitigated danger still reads at least "Low" rather than collapsing to a boon.
-int endlessDangerScore(Uint64 mods)
+// `baseDanger` is the shipped level's intrinsic danger nudge (endless_levelprofile.h), folded into a
+// HOSTILE course's score by the DISPLAY/SORT sites so its rank reflects the level too. A calm/boon
+// course (no hostile bits) deliberately IGNORES baseDanger and stays at 0 -- so calm sectors always
+// read Calm and always sort FIRST, whatever their level; that level's danger surfaces only in the
+// PAYOUT (payoutMille, endless_shop.c), never by demoting the safe route below a hostile one. The
+// plain endlessDangerScore is this with baseDanger 0 -- kept pure for the milestone generator, which
+// scores bare hypothetical bitsets that have no level behind them.
+int endlessDangerScoreEx(Uint64 mods, int baseDanger)
 {
 	const Uint64 h = mods & ENDLESS_HOSTILE_MASK;
 	if (h == 0)
-		return 0;
+		return 0;   // clean/boon course: always Calm and always first, regardless of the level's baseDanger
 	int t = 0;
 	for (unsigned i = 0; i < COUNTOF(endlessModTable); ++i)
 		if (h & endlessModTable[i].bit)
@@ -798,7 +834,14 @@ int endlessDangerScore(Uint64 mods)
 	for (unsigned i = 0; i < COUNTOF(endlessBoonMitigation); ++i)
 		if (mods & endlessBoonMitigation[i].bit)
 			t -= endlessBoonMitigation[i].credit;
-	return (t < 1) ? 1 : t;
+	t += endlessSynergyBonus(mods);   // combos worse than the sum of their parts
+	t += baseDanger;
+	return (t < 1) ? 1 : t;   // a hostile course never reads below Low, even on a gentle level
+}
+
+int endlessDangerScore(Uint64 mods)
+{
+	return endlessDangerScoreEx(mods, 0);
 }
 
 // THE DANGER LADDER. One table drives both the tier WORD and the letter GRADE, so the pair can
@@ -830,28 +873,86 @@ static unsigned endlessDangerBand(int score)
 
 // Tier word shown before a course's description: a one-glance risk read off the net danger score.
 // Cursed sectors are Traps; no hostile bits is a Boon (Calm with no mods at all).
+const char *endlessDangerTierEx(Uint64 mods, int baseDanger)
+{
+	if (mods & ENDLESS_MOD_THEEND) return "FINALITY";  // the 100th-zone finale, a rung above APOCALYPSE
+	if (mods & ENDLESS_MOD_CURSED) return "Trap";
+	const int score = endlessDangerScoreEx(mods, baseDanger);
+	if (score == 0) return (mods == 0) ? "Calm" : "Boon";  // no danger at all: clean/boon AND a gentle level
+	return endlessDangerBands[endlessDangerBand(score)].tier;
+}
+
 const char *endlessDangerTier(Uint64 mods)
 {
-	if (mods & ENDLESS_MOD_THEEND)          return "FINALITY";  // the 100th-zone finale, a rung above APOCALYPSE
-	if (mods & ENDLESS_MOD_CURSED)          return "Trap";
-	if ((mods & ENDLESS_HOSTILE_MASK) == 0) return (mods == 0) ? "Calm" : "Boon";
-	return endlessDangerBands[endlessDangerBand(endlessDangerScore(mods))].tier;
+	return endlessDangerTierEx(mods, 0);
 }
 
 // Letter-grade twin of endlessDangerTier, off the same ladder: level 0 (F, no hostile bits at
 // all) up to 9 (S+++). The numeric level is the single source of truth for both the letter string
 // and the green-to-red tint the monitor draws it in (game_menu.c endlessRankHue[]), so those two
 // can never drift either.
+int endlessDangerRankLevelEx(Uint64 mods, int baseDanger)
+{
+	if (mods & ENDLESS_MOD_THEEND) return 10;   // END -- the 100th-zone finale's own grade
+	const int score = endlessDangerScoreEx(mods, baseDanger);
+	if (score == 0) return 0;                   // F -- genuinely no danger
+	return 1 + (int)endlessDangerBand(score);   // E .. S+++
+}
+
 int endlessDangerRankLevel(Uint64 mods)
 {
-	if (mods & ENDLESS_MOD_THEEND) return 10;         // END -- the 100th-zone finale's own grade
-	if ((mods & ENDLESS_HOSTILE_MASK) == 0) return 0; // F
-	return 1 + (int)endlessDangerBand(endlessDangerScore(mods));  // E .. S+++
+	return endlessDangerRankLevelEx(mods, 0);
 }
 // Grade 10 ("END") is off the letter scale on purpose -- it belongs to the finale alone. game_menu.c's
 // endlessRankHue[] is indexed by the same level, so the two arrays must stay the same length.
 static const char *const endlessRankName[11] = { "F", "E", "D", "C", "B", "A", "S", "S+", "S++", "S+++", "END" };
+const char *endlessDangerRankEx(Uint64 mods, int baseDanger)
+{
+	return endlessRankName[endlessDangerRankLevelEx(mods, baseDanger)];
+}
+
 const char *endlessDangerRank(Uint64 mods)
 {
-	return endlessRankName[endlessDangerRankLevel(mods)];
+	return endlessDangerRankEx(mods, 0);
+}
+
+// --- Per-level intrinsic danger (endless_levelprofile.h) -------------------------------------
+// The generated table is keyed by (episode, lvlFileNum). Endless folds baseDanger into a course's
+// danger score at the DISPLAY / SORT / PAYOUT sites (endless_course.c) so the shown rank reflects
+// the level too; endlessDangerScore itself stays pure (it also scores bare hypothetical bitsets
+// that have no level). A level missing from the table -- which shouldn't happen for shipped data
+// -- reads neutral so an unknown level never mislabels or misprices a course.
+int endlessLevelBaseDanger(int ep, int file, int difficulty)
+{
+	if (difficulty < 0)
+		difficulty = 0;
+	else if (difficulty > 10)
+		difficulty = 10;
+	for (unsigned i = 0; i < COUNTOF(endlessLevelProfiles); ++i)
+		if (endlessLevelProfiles[i].ep == ep && endlessLevelProfiles[i].file == file)
+			return endlessLevelProfiles[i].baseDanger[difficulty];
+	return 0;
+}
+
+// The level's fine PAYOUT term (thousandths of the base clear reward) -- decoupled from baseDanger so
+// same-grade levels still pay different amounts. Folded into endlessClearBonusForEx, not the danger
+// score; a missing level reads 0 (pays exactly the modifier-driven amount, no level bonus).
+int endlessLevelPayoutMille(int ep, int file, int difficulty)
+{
+	if (difficulty < 0)
+		difficulty = 0;
+	else if (difficulty > 10)
+		difficulty = 10;
+	for (unsigned i = 0; i < COUNTOF(endlessLevelProfiles); ++i)
+		if (endlessLevelProfiles[i].ep == ep && endlessLevelProfiles[i].file == file)
+			return endlessLevelProfiles[i].payoutMille[difficulty];
+	return 0;
+}
+
+int endlessLevelLengthClass(int ep, int file)
+{
+	for (unsigned i = 0; i < COUNTOF(endlessLevelProfiles); ++i)
+		if (endlessLevelProfiles[i].ep == ep && endlessLevelProfiles[i].file == file)
+			return endlessLevelProfiles[i].lengthClass;
+	return 1;
 }

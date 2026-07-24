@@ -33,6 +33,11 @@ void JE_itemScreen(void);
 // two levels that share a section (Episode 1 section 3's two TYRIAN cuts, files 9 and 15).
 uint JE_getLevelSections(int episode, JE_byte *out, JE_byte *fileOut, uint maxOut);
 
+// Look up the authored level name at (episode, section, fileNum) without loading the level,
+// into `out` (<= outSize, set to "" if not found). fileNum 0 matches the section's first ']L';
+// a non-zero fileNum distinguishes a section's alternate cut. Used by the endless Radar perk.
+void JE_getLevelSectionName(int episode, JE_byte section, JE_byte fileNum, char *out, size_t outSize);
+
 void load_cubes(void);
 bool load_cube(int cube_slot, int cube_index);
 

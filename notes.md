@@ -793,11 +793,15 @@ mutable `last`, so a Quit-Level retry replays the same track.
   quitting ends the run with no reload.
 - Sidecar version history: v3 seed, v4 locked sortie, v5 buff recharge, v6
   recent-level ring, v7 64-bit mods, v8 exact course files, v9 zone-100
-  credits-shown flag, v10 last zone's song + its depth. Each new field is appended
-  and read behind a `version >= N` guard, so older sidecars still load (a missing
-  field reads as the memset-zero default — note v10's apply step has to map a
-  zeroed `lastSong` back to depth −1, or a pre-v10 record would read as a real
-  entry for depth 0).
+  credits-shown flag, v10 last zone's song + its depth, v11 widened the fixed
+  perk block (16 → 32 slots) so the 17th perk (Radar) persists. Each new field is
+  appended and read behind a `version >= N` guard, so older sidecars still load (a
+  missing field reads as the memset-zero default — note v10's apply step has to map
+  a zeroed `lastSong` back to depth −1, or a pre-v10 record would read as a real
+  entry for depth 0; v11 reads the legacy 16-slot perk width for pre-v11 files, the
+  zeroed extra slots reading as newer perks unowned). A `COMPILE_TIME_ASSERT` keeps
+  `PERK_COUNT <= ENDLESS_SAVE_PERKS`, so the next overflow fails the build instead
+  of silently dropping a perk.
 - Quit Level in endless reverts the level to its launch state and reopens the
   outpost. Hardcore relocks it (retry same level or quit run; no farm-then-bail);
   non-hardcore unlocks it (re-outfit freely, still no mid-zone farming).

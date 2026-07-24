@@ -46,9 +46,15 @@ int      endlessSortiePreLongCon   = 0;
 // by the same slot; restoring the snapshot rather than regenerating stops reload rerolling the shop. notes.md §Save / resume.
 
 #define ENDLESS_SAVE_FILE    "endless.sav"
-#define ENDLESS_SAVE_VERSION 10     // v1 run-state only; v2 outpost snapshot; v3 seed; v4 locked sortie; v5 buff recharge; v6 recent-level ring; v7 64-bit mods; v8 exact course files; v9 credits-shown flag; v10 last zone's song
-#define ENDLESS_SAVE_PERKS   16     // fixed perk-array width on disk; now == PERK_COUNT (headroom used up).
-                                    // Adding a 17th perk means bumping this (and the save version) or it won't persist.
+#define ENDLESS_SAVE_VERSION 11     // v1 run-state only; v2 outpost snapshot; v3 seed; v4 locked sortie; v5 buff recharge; v6 recent-level ring; v7 64-bit mods; v8 exact course files; v9 credits-shown flag; v10 last zone's song; v11 wider perk array (17th perk)
+#define ENDLESS_SAVE_PERKS   32     // on-disk perk-array width from v11 (was 16, which had grown to == PERK_COUNT).
+                                    // Comfortable headroom now; a future perk only needs a version bump once PERK_COUNT passes this.
+#define ENDLESS_SAVE_PERKS_V10 16   // v3..v10 wrote a fixed 16-wide perk block; the reader honours that for older files.
+
+// A perk's on-disk slot IS its PERK_* index, so the fixed-width block must cover every perk or
+// endlessCaptureCurrent would silently drop the highest ones. This stops compiling the moment
+// PERK_COUNT outgrows the block -- the cue to widen ENDLESS_SAVE_PERKS and bump the save version.
+COMPILE_TIME_ASSERT(endless_save_perks_fit, PERK_COUNT <= ENDLESS_SAVE_PERKS);
 
 typedef struct {
 	bool used;
@@ -156,6 +162,8 @@ static void endlessRestoreSavedCourses(const EndlessSlotRec *r)
 		endlessReseed((Uint64)endlessRunDepth * 2);
 		endlessGenerateCourses();
 	}
+
+	endlessNameCourseBaseLevels();  // populate the Radar perk's base-level cache for the restored chart
 }
 
 // Little-endian field I/O over a FILE*. The write side is fire-and-forget; the read side never
@@ -256,7 +264,10 @@ static bool endlessReadRec(FILE *f, EndlessSlotRec *r, int version)
 	    || !endlessGetU8(f, &r->lastSec) || !endlessGetU8(f, &r->forced))
 		return false;
 
-	if (!endlessGetBytes(f, r->perkOwned, ENDLESS_SAVE_PERKS)
+	// v11 widened the perk block; v3..v10 wrote 16 bytes. memset(r,0) above zeroed the extra
+	// slots, so reading the narrow legacy width just leaves the newer perks unowned.
+	const size_t perkBytes = (version >= 11) ? ENDLESS_SAVE_PERKS : ENDLESS_SAVE_PERKS_V10;
+	if (!endlessGetBytes(f, r->perkOwned, perkBytes)
 	    || !endlessGetBytes(f, r->gambleMsg, sizeof(r->gambleMsg))
 	    || !endlessGetBytes(f, r->lastSpecialName, sizeof(r->lastSpecialName)))
 		return false;
@@ -699,6 +710,17 @@ void endlessRestoreSortie(void)
 }
 
 bool endlessSortieValid(void) { return endlessSortieHave; }
+
+// The committed level's fine PAYOUT term at the run difficulty, from the sortie snapshot (the
+// authoritative "level being played" record, valid through the clear + outpost and across a reload).
+// The clear payout reads this so the banked cash matches the course card the player picked; 0 when no
+// sortie is live (e.g. a debug launch that set endlessActiveMods without committing a level).
+int endlessSortiePayoutMille(void)
+{
+	if (!endlessSortieHave)
+		return 0;
+	return endlessLevelPayoutMille(endlessSortieEp, endlessSortieFile, difficultyLevel);
+}
 
 void endlessArmLockedRelaunch(void)
 {

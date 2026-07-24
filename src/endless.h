@@ -447,6 +447,7 @@ int endlessPerkPowerUsePercent(void);  // Efficient Coils perk: generator power-
 int endlessPerkShieldWait(int base);   // Shield Matrix perk: shield-regen interval (ticks between +1 shield) reduced from `base`, floored; applied at the shield-regen reset in tyrian2.c
 int endlessPerkChargeTicks(int base);  // Rapid Charger perk: charge-base sidekick charge interval (ticks per +1 charge level) reduced from `base`, floored; applied at the sidekick charge loop in mainint.c
 int endlessPerkShotSpeedPercent(void); // High-Velocity Rounds perk: shot travel-speed scale (100 = normal); applied to genuine shot velocities in shots.c player_shot_create
+bool endlessPerkRadarActive(void);     // Radar perk: Chart-a-Course help line names each sector's base level (endless_course.c endlessCourseHelp)
 
 // Perk registry accessors (for the endless debug screen: list / toggle / stack perks).
 int         endlessPerkCount(void);          // number of perks (PERK_COUNT)

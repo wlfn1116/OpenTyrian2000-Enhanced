@@ -356,6 +356,63 @@ uint JE_getLevelSections(int episode, JE_byte *out, JE_byte *fileOut, uint maxOu
 	return n;
 }
 
+// Look up the authored name of the level at (episode, section, fileNum) -- the same 9-char name
+// (offset 13, space-padded) JE_getLevelSections reads for its blocklist -- without loading the
+// level. fileNum 0 matches the section's first ']L'; a non-zero fileNum picks a specific cut
+// (Episode 1 section 3's two TYRIAN files). `out` is set to "" if no matching entry is found.
+// Used by the endless Radar perk to name each charted course's base level. (Distinct from
+// mainint.c's static JE_getLevelName, which resolves routing sections in the current episode.)
+void JE_getLevelSectionName(int episode, JE_byte section, JE_byte fileNum, char *out, size_t outSize)
+{
+	if (out == NULL || outSize == 0)
+		return;
+	out[0] = '\0';
+
+	const unsigned int levelFileCount = JE_levelFileCount(episode);
+	if (levelFileCount == 0)
+		return;
+
+	char fname[16];
+	snprintf(fname, sizeof(fname), "levels%d.dat", episode);
+	FILE *f = dir_fopen_warn(data_dir(), fname, "rb");
+	if (f == NULL)
+		return;
+
+	JE_word sec = 0;
+	long end = ftell_eof(f);
+	char s[256];
+
+	while (ftell(f) < end)
+	{
+		read_encrypted_pascal_string(s, sizeof(s), f);
+
+		if (s[0] == '*')
+		{
+			sec++;
+		}
+		else if (s[0] == ']' && s[1] == 'L')
+		{
+			const int fn = atoi(s + 25);
+			if (fn < 1 || (unsigned int)fn > levelFileCount)
+				continue;
+			if (sec != section || (fileNum != 0 && fn != (int)fileNum))
+				continue;
+
+			// The name is a fixed 9-char field (offset 13), space-padded, with the file number
+			// following at offset 25 -- so copy exactly 9 chars first, never the whole tail.
+			char name[10];
+			SDL_strlcpy(name, s + 13, sizeof(name));
+			size_t len = strlen(name);
+			while (len > 0 && name[len - 1] == ' ')
+				name[--len] = '\0';
+			SDL_strlcpy(out, name, outSize);
+			break;
+		}
+	}
+
+	fclose(f);
+}
+
 JE_longint JE_cashLeft(void)
 {
 	JE_longint tempL = player[0].cash;

@@ -133,7 +133,8 @@ enum {
 	PERK_POWERUSE,
 	PERK_SHIELDREGEN,
 	PERK_CHARGERATE,
-	PERK_SHOTSPEED,    // append new perks here; the index is the on-disk save slot, so don't renumber
+	PERK_SHOTSPEED,
+	PERK_RADAR,        // append new perks here; the index is the on-disk save slot, so don't renumber
 	PERK_COUNT
 };
 
@@ -180,6 +181,8 @@ extern bool endlessResumeVisit;         // a save was just loaded: the next outp
 extern bool endlessCreditsShown;        // the zone-100 credits roll already played this run (rides the save)
 
 long   endlessClearBonusFor(Uint64 mods);   // clear payout for an ARBITRARY modifier set at the current depth
+long   endlessClearBonusForEx(Uint64 mods, int payoutMille);  // ...plus the shipped level's payoutMille (thousandths of base: harder level pays more, finely)
+int    endlessSortiePayoutMille(void);      // payoutMille of the COMMITTED level at the run difficulty (0 if no sortie); keeps banked payout == the shown course payout
 Uint64 endlessStripWorstMod(Uint64 mods);   // strip the single most-dangerous hostile bit (one per cleanse charge)
 
 // --- endless_mods.c: the mutator registry ----------------------------------------
@@ -237,10 +240,35 @@ extern const EndlessTheme endlessDeadgenThemes[5];
 Uint64      endlessMakeTheEndMods(void);   // "The End" -- the sector every GRAND milestone deals
 Uint64      endlessPickThemeMods(const EndlessTheme *tbl, unsigned count, Uint64 must, Uint64 forbid);
 const char *endlessComboNameSalted(Uint64 mods, unsigned salt);  // salt steps a GENERATED pick to the next word
-int         endlessDangerScore(Uint64 mods);      // net danger: summed hostile reward, minus boon credits
+int         endlessSynergyBonus(Uint64 mods);     // extra danger for combos worse than the sum of their parts (into score AND payout)
+int         endlessDangerScore(Uint64 mods);      // net danger: summed hostile reward, minus boon credits, plus synergy
 const char *endlessDangerTier(Uint64 mods);       // tier word shown before a course's description
 int         endlessDangerRankLevel(Uint64 mods);  // 0 (F) .. 10 (END)
 const char *endlessDangerRank(Uint64 mods);       // the letter grade for that level
+// ...the same four, but with a shipped-level baseDanger nudge folded in (endless_levelprofile.h).
+// The plain versions above are these with baseDanger 0.
+int         endlessDangerScoreEx(Uint64 mods, int baseDanger);
+const char *endlessDangerTierEx(Uint64 mods, int baseDanger);
+int         endlessDangerRankLevelEx(Uint64 mods, int baseDanger);
+const char *endlessDangerRankEx(Uint64 mods, int baseDanger);
+
+// --- endless_levelprofile.h: GENERATED per-level intrinsic danger ------------------
+// Each shipped level, run through the Tyrian2000Atlas GameSim at every difficulty, yields a
+// small baseDanger nudge (roughly -2..+5) that endless folds into a course's danger score so
+// the displayed rank/payout reflects the intrinsic LEVEL, not just its modifiers. Keyed by
+// (episode, lvlFileNum) == (endlessCourseEp[i], endlessCourseFile[i]). The generated table and
+// the mapping that built it live in endless_levelprofile.h (included by endless_mods.c).
+typedef struct {
+	JE_byte     ep;               // episode number 1..5
+	JE_byte     file;             // lvlFileNum (endlessCourseFile / forcedLvlFileNum)
+	JE_byte     lengthClass;      // 0 short, 1 normal, 2 long
+	JE_shortint baseDanger[11];   // COARSE grade/tier/sort nudge per difficulty (DIFFICULTY_WIMP..DIFFICULTY_10)
+	Sint16      payoutMille[11];  // FINE payout term per difficulty, in thousandths of the base clear reward
+} EndlessLevelProfile;
+
+int endlessLevelBaseDanger(int ep, int file, int difficulty);   // coarse grade nudge (-2..+5); 0 if level unknown
+int endlessLevelPayoutMille(int ep, int file, int difficulty);  // fine payout term (thousandths of base); 0 if unknown
+int endlessLevelLengthClass(int ep, int file);                  // 0/1/2; 1 (normal) if level unknown
 
 // --- endless_course.c: Chart-a-Course --------------------------------------------
 #define ENDLESS_MAX_COURSES 5
@@ -256,6 +284,11 @@ extern bool     endlessForced;   // this visit is a forced "Ambush" (single dang
 
 // Resolve a saved/chosen (episode, section) back to a real endless-safe level file.
 bool endlessResolveCourseFile(int ep, JE_byte sec, JE_byte requestedFile, JE_byte *resolvedFile);
+
+// Cache each current course's authored base-level name (for the Radar perk's Chart-a-Course
+// readout) so the per-frame help text never re-reads levels*.dat. Run whenever the course set
+// is finalized: the tail of endlessGenerateCourses, and after endlessRestoreSavedCourses.
+void endlessNameCourseBaseLevels(void);
 
 // --- endless_save.c: the Quit Level sortie snapshot ------------------------------
 extern bool     endlessSortieHave;         // a launch-time snapshot exists

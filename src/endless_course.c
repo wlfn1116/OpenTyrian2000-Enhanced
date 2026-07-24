@@ -35,18 +35,31 @@ JE_byte  endlessCourseSec[ENDLESS_MAX_COURSES];
 JE_byte  endlessCourseFile[ENDLESS_MAX_COURSES];  // each course's specific lvlFileNum (see forcedLvlFileNum)
 Uint64 endlessCourseMod[ENDLESS_MAX_COURSES];
 static JE_byte  endlessCourseNameSalt[ENDLESS_MAX_COURSES];  // per-visit nudge so no two offered names read the same
+static char     endlessCourseBaseName[ENDLESS_MAX_COURSES][10];  // Radar perk: authored level name behind each course (9 chars + NUL)
 int      endlessLastEp = 0;
 JE_byte  endlessLastSec = 0;
 bool     endlessForced = false;  // this visit is a forced "Ambush" (single dangerous sector)
 
-// The TRUTHFUL clear payout for course i at the current depth -- derived from the same table
-// (endlessClearBonusFor) that actually pays it out, so the shown and banked amounts can't
-// disagree. Shown highlighted on the course's help line (game_menu.c).
+// The intrinsic-danger nudge for course i's shipped level at the current run difficulty
+// (endless_levelprofile.h): folded into the course's shown danger tier/grade, its sort position and
+// its payout so all three reflect the LEVEL, not just its modifiers. 0 for an out-of-range course.
+static int endlessCourseBaseDanger(int i)
+{
+	if (i < 0 || i >= endlessCourseCnt)
+		return 0;
+	return endlessLevelBaseDanger(endlessCourseEp[i], endlessCourseFile[i], difficultyLevel);
+}
+
+// The TRUTHFUL clear payout for course i at the current depth -- the modifier table plus the LEVEL's
+// fine payoutMille term (thousandths of base), exactly as endlessClearBonus banks it on clear (via
+// endlessSortiePayoutMille, keyed off the same committed level), so shown == banked. This is what
+// varies the cash between same-grade courses. Shown highlighted on the help line (game_menu.c).
 long endlessCoursePayout(int i)
 {
 	if (i < 0 || i >= endlessCourseCnt)
 		return 0;
-	return endlessClearBonusFor(endlessCourseMod[i]);
+	return endlessClearBonusForEx(endlessCourseMod[i],
+	                              endlessLevelPayoutMille(endlessCourseEp[i], endlessCourseFile[i], difficultyLevel));
 }
 
 // Pick a random BOON bit safe to weld onto a hostile course that already carries `hostiles`, turning it
@@ -346,15 +359,16 @@ static int endlessModReward(Uint64 bit)
 	return 0;
 }
 
-// Build a random pure-hostile combo whose letter grade is exactly `rank` (7 = S+, 8 = S++, 9 = S+++),
-// distinct from the `usedN` bitsets already dealt this visit. The bands mirror endlessDangerRankLevel
-// -- keep the two in lockstep -- and the built combo is checked against it before being handed back,
-// so a retuned band can never silently mislabel a milestone. S+++ is open-ended, but the build stops
-// well short of piling on every bit in the pool: brutal, still flyable.
+// Build a random pure-hostile combo whose letter grade is exactly `rank` (6 = S, 7 = S+, 8 = S++,
+// 9 = S+++), distinct from the `usedN` bitsets already dealt this visit. The bands mirror
+// endlessDangerRankLevel -- keep the two in lockstep -- and the built combo is checked against it
+// (synergy included) before being handed back, so a retuned band/synergy can never silently mislabel
+// a milestone. S+++ is open-ended, but the build stops well short of piling on every bit in the pool:
+// brutal, still flyable.
 static Uint64 endlessMakeRankCombo(int rank, const Uint64 *used, int usedN)
 {
-	const int lo = (rank <= 7) ? 40 : (rank == 8) ? 50 : 60;
-	const int hi = (rank <= 7) ? 49 : (rank == 8) ? 59 : 95;
+	const int lo = (rank <= 6) ? 34 : (rank == 7) ? 40 : (rank == 8) ? 50 : 60;
+	const int hi = (rank <= 6) ? 39 : (rank == 7) ? 49 : (rank == 8) ? 59 : 95;
 
 	Uint64 best = 0;  // first in-band combo seen, used if every attempt collides with an offered one
 	for (int attempt = 0; attempt < 60; ++attempt)
@@ -549,10 +563,11 @@ static void endlessWidenHostileCombos(int dangerRamp)
 // A boon course is uncommon (~1 in 3 visits replaces a hostile one): most draw a named boon theme
 // (single or curated combo), but ~40% instead roll a fresh emergent boon pair/triple, so
 // pure-good sectors vary beyond the named set too. The danger ramp thins boon courses deep (~1/3
-// early down to ~1/6 at the cap), but they never vanish.
+// early, ~1/5 by the mid, gently past that), but they never vanish. The deep-thinning coefficient is
+// kept a touch gentle (a small nudge, since the extra milestone zones force danger more often now).
 static void endlessDealBoonCourse(int dangerRamp)
 {
-	if (endlessCourseCnt > 1 && (endlessRand() % (3 + dangerRamp * 3 / 100)) == 0)
+	if (endlessCourseCnt > 1 && (endlessRand() % (3 + dangerRamp * 2 / 100)) == 0)
 	{
 		const int slot = 1 + endlessRand() % (endlessCourseCnt - 1);
 		if (endlessRand() % 100 < 40)
@@ -747,16 +762,16 @@ static void endlessEnsureLegibleChoice(void)
 		endlessCourseMod[best] = keep;
 }
 
-// MILESTONE SLATE: on every 50th zone the whole chart is replaced by five S-tier sectors. A plain
-// milestone deals S+/S++ split 2-and-3, which rung gets the pair decided by the seed; a GRAND
-// (100th) one has a FIXED shape -- one END course, two S+++ and two S++. The LEVELS gathered above
-// are kept; only the mutator sets are re-dealt, so the slate is still five different sectors. Runs
-// after every ordinary generation step (nothing above can survive into it) and before the OMNI
-// roll / sort / naming, which finish it off like any other chart.
+// MILESTONE SLATE: on a milestone zone the whole chart is replaced by five high-tier sectors. The
+// minor (kind 3) milestone deals S/S+ and the plain (kind 1) one S+/S++, each split 2-and-3 with the
+// seed deciding which rung gets the pair; a GRAND (kind 2) one has a FIXED shape -- one END course,
+// two S+++ and two S++. The LEVELS gathered above are kept; only the mutator sets are re-dealt, so the
+// slate is still five different sectors. Runs after every ordinary generation step (nothing above can
+// survive into it) and before the OMNI roll / sort / naming, which finish it off like any other chart.
 static void endlessDealMilestoneSlate(int milestone)
 {
-	const int lowRank = (milestone == 2) ? 8 : 7;  // S++ / S+  (see endlessDangerRankLevel)
-	int lowN = 2 + (int)(endlessRand() % 2);       // plain: 2 or 3 of the lower rung, the rest one higher
+	const int lowRank = (milestone == 2) ? 8 : (milestone == 3) ? 6 : 7;  // S++ / S / S+  (see endlessDangerRankLevel)
+	int lowN = 2 + (int)(endlessRand() % 2);       // minor/plain: 2 or 3 of the lower rung, the rest one higher
 	if (milestone == 2)
 		lowN = 2;                                  // grand: exactly 2 S++ (the roll above is still consumed,
 		                                           // so the seed stream stays aligned with a plain milestone)
@@ -835,6 +850,14 @@ static void endlessEnforceEliteRules(void)
 // Low/Moderate/.../NIGHTMARE tier word. A stable insertion sort over this tiny list keeps equal-
 // danger courses in their generated order and consumes no RNG (it runs after every draw), so the
 // seed's structure is unchanged. Ambush already collapsed to one course above, so it's a no-op there.
+// Course i's danger score WITH its level's intrinsic baseDanger folded in -- the metric the chart
+// sorts on (and the same one endlessCourseRank/Tier show), so a course backed by a harder level
+// sorts rightward even when its modifier set is milder.
+static int endlessCourseDangerScore(int i)
+{
+	return endlessDangerScoreEx(endlessCourseMod[i], endlessCourseBaseDanger(i));
+}
+
 static void endlessSortCoursesByDanger(void)
 {
 	for (int i = 1; i < endlessCourseCnt; ++i)
@@ -843,9 +866,11 @@ static void endlessSortCoursesByDanger(void)
 		const JE_byte  sec  = endlessCourseSec[i];
 		const JE_byte  file = endlessCourseFile[i];
 		const Uint64   mod  = endlessCourseMod[i];
-		const int      key  = endlessDangerScore(mod);
+		// The insertion element is out of the arrays during the shift below, so score it from the
+		// captured (mod, ep, file) rather than endlessCourseDangerScore(i).
+		const int      key  = endlessDangerScoreEx(mod, endlessLevelBaseDanger(ep, file, difficultyLevel));
 		int j = i - 1;
-		while (j >= 0 && endlessDangerScore(endlessCourseMod[j]) > key)
+		while (j >= 0 && endlessCourseDangerScore(j) > key)
 		{
 			endlessCourseEp[j + 1]   = endlessCourseEp[j];
 			endlessCourseSec[j + 1]  = endlessCourseSec[j];
@@ -885,6 +910,19 @@ static void endlessMakeCourseNamesUnique(void)
 	}
 }
 
+// Cache the authored base-level name behind each finalized course, so the Radar perk's per-frame
+// help line (endlessCourseHelp) reads a string instead of re-parsing levels*.dat every frame. Runs
+// after the danger sort (so index i matches the displayed order) and after any course restore, off
+// the final (episode, section, file) each course actually launches. Empty for unused slots.
+void endlessNameCourseBaseLevels(void)
+{
+	for (int i = 0; i < endlessCourseCnt && i < ENDLESS_MAX_COURSES; ++i)
+		JE_getLevelSectionName(endlessCourseEp[i], endlessCourseSec[i], endlessCourseFile[i],
+		                       endlessCourseBaseName[i], sizeof endlessCourseBaseName[i]);
+	for (int i = endlessCourseCnt; i < ENDLESS_MAX_COURSES; ++i)
+		endlessCourseBaseName[i][0] = '\0';
+}
+
 void endlessGenerateCourses(void)
 {
 	endlessCourseCnt = 0;
@@ -911,7 +949,7 @@ void endlessGenerateCourses(void)
 	endlessDedupeCourseMods(idx);
 
 	// --- Rare whole-visit flavors: Jackpot / Gauntlet / Ambush (mutually exclusive) ----------
-	// Jackpot (~1/25) all boons; Ambush (~1/20) one forced dangerous sector; Gauntlet (~1/7)
+	// Jackpot (~1/22) all boons; Ambush (~1/20) one forced dangerous sector; Gauntlet (~1/7)
 	// all hostile. All three dice roll up front UNCONDITIONALLY so the seed stream stays
 	// aligned; precedence Jackpot > Ambush > Gauntlet; none fire at depth 0. The danger ramp tilts
 	// the odds deep: the danger-only Gauntlet/Ambush grow more common while the all-boon Jackpot thins.
@@ -923,7 +961,7 @@ void endlessGenerateCourses(void)
 	int ambushPct = 5 + dangerRamp * 4 / 100;      // ~1/20 early -> ~9% by the mid -> capped
 	if (ambushPct > ENDLESS_DANGER_AMBUSH_CAP_PCT)
 		ambushPct = ENDLESS_DANGER_AMBUSH_CAP_PCT;
-	const bool jackpotRoll  = ((endlessRand() % (25 + dangerRamp * 25 / 100)) == 0);  // 1/25 -> 1/50 (mid) -> ~1/112 (cap)
+	const bool jackpotRoll  = ((endlessRand() % (22 + dangerRamp * 22 / 100)) == 0);  // ~1/22 -> 1/44 (mid) -> ~1/99 (cap) -- small bump to offset the extra milestone danger zones
 	const bool gauntletRoll = ((int)(endlessRand() % 100) < gauntletPct);
 	const bool ambushRoll   = ((int)(endlessRand() % 100) < ambushPct);
 	// A milestone zone deals its own fixed slate below, so none of the three may fire there (an
@@ -950,6 +988,7 @@ void endlessGenerateCourses(void)
 	endlessEnforceEliteRules();
 	endlessSortCoursesByDanger();
 	endlessMakeCourseNamesUnique();
+	endlessNameCourseBaseLevels();  // cache each course's base-level name for the Radar perk (after the sort)
 }
 
 // Resolve a saved/chosen (episode, section) back to a real endless-safe level file. Prefer the
@@ -997,26 +1036,36 @@ const char *endlessCourseName(int i)
 // "A, B and more" listing would just duplicate them.
 const char *endlessCourseHelp(int i)
 {
-	static char buf[64];
+	static char buf[80];
 	if (i < 0 || i >= endlessCourseCnt)
 		return "";
 	if (endlessForced && i == 0)
 	{
 		snprintf(buf, sizeof buf, "Ambush! %s - no way around it",
-		         endlessDangerTier(endlessCourseMod[0]));
-		return buf;
+		         endlessDangerTierEx(endlessCourseMod[0], endlessCourseBaseDanger(0)));
 	}
-	const Uint64 mods = endlessCourseMod[i];
-	// The letter rank (F easiest .. S+++ hardest) is drawn separately, on the planet monitor's
-	// RANK field (endlessCourseRank + game_menu.c's overlay), so the help line is just the tier.
-	if (mods == 0)
-		snprintf(buf, sizeof buf, "Calm: clear skies ahead");
-	else if (mods & ENDLESS_MOD_CURSED)
-		snprintf(buf, sizeof buf, "Trap: rich now, barren shop next");
-	else if ((mods & ENDLESS_HOSTILE_MASK) == 0)
-		snprintf(buf, sizeof buf, "Boon: no danger here");
 	else
-		snprintf(buf, sizeof buf, "Danger: %s", endlessDangerTier(mods));
+	{
+		const Uint64 mods = endlessCourseMod[i];
+		const int    bd   = endlessCourseBaseDanger(i);   // the shipped level's own danger (hostile courses only)
+		// The letter rank (F easiest .. S+++ hardest) is drawn separately, on the planet monitor's
+		// RANK field (endlessCourseRank + game_menu.c's overlay), so the help line is just the tier.
+		// A clean/boon course always reads Calm/Boon (its score ignores baseDanger, so the safe route
+		// is never demoted); the level's danger surfaces in its PAYOUT instead. bd only bites on the
+		// hostile branch below, where it lifts the tier to match the shipped stage.
+		if (mods & ENDLESS_MOD_CURSED)
+			snprintf(buf, sizeof buf, "Trap: rich now, barren shop next");
+		else if (endlessDangerScoreEx(mods, bd) == 0)
+			snprintf(buf, sizeof buf, "%s", (mods == 0) ? "Calm: clear skies ahead" : "Boon: no danger here");
+		else
+			snprintf(buf, sizeof buf, "Danger: %s", endlessDangerTierEx(mods, bd));
+	}
+	// Radar perk: reveal the shipped level behind this sector, right after the tier read.
+	if (endlessPerkRadarActive() && endlessCourseBaseName[i][0] != '\0')
+	{
+		const size_t len = strlen(buf);
+		snprintf(buf + len, sizeof buf - len, " (%s)", endlessCourseBaseName[i]);
+	}
 	return buf;
 }
 
@@ -1027,7 +1076,7 @@ const char *endlessCourseRank(int i)
 {
 	if (i < 0 || i >= endlessCourseCnt)
 		return "";
-	return endlessDangerRank(endlessCourseMod[i]);
+	return endlessDangerRankEx(endlessCourseMod[i], endlessCourseBaseDanger(i));
 }
 
 // Numeric danger level 0 (F) .. 9 (S+++) for course i, or -1 if out of range. The monitor uses
@@ -1036,7 +1085,7 @@ int endlessCourseRankLevel(int i)
 {
 	if (i < 0 || i >= endlessCourseCnt)
 		return -1;
-	return endlessDangerRankLevel(endlessCourseMod[i]);
+	return endlessDangerRankLevelEx(endlessCourseMod[i], endlessCourseBaseDanger(i));
 }
 
 // The highlighted course's individual modifiers for the monitor overlay, worst-first. The

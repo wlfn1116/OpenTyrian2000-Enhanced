@@ -132,23 +132,33 @@ static long endlessClearBase(void)
 // per-modifier reward (each in tenths of the base). Used both to pay out (endlessClearBonus)
 // and to SHOW the payout on the Chart-a-Course monitor (endlessCoursePayout) -- so the two
 // can't disagree.
-long endlessClearBonusFor(Uint64 mods)
+long endlessClearBonusForEx(Uint64 mods, int payoutMille)
 {
 	const long base = endlessClearBase();
 	long tenths = 0;
 	for (unsigned i = 0; i < COUNTOF(endlessModTable); ++i)
 		if (mods & endlessModTable[i].bit)
 			tenths += endlessModTable[i].reward;
-	const long total = base + base * tenths / 10;
+	tenths += endlessSynergyBonus(mods);   // combos worse than the sum of their parts pay extra too
+	// The sector's MODIFIERS pay in tenths of the base; the shipped LEVEL pays a separate, finer term
+	// in thousandths (endless_levelprofile.h payoutMille) so two same-grade levels still differ in cash.
+	const long total = base + base * tenths / 10 + base * payoutMille / 1000;
 	const long floor = base / 4;
 	return (total > floor) ? total : floor;  // always a minimum reward
 }
 
-// Cash paid on CLEARING a level -- the base plus whatever the active sector's mutators add.
+long endlessClearBonusFor(Uint64 mods)
+{
+	return endlessClearBonusForEx(mods, 0);
+}
+
+// Cash paid on CLEARING a level -- the base plus whatever the active sector's mutators add (tenths),
+// plus the committed LEVEL's own fine payout term (thousandths). endlessSortiePayoutMille keys off the
+// same committed level the course card priced (endlessCoursePayout), so banked == shown.
 // Taking the harder route pays off.
 static long endlessClearBonus(void)
 {
-	return endlessClearBonusFor(endlessActiveMods);
+	return endlessClearBonusForEx(endlessActiveMods, endlessSortiePayoutMille());
 }
 
 // --- Shop stock -----------------------------------------------------------------

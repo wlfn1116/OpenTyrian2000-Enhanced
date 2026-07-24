@@ -40,6 +40,7 @@ const EndlessPerk endlessPerkTable[PERK_COUNT] = {
 	{ "Shield Matrix",    "Your shield recharges faster.",        4 },
 	{ "Rapid Charger",    "Charge sidekicks power up faster.",    4 },
 	{ "High-Velocity Shots", "Your shots travel faster.",        3 },
+	{ "Radar",            "Chart-a-Course shows each sector's level.", 1 },
 };
 
 bool endlessPerkPending = false;             // a perk pick is queued for the next shop
@@ -168,6 +169,14 @@ int endlessPerkShotSpeedPercent(void)
 	if (!endlessMode)
 		return 100;
 	return 100 + endlessPerkOwned[PERK_SHOTSPEED] * ENDLESS_PERK_SHOTSPEED_PCT;
+}
+
+// Radar perk: while owned, Chart-a-Course's help line names the shipped level behind each offered
+// sector (endlessCourseHelp appends it after the danger tier). A pure information reveal -- no
+// combat effect -- so it hangs off the perk-owned flag alone.
+bool endlessPerkRadarActive(void)
+{
+	return endlessMode && endlessPerkOwned[PERK_RADAR] > 0;
 }
 
 // Roll this shop visit's perk offers: up to 3 distinct perks that aren't already maxed out.

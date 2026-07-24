@@ -54,17 +54,21 @@ int endlessTurbodriveTimer = 0;
 static bool endlessArmorHudDirty = false;  // set when the Overheat DoT shaves hull; the game loop repaints the (event-driven) armor bar
 
 // --- Milestone zones -------------------------------------------------------------------------
-// Every 50th zone is a set-piece: Chart-a-Course offers a full slate of five S-tier sectors and
-// nothing else (endlessGenerateCourses), and clearing one is worth a guaranteed perk pick
-// (endlessBetweenLevels). The plain milestone (50, 150, 250, ...) charts S+/S++; the GRAND
-// milestone -- every 100th zone -- charts S++/S+++. Keyed off the REAL zone the player sees, not
-// the difficulty-scaled one, so the numbers match the HUD.
+// Milestone zones are set-pieces: Chart-a-Course offers a full slate of five high-tier sectors and
+// nothing else (endlessGenerateCourses), and the outpost after plays the "Parlance" warning theme.
+// Three cadences: the minor milestone (25, 75, 125, ...) charts S/S+ and pins its level music to
+// "Tunneling Trolls"; the plain one (50, 150, 250, ...) charts S+/S++; the GRAND one -- every 100th
+// zone -- charts S++/S+++ and always includes "The End". The 50- and 100-based milestones each grant a
+// guaranteed perk pick (endlessBetweenLevels); the minor one does NOT -- its zones get a perk only if
+// the every-3rd cadence lands there. Keyed off the REAL zone the player sees, so the numbers match the HUD.
 #define ENDLESS_MILESTONE_EVERY 50
 #define ENDLESS_MILESTONE_GRAND 100
 
-// Milestone class of an arbitrary ZONE number: 0 = ordinary, 1 = the S+/S++ milestone, 2 = the
-// S++/S+++ one. Taking the zone as a parameter (rather than reading the run depth) is what lets the
-// music picker look at a zone's NEIGHBOURS without any RNG.
+// Milestone class of an arbitrary ZONE number: 0 = ordinary, 1 = the S+/S++ milestone (50, 150, ...),
+// 2 = the S++/S+++ one (100, 200, ...), 3 = the minor "Tunneling Trolls" S/S+ milestone that falls
+// halfway between the others (25, 75, 125, 175, ...). The kinds are tags, not an ordinal -- kind 3 is
+// the MILDEST despite its number. Taking the zone as a parameter (rather than reading the run depth)
+// is what lets the music picker look at a zone's NEIGHBOURS without any RNG.
 int endlessMilestoneKindOfZone(int zone)
 {
 	if (zone <= 0)
@@ -73,6 +77,8 @@ int endlessMilestoneKindOfZone(int zone)
 		return 2;
 	if (zone % ENDLESS_MILESTONE_EVERY == 0)
 		return 1;
+	if (zone % ENDLESS_MILESTONE_EVERY == ENDLESS_MILESTONE_EVERY / 2)
+		return 3;   // 25, 75, 125, ... -- one 50-cycle offset from the S+/S++ milestone
 	return 0;
 }
 
@@ -82,11 +88,14 @@ int endlessMilestoneKind(void)
 	return endlessMilestoneKindOfZone(endlessRunDepth + 1);
 }
 
-// Was run depth `depth` a milestone zone? (A run depth IS the zone just cleared, so this is the
-// test for "the outpost I'm standing in follows a milestone".)
-static bool endlessMilestoneClearedAt(int depth)
+// Was run depth `depth` a PERK-GRANTING milestone? Only the 50-based (kind 1) and 100-based (kind 2)
+// milestones hand out a guaranteed perk; the minor kind-3 "Tunneling Trolls" milestone does NOT -- its
+// zones get a perk only if the every-3rd cadence happens to land on one. (A run depth IS the zone just
+// cleared, so this tests "the outpost I'm standing in follows a perk milestone".)
+static bool endlessPerkMilestoneAt(int depth)
 {
-	return endlessMilestoneKindOfZone(depth) != 0;
+	const int kind = endlessMilestoneKindOfZone(depth);
+	return kind == 1 || kind == 2;
 }
 
 // Forced perk picks come on a fixed cadence: after the first cleared zone, then every 3rd zone
@@ -95,14 +104,16 @@ static bool endlessMilestoneClearedAt(int depth)
 
 // Each milestone class flies to its OWN pinned track, so the two set-pieces stay distinct. Both are
 // 1-based into musicTitle[] (musmast.c), matching levelSong -- the level start plays levelSong - 1.
-#define ENDLESS_MILESTONE_SONG_GRAND 35  // "One Mustn't Fall" -- every 100th zone
-#define ENDLESS_MILESTONE_SONG_PLAIN 37  // "A Field for Mag"  -- the other 50th zones (50, 150, 250, ...)
+#define ENDLESS_MILESTONE_SONG_GRAND 35  // "One Mustn't Fall"  -- every 100th zone
+#define ENDLESS_MILESTONE_SONG_PLAIN 37  // "A Field for Mag"   -- the other 50th zones (50, 150, 250, ...)
+#define ENDLESS_MILESTONE_SONG_MINOR 17  // "Tunneling Trolls"  -- the minor milestone (25, 75, 125, ...)
 
 // The pinned track for a milestone class, or 0 for an ordinary zone.
 JE_byte endlessMilestoneSong(int kind)
 {
 	return (kind == 2) ? ENDLESS_MILESTONE_SONG_GRAND
 	     : (kind == 1) ? ENDLESS_MILESTONE_SONG_PLAIN
+	     : (kind == 3) ? ENDLESS_MILESTONE_SONG_MINOR
 	     : 0;
 }
 
@@ -117,10 +128,10 @@ bool endlessPerkDueAtDepth(int depth)
 {
 	if (depth <= 0)
 		return false;
-	if (depth % ENDLESS_PERK_EVERY == 1 || endlessMilestoneClearedAt(depth))
+	if (depth % ENDLESS_PERK_EVERY == 1 || endlessPerkMilestoneAt(depth))
 		return true;
 	const int prev = depth - 1;  // deferred half of a collision on the previous zone
-	return endlessMilestoneClearedAt(prev) && prev % ENDLESS_PERK_EVERY == 1;
+	return endlessPerkMilestoneAt(prev) && prev % ENDLESS_PERK_EVERY == 1;
 }
 
 // Hardcore mode for the current run (see endless.h): no saving at all + a locked outpost on a
